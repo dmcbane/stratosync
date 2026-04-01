@@ -1,0 +1,23 @@
+[package]
+name        = "stratosync-core"
+description = "Core types, backend abstraction, and state DB for stratosync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace       = true
+serde.workspace       = true
+serde_json.workspace  = true
+anyhow.workspace      = true
+thiserror.workspace   = true
+async-trait.workspace = true
+rusqlite.workspace    = true
+chrono.workspace      = true
+tracing.workspace     = true
+dirs.workspace        = true
+bytesize.workspace    = true
+libc.workspace        = true
+
+[dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }

@@ -1,0 +1,25 @@
+[package]
+name        = "stratosync-cli"
+description = "stratosync command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stratosync"
+path = "src/main.rs"
+
+[dependencies]
+stratosync-core       = { path = "../stratosync-core" }
+clap.workspace        = true
+tokio.workspace       = true
+anyhow.workspace      = true
+tracing.workspace     = true
+tracing-subscriber.workspace = true
+serde_json.workspace  = true
+bytesize.workspace    = true
+chrono.workspace      = true
+dirs.workspace        = true
+rusqlite.workspace    = true
+toml.workspace        = true
+toml_edit.workspace   = true

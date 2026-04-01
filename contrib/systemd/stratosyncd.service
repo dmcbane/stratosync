@@ -1,0 +1,44 @@
+[Unit]
+Description=stratosync cloud sync daemon
+Documentation=https://github.com/dmcbane/stratosync
+After=network-online.target
+Wants=network-online.target
+
+# Restart on failure, but not if we exit with code 0 (clean shutdown)
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/stratosyncd
+Restart=on-failure
+RestartSec=5s
+
+# Environment
+Environment="RUST_LOG=stratosync=info"
+# Uncomment to override config path:
+# Environment="STRATOSYNC_CONFIG=%h/.config/stratosync/config.toml"
+
+# Security hardening (user service — no root required)
+PrivateTmp=true
+NoNewPrivileges=true
+
+# FUSE requires access to /dev/fuse
+DeviceAllow=/dev/fuse rw
+
+# Allow the mount namespace to be visible to other processes (required by FUSE)
+# Without this, the mount is invisible outside the daemon's namespace
+PrivateMounts=false
+
+# Resource limits
+LimitNOFILE=65536
+MemoryHigh=512M
+MemoryMax=1G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stratosyncd
+
+[Install]
+WantedBy=default.target

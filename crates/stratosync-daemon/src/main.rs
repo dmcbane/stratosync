@@ -1,0 +1,144 @@
+//! stratosyncd — startup, crash recovery, per-mount orchestration, signal handling.
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+mod cache;
+mod config_io;
+mod fuse;
+mod sync;
+mod watcher;
+
+use stratosync_core::{
+    backend::RcloneBackend,
+    config::{default_data_dir, Config},
+    state::StateDb,
+    Backend,
+};
+use sync::{RemotePoller, UploadQueue};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config_path = std::env::var("STRATOSYNC_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| stratosync_core::config::default_config_path());
+
+    let cfg = config_io::load(&config_path)
+        .with_context(|| format!("load config {config_path:?}"))?;
+
+    init_logging(&cfg);
+    info!(version = env!("CARGO_PKG_VERSION"), "stratosyncd starting");
+
+    let db_path = default_data_dir().join("state.db");
+    let db = Arc::new(StateDb::open(&db_path)?);
+    db.migrate().await.context("DB migrations")?;
+
+    // Crash recovery
+    let reset = db.reset_hydrating().await?;
+    if reset > 0 { info!(count = reset, "reset stale hydrations"); }
+
+    let mut fuse_threads = vec![];
+
+    for mount_cfg in cfg.mounts.iter().filter(|m| m.enabled) {
+        let backend: Arc<dyn Backend> = Arc::new(
+            RcloneBackend::new(&mount_cfg.remote)
+                .with_context(|| format!("backend for {:?}", mount_cfg.name))?,
+        );
+
+        let mount_id = db.upsert_mount(
+            &mount_cfg.name, &mount_cfg.remote,
+            &mount_cfg.mount_path.to_string_lossy(),
+            &mount_cfg.cache_dir().to_string_lossy(),
+            mount_cfg.cache_quota_bytes()?,
+            mount_cfg.poll_duration()?.as_secs() as u32,
+        ).await?;
+
+        info!(name = %mount_cfg.name, mount = %mount_cfg.mount_path.display(), "mounting");
+
+        // Re-queue any dirty/uploading files from prior run
+        let pending = db.get_pending_uploads(mount_id).await?;
+        if !pending.is_empty() {
+            warn!(count = pending.len(), mount = %mount_cfg.name, "re-queuing pending uploads");
+        }
+
+        // Upload queue
+        let upload_queue = Arc::new(UploadQueue::new(
+            mount_id, Arc::clone(&db), Arc::clone(&backend),
+            mount_cfg.poll_duration()?,               // reuse poll interval as debounce base
+            std::time::Duration::from_millis(
+                cfg.daemon.sync.upload_close_debounce_ms),
+            cfg.daemon.sync.max_upload_concurrent,
+        ));
+
+        for entry in pending {
+            upload_queue.enqueue(sync::UploadTrigger::Write { inode: entry.inode }).await;
+        }
+
+        // Cache manager
+        cache::CacheManager::new(mount_id, Arc::clone(&db), mount_cfg.cache_quota_bytes()?)
+            .with_marks(
+                mount_cfg.eviction.low_mark,
+                mount_cfg.eviction.high_mark,
+            )
+            .spawn();
+
+        // inotify watcher
+        if let Err(e) = watcher::FsWatcher::start(
+            mount_cfg.cache_dir(), mount_id,
+            Arc::clone(&db), Arc::clone(&upload_queue),
+        ) {
+            warn!(mount = %mount_cfg.name, "inotify watcher failed to start: {e}");
+        }
+
+        // Remote poller
+        let poller = RemotePoller::new(
+            mount_id, Arc::clone(&db), Arc::clone(&backend),
+            mount_cfg.poll_duration()?,
+        );
+        tokio::spawn(async move { poller.run().await });
+
+        // FUSE mount (blocking thread)
+        let mount_path   = mount_cfg.resolved_mount_path();
+        let cache_dir    = mount_cfg.cache_dir();
+        let fuse_cfg     = cfg.daemon.fuse.clone();
+        let mount_name   = mount_cfg.name.clone();
+        let db_c         = Arc::clone(&db);
+        let backend_c    = Arc::clone(&backend);
+        let queue_c      = Arc::clone(&upload_queue);
+
+        let handle = std::thread::Builder::new()
+            .name(format!("fuse-{}", mount_name))
+            .spawn(move || {
+                if let Err(e) = fuse::mount(
+                    &mount_name, mount_id, &mount_path,
+                    cache_dir, db_c, backend_c, queue_c, fuse_cfg,
+                ) {
+                    error!(mount = %mount_name, "FUSE error: {e}");
+                }
+            })?;
+
+        fuse_threads.push(handle);
+    }
+
+    if fuse_threads.is_empty() {
+        anyhow::bail!("no enabled mounts in {config_path:?}");
+    }
+
+    tokio::signal::ctrl_c().await?;
+    info!("shutdown signal — stopping");
+    for h in fuse_threads { let _ = h.join(); }
+    info!("stratosyncd stopped");
+    Ok(())
+}
+
+fn init_logging(cfg: &Config) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(cfg.daemon.log_level.as_str()));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(true).with_thread_names(true))
+        .init();
+}
