@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Stratosync is a Linux cloud sync daemon providing on-demand virtual filesystem via FUSE3, with multi-backend support through rclone. Files appear immediately with metadata-only placeholders, hydrate on `open()`, and uploads propagate automatically with conflict detection.
 
-**Status**: Pre-alpha. Phase 1 (read-only VFS) and Phase 2 (bidirectional sync) are complete. Phase 3+ (delta APIs, desktop integration, selective sync) are not started.
+**Status**: Pre-alpha (v0.2.0). Phase 1 (read-only VFS) and Phase 2 (bidirectional sync) are implemented and tested with Google Drive. Phase 3+ (delta APIs, desktop integration, selective sync) are not started.
 
 ## Build & Test Commands
 

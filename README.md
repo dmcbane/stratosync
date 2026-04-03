@@ -15,7 +15,7 @@ Stratosync brings the OneDrive/Google Drive experience to Linux: files appear im
 
 ## Status
 
-🚧 **Pre-alpha / design phase** — architecture is being finalized, no runnable code yet.
+🚧 **Pre-alpha (v0.2.0)** — Phase 1 (read-only VFS) and Phase 2 (bidirectional sync) are implemented and tested with Google Drive. The daemon mounts, lists, reads, writes, renames, and deletes files. Conflict resolution, LRU cache eviction, and inotify-based change detection are functional.
 
 ## Design Goals
 
