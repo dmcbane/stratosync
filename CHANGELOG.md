@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-04-03
+
+### Security
+- **Path traversal**: `validate_filename()` rejects `..`, `/`, null bytes in all
+  FUSE create/mkdir/rename handlers. `safe_cache_path()` canonicalizes paths and
+  verifies they stay within the cache directory.
+- **Symlink attacks**: Upload queue rejects symlink cache files via
+  `symlink_metadata()`. `.meta/partial` directory set to 0o700. Hydration temp
+  files use random suffixes to defeat symlink races.
+- **DoS protection**: Poller rejects remote listings exceeding 500,000 entries.
+- **Input sanitization**: `populate_directory` and poller skip entries with `..`
+  or null bytes in filenames from remote listings.
+
+### Added
+- 5 security regression tests (path traversal, symlink detection, SQL injection,
+  integer boundaries)
+
 ## [0.2.0] - 2026-04-03
 
 First functional release. The daemon mounts a Google Drive (or any rclone remote)
