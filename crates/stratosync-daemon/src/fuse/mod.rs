@@ -158,7 +158,11 @@ async fn populate_directory(
 
     let entries: Vec<_> = children.iter().map(|child| {
         let kind = if child.is_dir { FileKind::Directory } else { FileKind::File };
-        (child.name.clone(), child.path.clone(), kind, child.size, child.mtime, child.etag.clone())
+        // child.path from rclone lsjson is relative to the listed directory.
+        // We need the full path from root to match the poller's paths and
+        // for correct rclone operations (delete, download, etc.).
+        let full_path = write_ops::join_remote(&dir.remote_path, &child.name);
+        (child.name.clone(), full_path, kind, child.size, child.mtime, child.etag.clone())
     }).collect();
 
     db.batch_upsert_remote_files(mid, dir.inode, &entries).await
