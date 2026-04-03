@@ -758,11 +758,17 @@ impl StateDb {
         new_parent: Inode,
         new_name:   &str,
         new_remote: &str,
+        new_cache_path: Option<&std::path::Path>,
     ) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE file_index SET parent_inode=?1, name=?2, remote_path=?3 WHERE inode=?4",
-            params![new_parent as i64, new_name, new_remote, inode as i64],
+            "UPDATE file_index SET parent_inode=?1, name=?2, remote_path=?3, cache_path=?4
+             WHERE inode=?5",
+            params![
+                new_parent as i64, new_name, new_remote,
+                new_cache_path.and_then(|p| p.to_str()),
+                inode as i64,
+            ],
         )?;
         Ok(())
     }

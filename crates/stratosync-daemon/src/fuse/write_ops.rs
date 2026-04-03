@@ -316,18 +316,23 @@ pub async fn handle_rename(
         .map_err(|_| libc::EIO)?;
 
     // Update local cache path if hydrated.
-    // Failure here means the cache file is at the old path; next open()
-    // will re-hydrate from the (already-renamed) remote path.
-    if let Some(old_cache) = &entry.cache_path {
+    let new_cache_path = if let Some(old_cache) = &entry.cache_path {
         let new_cache = old_cache.parent()
             .map(|p| p.join(new_name))
             .unwrap_or_else(|| PathBuf::from(new_name));
         if let Err(e) = tokio::fs::rename(old_cache, &new_cache).await {
             warn!(inode = entry.inode, ?old_cache, ?new_cache, "cache rename failed: {e}");
+            // Cache file didn't move — keep old path so open() can still find it
+            Some(old_cache.clone())
+        } else {
+            Some(new_cache)
         }
-    }
+    } else {
+        None
+    };
 
-    db.rename_entry(entry.inode, new_parent, new_name, &new_remote).await
+    db.rename_entry(entry.inode, new_parent, new_name, &new_remote,
+        new_cache_path.as_deref()).await
         .map_err(|_| libc::EIO)?;
 
     if let Err(e) = db.invalidate_dir(parent).await {

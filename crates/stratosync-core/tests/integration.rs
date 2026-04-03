@@ -176,7 +176,7 @@ async fn db_rename_and_delete_entry() {
     let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "old.txt")).await.unwrap();
 
-    db.rename_entry(inode, root, "new.txt", "/new.txt").await.unwrap();
+    db.rename_entry(inode, root, "new.txt", "/new.txt", None).await.unwrap();
     let e = db.get_by_inode(inode).await.unwrap().unwrap();
     assert_eq!(e.name, "new.txt");
     assert_eq!(e.remote_path, "/new.txt");
