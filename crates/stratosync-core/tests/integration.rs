@@ -470,6 +470,11 @@ async fn db_delete_mount_entries_clears_all() {
     db.delete_mount_entries(mid).await.unwrap();
     assert!(db.get_by_inode(root).await.unwrap().is_none());
     assert!(db.list_children(root).await.unwrap().is_empty());
+
+    // After clearing, we must be able to re-insert a root at inode 1
+    // (autoincrement counter is reset so the self-referencing FK works)
+    let new_root = db.insert_file(&root_entry(mid)).await.unwrap();
+    assert_eq!(new_root, FUSE_ROOT_INODE, "root must get inode 1 after clear");
 }
 
 // ── Populate directory (simulates readdir flow) ─────────────────────────────

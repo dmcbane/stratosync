@@ -705,6 +705,8 @@ impl StateDb {
 
     /// Delete all file_index and related entries for a mount.
     /// Used to clear corrupt state (e.g. stale DB from a crashed run).
+    /// Resets the autoincrement counter so the root can be re-inserted
+    /// at inode 1 (required for FUSE_ROOT_INODE self-referencing FK).
     pub async fn delete_mount_entries(&self, mount_id: u32) -> Result<()> {
         let conn = self.conn.lock().await;
         // cache_lru and sync_queue have ON DELETE CASCADE from file_index
@@ -712,6 +714,18 @@ impl StateDb {
             "DELETE FROM file_index WHERE mount_id = ?1",
             params![mount_id],
         )?;
+        // Reset autoincrement so the next insert gets inode 1 again.
+        // The root entry uses parent_inode=1 (self-referencing), which
+        // only satisfies the FK if the row itself gets inode 1.
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_index", [], |r| r.get(0),
+        )?;
+        if remaining == 0 {
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name = 'file_index'",
+                [],
+            )?;
+        }
         info!(mount_id, "cleared all file entries for mount");
         Ok(())
     }
