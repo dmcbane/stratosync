@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 
+use anyhow::Context;
 use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
@@ -150,11 +151,15 @@ async fn do_hydrate(
 async fn populate_directory(
     db: &Arc<StateDb>, backend: &Arc<dyn Backend>, mid: u32, dir: &FileEntry,
 ) -> Result<(), anyhow::Error> {
-    let children = backend.list(&dir.remote_path).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    debug!(inode = dir.inode, path = %dir.remote_path, "populating directory");
+    let children = backend.list(&dir.remote_path).await
+        .map_err(|e| anyhow::anyhow!("list {:?}: {e}", dir.remote_path))?;
+    debug!(inode = dir.inode, count = children.len(), "listed children");
     for child in children {
         let kind = if child.is_dir { FileKind::Directory } else { FileKind::File };
         db.upsert_remote_file(mid, dir.inode, &child.name, &child.path,
-            kind, child.size, child.mtime, child.etag.as_deref()).await?;
+            kind, child.size, child.mtime, child.etag.as_deref()).await
+            .with_context(|| format!("upsert {:?} under inode {}", child.path, dir.inode))?;
     }
     db.mark_dir_listed(dir.inode).await?;
     Ok(())
@@ -306,18 +311,56 @@ impl Filesystem for StratoFs {
     }
 }
 
+/// Ensure inode 1 is the mount root directory. Must be called before the
+/// poller or FUSE thread start (poller inserts with parent=FUSE_ROOT_INODE,
+/// so the FK requires inode 1 to exist). Also validates that any existing
+/// inode 1 is actually the root directory — a stale DB from a broken run
+/// could have a non-directory entry there.
+pub async fn ensure_root(db: &Arc<StateDb>, mount_id: u32) -> anyhow::Result<()> {
+    let needs_root = match db.get_by_inode(FUSE_ROOT_INODE).await? {
+        None => true,
+        Some(entry) => {
+            if entry.kind != FileKind::Directory
+                || entry.remote_path != "/"
+                || entry.mount_id != mount_id
+            {
+                warn!(
+                    inode = FUSE_ROOT_INODE,
+                    kind = ?entry.kind,
+                    remote_path = %entry.remote_path,
+                    "root inode is corrupt — clearing stale state"
+                );
+                db.delete_mount_entries(mount_id).await?;
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if needs_root {
+        db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: FUSE_ROOT_INODE,
+            name: "/".into(),
+            remote_path: "/".into(),
+            kind: FileKind::Directory,
+            size: 0,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None,
+            cache_size: None,
+        }).await?;
+    }
+    Ok(())
+}
+
 pub fn mount(
     mount_name: &str, mount_id: u32, mount_path: &std::path::Path,
     cache_dir: PathBuf, db: Arc<StateDb>, backend: Arc<dyn Backend>,
     upload_queue: Arc<UploadQueue>, cfg: FuseConfig, rt: Handle,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
-    rt.block_on(async {
-        if db.get_by_inode(FUSE_ROOT_INODE).await?.is_none() {
-            db.insert_file(&NewFileEntry { mount_id, parent: FUSE_ROOT_INODE, name: "/".into(), remote_path: "/".into(), kind: FileKind::Directory, size: 0, mtime: SystemTime::now(), etag: None, status: SyncStatus::Remote, cache_path: None, cache_size: None }).await?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
     std::fs::create_dir_all(cache_dir.join(".meta").join("partial"))?;
     std::fs::create_dir_all(mount_path)?;
     let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters: Arc::new(DashMap::new()), upload_queue };

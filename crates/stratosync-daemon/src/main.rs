@@ -58,6 +58,12 @@ async fn main() -> Result<()> {
 
         info!(name = %mount_cfg.name, mount = %mount_cfg.mount_path.display(), "mounting");
 
+        // Ensure root directory entry exists BEFORE poller or FUSE start.
+        // The poller inserts files with parent=FUSE_ROOT_INODE, so inode 1
+        // must exist first (FK constraint). Also validates that any existing
+        // inode 1 is actually the root directory.
+        fuse::ensure_root(&db, mount_id).await?;
+
         // Re-queue any dirty/uploading files from prior run
         let pending = db.get_pending_uploads(mount_id).await?;
         if !pending.is_empty() {

@@ -702,4 +702,17 @@ impl StateDb {
         )?;
         Ok(())
     }
+
+    /// Delete all file_index and related entries for a mount.
+    /// Used to clear corrupt state (e.g. stale DB from a crashed run).
+    pub async fn delete_mount_entries(&self, mount_id: u32) -> Result<()> {
+        let conn = self.conn.lock().await;
+        // cache_lru and sync_queue have ON DELETE CASCADE from file_index
+        conn.execute(
+            "DELETE FROM file_index WHERE mount_id = ?1",
+            params![mount_id],
+        )?;
+        info!(mount_id, "cleared all file entries for mount");
+        Ok(())
+    }
 }

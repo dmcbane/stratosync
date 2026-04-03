@@ -451,6 +451,61 @@ async fn db_fail_queue_job_applies_backoff() {
     assert!(next.is_none(), "job with future next_attempt must not be dequeued");
 }
 
+// ── Root inode integrity ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn db_delete_mount_entries_clears_all() {
+    let (db, mid) = fresh_db().await;
+    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+
+    // Add several children
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        db.insert_file(&file_entry(mid, root, name)).await.unwrap();
+    }
+    let children: Vec<_> = db.list_children(root).await.unwrap()
+        .into_iter().filter(|e| e.inode != root).collect();
+    assert_eq!(children.len(), 3);
+
+    // delete_mount_entries should clear everything including root
+    db.delete_mount_entries(mid).await.unwrap();
+    assert!(db.get_by_inode(root).await.unwrap().is_none());
+    assert!(db.list_children(root).await.unwrap().is_empty());
+}
+
+// ── Populate directory (simulates readdir flow) ─────────────────────────────
+
+#[tokio::test]
+async fn populate_root_from_mock_backend() {
+    // This simulates the readdir code path: backend.list("/") → upsert each child
+    let (db, mid) = fresh_db().await;
+    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    assert_eq!(root, FUSE_ROOT_INODE);
+
+    let backend = MockBackend::default();
+    backend.seed_file("/hello.txt", b"hello");
+    backend.seed_file("/world.pdf", b"world");
+
+    // Simulate populate_directory: list root, upsert children
+    let children = backend.list("/").await.unwrap();
+    assert_eq!(children.len(), 2);
+    for child in &children {
+        let kind = if child.is_dir { FileKind::Directory } else { FileKind::File };
+        db.upsert_remote_file(
+            mid, root, &child.name, &child.path,
+            kind, child.size, child.mtime, child.etag.as_deref(),
+        ).await.unwrap();
+    }
+    db.mark_dir_listed(root).await.unwrap();
+
+    // Verify list_children returns the two files (excluding root self-reference)
+    let listed: Vec<_> = db.list_children(root).await.unwrap()
+        .into_iter().filter(|e| e.inode != root).collect();
+    assert_eq!(listed.len(), 2);
+    let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"hello.txt"));
+    assert!(names.contains(&"world.pdf"));
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn tempfile_path() -> std::path::PathBuf {
