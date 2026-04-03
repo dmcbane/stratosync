@@ -530,7 +530,7 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
     Ok(FileEntry {
         inode:      r.get::<_, i64>(0)? as u64,
         mount_id:   r.get::<_, i32>(1)? as u32,
-        parent:     r.get::<_, i64>(2)? as u64,
+        parent:     r.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
         name:       r.get(3)?,
         remote_path: r.get(4)?,
         kind,
