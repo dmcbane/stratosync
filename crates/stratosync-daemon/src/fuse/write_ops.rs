@@ -342,9 +342,14 @@ pub async fn handle_rename(
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Concatenate a parent remote path with a child name.
-/// `join_remote("/Documents", "notes.md")` → `"/Documents/notes.md"`
-/// `join_remote("/", "notes.md")` → `"/notes.md"`
+/// Returns paths without a leading slash to match rclone's lsjson output.
+/// `join_remote("/", "notes.md")` → `"notes.md"`
+/// `join_remote("Documents", "notes.md")` → `"Documents/notes.md"`
 pub fn join_remote(parent: &str, child: &str) -> String {
-    let p = parent.trim_end_matches('/');
-    format!("{p}/{child}")
+    let p = parent.trim_matches('/');
+    if p.is_empty() {
+        child.to_string()
+    } else {
+        format!("{p}/{child}")
+    }
 }
