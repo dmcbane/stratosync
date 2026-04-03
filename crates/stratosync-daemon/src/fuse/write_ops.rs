@@ -311,9 +311,26 @@ pub async fn handle_rename(
         }
     }
 
-    // Move on the remote
-    backend.rename(&entry.remote_path, &new_remote).await
-        .map_err(|_| libc::EIO)?;
+    // Only rename on the remote if the file exists there (Cached/Stale/Uploading).
+    // Dirty files haven't been uploaded yet — the upload queue will use the new
+    // remote_path from the DB when it eventually runs.
+    let needs_remote_rename = matches!(
+        entry.status,
+        SyncStatus::Cached | SyncStatus::Stale | SyncStatus::Uploading | SyncStatus::Conflict
+    );
+    if needs_remote_rename {
+        match backend.rename(&entry.remote_path, &new_remote).await {
+            Ok(()) => {}
+            Err(SyncError::NotFound(_)) => {
+                // File was deleted remotely between DB lookup and rename — proceed locally
+                debug!(inode = entry.inode, "remote rename: source not found, proceeding locally");
+            }
+            Err(e) => {
+                warn!(inode = entry.inode, "remote rename failed: {e}");
+                return Err(libc::EIO);
+            }
+        }
+    }
 
     // Update local cache path if hydrated.
     let new_cache_path = if let Some(old_cache) = &entry.cache_path {
