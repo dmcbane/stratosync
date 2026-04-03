@@ -28,7 +28,7 @@ async fn fresh_db() -> (Arc<StateDb>, u32) {
 fn root_entry(mount_id: u32) -> NewFileEntry {
     NewFileEntry {
         mount_id,
-        parent: FUSE_ROOT_INODE,
+        parent: 0, // ignored by insert_root — uses NULL
         name: "/".into(),
         remote_path: "/".into(),
         kind: FileKind::Directory,
@@ -39,6 +39,10 @@ fn root_entry(mount_id: u32) -> NewFileEntry {
         cache_path: None,
         cache_size: None,
     }
+}
+
+async fn insert_root(db: &Arc<StateDb>, mid: u32) -> u64 {
+    db.insert_root(&root_entry(mid)).await.unwrap()
 }
 
 fn file_entry(mount_id: u32, parent: u64, name: &str) -> NewFileEntry {
@@ -62,7 +66,7 @@ fn file_entry(mount_id: u32, parent: u64, name: &str) -> NewFileEntry {
 #[tokio::test]
 async fn db_insert_and_lookup_by_inode() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "hello.txt")).await.unwrap();
 
     let entry = db.get_by_inode(inode).await.unwrap().expect("entry must exist");
@@ -75,7 +79,7 @@ async fn db_insert_and_lookup_by_inode() {
 #[tokio::test]
 async fn db_lookup_by_parent_and_name() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     db.insert_file(&file_entry(mid, root, "alpha.rs")).await.unwrap();
     db.insert_file(&file_entry(mid, root, "beta.rs")).await.unwrap();
 
@@ -89,16 +93,14 @@ async fn db_lookup_by_parent_and_name() {
 #[tokio::test]
 async fn db_list_children_ordered() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     for name in ["c.rs", "a.rs", "b.rs"] {
         db.insert_file(&file_entry(mid, root, name)).await.unwrap();
     }
     let children = db.list_children(root).await.unwrap();
-    // Filter to just the files we inserted (root may also appear as its own child
-    // when root.inode == FUSE_ROOT_INODE since parent_inode = FUSE_ROOT_INODE)
+    assert_eq!(children.len(), 3);
     let mut names: Vec<&str> = children.iter()
         .map(|e| e.name.as_str())
-        .filter(|n| n.ends_with(".rs"))
         .collect();
     names.sort();
     assert_eq!(names, ["a.rs", "b.rs", "c.rs"]);
@@ -107,7 +109,7 @@ async fn db_list_children_ordered() {
 #[tokio::test]
 async fn db_status_transitions() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "notes.md")).await.unwrap();
 
     // Remote → Hydrating → Cached
@@ -133,7 +135,7 @@ async fn db_status_transitions() {
 #[tokio::test]
 async fn db_eviction_clears_cache_fields() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "big.tar")).await.unwrap();
 
     let cache_path = std::path::Path::new("/tmp/cache/big.tar");
@@ -150,7 +152,7 @@ async fn db_eviction_clears_cache_fields() {
 #[tokio::test]
 async fn db_reset_hydrating_on_restart() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
 
     // Simulate crash: two files left in Hydrating
     for name in ["x.bin", "y.bin"] {
@@ -171,7 +173,7 @@ async fn db_reset_hydrating_on_restart() {
 #[tokio::test]
 async fn db_rename_and_delete_entry() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "old.txt")).await.unwrap();
 
     db.rename_entry(inode, root, "new.txt", "/new.txt").await.unwrap();
@@ -186,7 +188,7 @@ async fn db_rename_and_delete_entry() {
 #[tokio::test]
 async fn db_upsert_remote_file_preserves_dirty() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "work.rs")).await.unwrap();
 
     // Locally dirty — remote poll should NOT reset to stale
@@ -205,7 +207,7 @@ async fn db_upsert_remote_file_preserves_dirty() {
 #[tokio::test]
 async fn db_lru_eviction_candidates_skips_pinned() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let quota = 100u64;
 
     let inode_a = db.insert_file(&file_entry(mid, root, "a.bin")).await.unwrap();
@@ -416,7 +418,7 @@ fn file_entry_stem_and_extension() {
 #[tokio::test]
 async fn db_enqueue_and_dequeue_upload() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "todo.txt")).await.unwrap();
 
     db.enqueue_upload(inode, mid, "/todo.txt", Some("etag-old"), 1).await.unwrap();
@@ -437,7 +439,7 @@ async fn db_enqueue_and_dequeue_upload() {
 #[tokio::test]
 async fn db_fail_queue_job_applies_backoff() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "slow.bin")).await.unwrap();
     db.set_status(inode, SyncStatus::Dirty).await.unwrap();
 
@@ -456,24 +458,21 @@ async fn db_fail_queue_job_applies_backoff() {
 #[tokio::test]
 async fn db_delete_mount_entries_clears_all() {
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
 
     // Add several children
     for name in ["a.txt", "b.txt", "c.txt"] {
         db.insert_file(&file_entry(mid, root, name)).await.unwrap();
     }
-    let children: Vec<_> = db.list_children(root).await.unwrap()
-        .into_iter().filter(|e| e.inode != root).collect();
-    assert_eq!(children.len(), 3);
+    assert_eq!(db.list_children(root).await.unwrap().len(), 3);
 
     // delete_mount_entries should clear everything including root
     db.delete_mount_entries(mid).await.unwrap();
     assert!(db.get_by_inode(root).await.unwrap().is_none());
     assert!(db.list_children(root).await.unwrap().is_empty());
 
-    // After clearing, we must be able to re-insert a root at inode 1
-    // (autoincrement counter is reset so the self-referencing FK works)
-    let new_root = db.insert_file(&root_entry(mid)).await.unwrap();
+    // Must be able to re-insert root at inode 1 after clearing
+    let new_root = insert_root(&db, mid).await;
     assert_eq!(new_root, FUSE_ROOT_INODE, "root must get inode 1 after clear");
 }
 
@@ -483,7 +482,7 @@ async fn db_delete_mount_entries_clears_all() {
 async fn populate_root_from_mock_backend() {
     // This simulates the readdir code path: backend.list("/") → upsert each child
     let (db, mid) = fresh_db().await;
-    let root = db.insert_file(&root_entry(mid)).await.unwrap();
+    let root = insert_root(&db, mid).await;
     assert_eq!(root, FUSE_ROOT_INODE);
 
     let backend = MockBackend::default();
@@ -502,9 +501,8 @@ async fn populate_root_from_mock_backend() {
     }
     db.mark_dir_listed(root).await.unwrap();
 
-    // Verify list_children returns the two files (excluding root self-reference)
-    let listed: Vec<_> = db.list_children(root).await.unwrap()
-        .into_iter().filter(|e| e.inode != root).collect();
+    // Verify list_children returns the two files
+    let listed = db.list_children(root).await.unwrap();
     assert_eq!(listed.len(), 2);
     let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"hello.txt"));

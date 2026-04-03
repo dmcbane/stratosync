@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::types::{FileEntry, FileKind, Inode, SyncStatus};
+use crate::types::{FileEntry, FileKind, Inode, SyncStatus, FUSE_ROOT_INODE};
 
 // ── DB wrapper ────────────────────────────────────────────────────────────────
 
@@ -106,6 +106,33 @@ impl StateDb {
     }
 
     // ── File index: insert / update ──────────────────────────────────────────
+
+    /// Insert the FUSE root directory at inode 1 with NULL parent.
+    /// Uses an explicit inode value to avoid self-referencing FK issues
+    /// (autoincrement may not start at 1 if the table was previously populated).
+    pub async fn insert_root(&self, entry: &NewFileEntry) -> Result<Inode> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO file_index
+               (inode, mount_id, parent_inode, name, remote_path, kind, size, mtime,
+                etag, status, cache_path, cache_size)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                FUSE_ROOT_INODE as i64,
+                entry.mount_id,
+                entry.name,
+                entry.remote_path,
+                entry.kind.as_str(),
+                entry.size as i64,
+                to_unix(entry.mtime),
+                entry.etag,
+                entry.status.as_str(),
+                entry.cache_path.as_ref().map(|p| p.to_str()),
+                entry.cache_size.map(|s| s as i64),
+            ],
+        )?;
+        Ok(FUSE_ROOT_INODE)
+    }
 
     /// Insert a new file entry. Returns the new inode.
     pub async fn insert_file(&self, entry: &NewFileEntry) -> Result<Inode> {
@@ -587,9 +614,9 @@ mod tests {
         ).await.unwrap();
 
         // Insert root directory
-        let root_inode = db.insert_file(&NewFileEntry {
+        let root_inode = db.insert_root(&NewFileEntry {
             mount_id,
-            parent: 1,
+            parent: 0, // ignored by insert_root
             name: "/".into(),
             remote_path: "/".into(),
             kind: FileKind::Directory,

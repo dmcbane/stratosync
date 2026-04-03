@@ -338,9 +338,9 @@ pub async fn ensure_root(db: &Arc<StateDb>, mount_id: u32) -> anyhow::Result<()>
         }
     };
     if needs_root {
-        db.insert_file(&NewFileEntry {
+        db.insert_root(&NewFileEntry {
             mount_id,
-            parent: FUSE_ROOT_INODE,
+            parent: 0, // ignored by insert_root — uses NULL for parent_inode
             name: "/".into(),
             remote_path: "/".into(),
             kind: FileKind::Directory,
