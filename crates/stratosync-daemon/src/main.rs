@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
     if reset > 0 { info!(count = reset, "reset stale hydrations"); }
 
     let mut fuse_threads = vec![];
+    let mut mount_paths = vec![];
     let mut _watchers = vec![]; // must outlive fuse_threads to keep inotify alive
 
     for mount_cfg in cfg.mounts.iter().filter(|m| m.enabled) {
@@ -143,6 +144,7 @@ async fn main() -> Result<()> {
             })?;
 
         fuse_threads.push(handle);
+        mount_paths.push(mount_cfg.resolved_mount_path());
     }
 
     if fuse_threads.is_empty() {
@@ -150,7 +152,25 @@ async fn main() -> Result<()> {
     }
 
     tokio::signal::ctrl_c().await?;
-    info!("shutdown signal — stopping");
+    info!("shutdown signal — unmounting");
+    for path in &mount_paths {
+        info!(path = %path.display(), "unmounting");
+        // fusermount3 for FUSE3, fusermount for FUSE2, umount as fallback
+        let unmounted = std::process::Command::new("fusermount3")
+            .args(["-u", &path.to_string_lossy()])
+            .status()
+            .ok()
+            .map_or(false, |s| s.success())
+        || std::process::Command::new("fusermount")
+            .args(["-u", &path.to_string_lossy()])
+            .status()
+            .ok()
+            .map_or(false, |s| s.success());
+        if !unmounted {
+            warn!(path = %path.display(), "unmount failed — FUSE thread may hang");
+        }
+    }
+    info!("waiting for FUSE threads");
     for h in fuse_threads {
         if let Err(panic_val) = h.join() {
             let msg = panic_val.downcast_ref::<String>()
