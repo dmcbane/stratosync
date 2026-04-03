@@ -265,10 +265,10 @@ pub async fn handle_rmdir(
         warn!(parent, "invalidate_dir after rmdir failed: {e}");
     }
 
-    // Delete remotely in background
+    // Remove remote directory in background (uses rclone rmdir, not deletefile)
     let backend = Arc::clone(backend);
     tokio::spawn(async move {
-        match backend.delete(&remote_path).await {
+        match backend.rmdir(&remote_path).await {
             Ok(()) | Err(SyncError::NotFound(_)) => {}
             Err(e) => warn!(path = %remote_path, "background remote rmdir failed: {e}"),
         }

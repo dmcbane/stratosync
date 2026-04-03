@@ -60,8 +60,11 @@ pub trait Backend: Send + Sync + 'static {
     /// Create a remote directory (and any missing parents).
     async fn mkdir(&self, path: &str) -> Result<(), SyncError>;
 
-    /// Delete a remote file or empty directory.
+    /// Delete a remote file.
     async fn delete(&self, path: &str) -> Result<(), SyncError>;
+
+    /// Remove an empty remote directory.
+    async fn rmdir(&self, path: &str) -> Result<(), SyncError>;
 
     /// Move/rename a remote path.
     async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError>;
@@ -286,6 +289,12 @@ impl Backend for RcloneBackend {
         Ok(())
     }
 
+    async fn rmdir(&self, path: &str) -> Result<(), SyncError> {
+        let rp = self.rpath(path);
+        self.run(&["rmdir", &rp]).await?;
+        Ok(())
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
         let rf = self.rpath(from);
         let rt = self.rpath(to);
@@ -457,6 +466,7 @@ pub mod mock {
         }
 
         async fn mkdir(&self, _path: &str) -> Result<(), SyncError> { Ok(()) }
+        async fn rmdir(&self, _path: &str) -> Result<(), SyncError> { Ok(()) }
         async fn delete(&self, path: &str) -> Result<(), SyncError> {
             self.inner.lock().unwrap().files.remove(path);
             Ok(())
