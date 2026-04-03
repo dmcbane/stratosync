@@ -253,4 +253,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing guide, an
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
