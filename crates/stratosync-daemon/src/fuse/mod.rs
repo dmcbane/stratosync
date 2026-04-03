@@ -155,13 +155,18 @@ async fn populate_directory(
     let children = backend.list(&dir.remote_path).await
         .map_err(|e| anyhow::anyhow!("list {:?}: {e}", dir.remote_path))?;
     debug!(inode = dir.inode, count = children.len(), "listed children");
-    for child in children {
+
+    let entries: Vec<_> = children.iter().map(|child| {
         let kind = if child.is_dir { FileKind::Directory } else { FileKind::File };
-        db.upsert_remote_file(mid, dir.inode, &child.name, &child.path,
-            kind, child.size, child.mtime, child.etag.as_deref()).await
-            .with_context(|| format!("upsert {:?} under inode {}", child.path, dir.inode))?;
-    }
+        (child.name.clone(), child.path.clone(), kind, child.size, child.mtime, child.etag.clone())
+    }).collect();
+
+    db.batch_upsert_remote_files(mid, dir.inode, &entries).await
+        .with_context(|| format!("batch upsert {} children under inode {}", entries.len(), dir.inode))?;
+
+    debug!(inode = dir.inode, "upserts complete");
     db.mark_dir_listed(dir.inode).await?;
+    debug!(inode = dir.inode, "directory populated");
     Ok(())
 }
 
@@ -206,6 +211,7 @@ impl Filesystem for StratoFs {
         match result {
             Err(e) => { error!(ino, "readdir: {e:#}"); reply.error(libc::EIO); }
             Ok(children) => {
+                debug!(ino, count = children.len(), offset, "readdir returning entries");
                 let dots = [(ino, FileType::Directory, "."), (ino, FileType::Directory, "..")];
                 let rest: Vec<(u64, FileType, String)> = children.iter().map(|e| {
                     let ft = match e.kind { FileKind::Directory => FileType::Directory, FileKind::Symlink => FileType::Symlink, _ => FileType::RegularFile };

@@ -159,6 +159,48 @@ impl StateDb {
         Ok(conn.last_insert_rowid() as u64)
     }
 
+    /// Batch upsert children of a directory in a single transaction.
+    /// Much faster than individual upserts (single mutex acquire, single txn).
+    pub async fn batch_upsert_remote_files(
+        &self,
+        mount_id: u32,
+        parent:   Inode,
+        entries:  &[(String, String, FileKind, u64, SystemTime, Option<String>)],
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute_batch("BEGIN")?;
+        let result: Result<()> = (|| {
+            for (name, remote_path, kind, size, mtime, etag) in entries {
+                conn.execute(
+                    "INSERT INTO file_index
+                       (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote')
+                     ON CONFLICT(mount_id, remote_path) DO UPDATE SET
+                       parent_inode = excluded.parent_inode,
+                       name         = excluded.name,
+                       kind         = excluded.kind,
+                       size         = excluded.size,
+                       mtime        = excluded.mtime,
+                       etag         = excluded.etag,
+                       status       = CASE
+                         WHEN status IN ('dirty','uploading') THEN status
+                         ELSE 'stale'
+                       END",
+                    params![
+                        mount_id, parent as i64, name, remote_path,
+                        kind.as_str(), *size as i64, to_unix(*mtime), etag.as_deref(),
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        match &result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+        }
+        result
+    }
+
     /// Upsert by (mount_id, remote_path) — used during remote listing.
     pub async fn upsert_remote_file(
         &self,
