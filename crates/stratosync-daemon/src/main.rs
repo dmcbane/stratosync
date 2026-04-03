@@ -98,7 +98,11 @@ async fn main() -> Result<()> {
             mount_id, Arc::clone(&db), Arc::clone(&backend),
             mount_cfg.poll_duration()?,
         );
-        tokio::spawn(async move { poller.run().await });
+        let poller_mount = mount_cfg.name.clone();
+        tokio::spawn(async move {
+            poller.run().await;
+            error!(mount = %poller_mount, "remote poller exited unexpectedly");
+        });
 
         // FUSE mount (blocking thread)
         let mount_path   = mount_cfg.resolved_mount_path();

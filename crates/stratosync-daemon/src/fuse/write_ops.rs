@@ -62,8 +62,12 @@ pub async fn handle_write(
     file.write_all(data).await.map_err(|_| libc::EIO)?;
     file.flush().await.map_err(|_| libc::EIO)?;
 
-    // Mark dirty and start debounce
-    let _ = db.set_status(entry.inode, SyncStatus::Dirty).await;
+    // Mark dirty and start debounce.
+    // The FUSE write already succeeded (data is in the cache file), so we don't
+    // fail the syscall if the DB update fails — but we must surface the error.
+    if let Err(e) = db.set_status(entry.inode, SyncStatus::Dirty).await {
+        warn!(inode = entry.inode, "set_status(Dirty) failed: {e}");
+    }
     queue.enqueue(UploadTrigger::Write { inode: entry.inode }).await;
 
     Ok(data.len() as u32)
@@ -139,8 +143,11 @@ pub async fn handle_create(
         cache_size:  Some(0),
     }).await.map_err(|_| libc::EIO)?;
 
-    // Invalidate parent directory listing
-    let _ = db.invalidate_dir(parent).await;
+    // Invalidate parent directory listing so the next readdir re-fetches.
+    // The create itself already succeeded, so this is best-effort.
+    if let Err(e) = db.invalidate_dir(parent).await {
+        warn!(inode, parent, "invalidate_dir after create failed: {e}");
+    }
 
     // Allocate file handle
     let fh = next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -186,7 +193,9 @@ pub async fn handle_mkdir(
         cache_size:  None,
     }).await.map_err(|_| libc::EIO)?;
 
-    let _ = db.invalidate_dir(parent).await;
+    if let Err(e) = db.invalidate_dir(parent).await {
+        warn!(inode, parent, "invalidate_dir after mkdir failed: {e}");
+    }
     Ok(inode)
 }
 
@@ -208,13 +217,20 @@ pub async fn handle_unlink(
         Err(e) => { warn!("remote delete error: {e}"); return Err(libc::EIO); }
     }
 
-    // Remove local cache file if present
+    // Remove local cache file if present.
+    // ENOENT is acceptable (file may not have been hydrated).
     if let Some(cp) = &entry.cache_path {
-        let _ = tokio::fs::remove_file(cp).await;
+        if let Err(e) = tokio::fs::remove_file(cp).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(inode = entry.inode, path = ?cp, "cache file removal failed: {e}");
+            }
+        }
     }
 
     db.delete_entry(entry.inode).await.map_err(|_| libc::EIO)?;
-    let _ = db.invalidate_dir(parent).await;
+    if let Err(e) = db.invalidate_dir(parent).await {
+        warn!(parent, "invalidate_dir after unlink failed: {e}");
+    }
     Ok(())
 }
 
@@ -242,7 +258,9 @@ pub async fn handle_rmdir(
     }
 
     db.delete_entry(entry.inode).await.map_err(|_| libc::EIO)?;
-    let _ = db.invalidate_dir(parent).await;
+    if let Err(e) = db.invalidate_dir(parent).await {
+        warn!(parent, "invalidate_dir after rmdir failed: {e}");
+    }
     Ok(())
 }
 
@@ -272,26 +290,38 @@ pub async fn handle_rename(
             Ok(()) | Err(SyncError::NotFound(_)) => {}
             Err(_) => return Err(libc::EIO),
         }
-        let _ = db.delete_entry(dest.inode).await;
+        if let Err(e) = db.delete_entry(dest.inode).await {
+            warn!(inode = dest.inode, "delete_entry for rename overwrite failed: {e}");
+        }
     }
 
     // Move on the remote
     backend.rename(&entry.remote_path, &new_remote).await
         .map_err(|_| libc::EIO)?;
 
-    // Update local cache path if hydrated
+    // Update local cache path if hydrated.
+    // Failure here means the cache file is at the old path; next open()
+    // will re-hydrate from the (already-renamed) remote path.
     if let Some(old_cache) = &entry.cache_path {
         let new_cache = old_cache.parent()
             .map(|p| p.join(new_name))
             .unwrap_or_else(|| PathBuf::from(new_name));
-        let _ = tokio::fs::rename(old_cache, &new_cache).await;
+        if let Err(e) = tokio::fs::rename(old_cache, &new_cache).await {
+            warn!(inode = entry.inode, ?old_cache, ?new_cache, "cache rename failed: {e}");
+        }
     }
 
     db.rename_entry(entry.inode, new_parent, new_name, &new_remote).await
         .map_err(|_| libc::EIO)?;
 
-    let _ = db.invalidate_dir(parent).await;
-    if new_parent != parent { let _ = db.invalidate_dir(new_parent).await; }
+    if let Err(e) = db.invalidate_dir(parent).await {
+        warn!(parent, "invalidate_dir after rename (src) failed: {e}");
+    }
+    if new_parent != parent {
+        if let Err(e) = db.invalidate_dir(new_parent).await {
+            warn!(new_parent, "invalidate_dir after rename (dst) failed: {e}");
+        }
+    }
 
     Ok(())
 }

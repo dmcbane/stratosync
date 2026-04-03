@@ -126,10 +126,22 @@ async fn do_hydrate(
     }.await;
 
     if result.is_err() {
-        let _ = db.set_status(entry.inode, SyncStatus::Remote).await;
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+        // Roll back: reset status so a future open() retries hydration.
+        // If this fails, the inode is stuck in Hydrating until daemon restart
+        // (reset_hydrating handles that on startup).
+        if let Err(e) = db.set_status(entry.inode, SyncStatus::Remote).await {
+            warn!(inode = entry.inode, "failed to reset status after hydration error: {e}");
+        }
+        // Clean up partial download. ENOENT is expected if the download
+        // failed before creating the file.
+        if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(inode = entry.inode, ?tmp_path, "failed to remove partial download: {e}");
+            }
+        }
     }
     if let Some((_, senders)) = waiters.remove(&entry.inode) {
+        // Receiver dropped = waiter timed out or was cancelled; that's fine.
         for tx in senders { let _ = tx.send(result.as_ref().map(|_| ()).map_err(|_| libc::EIO)); }
     }
     result
@@ -210,7 +222,9 @@ impl Filesystem for StratoFs {
             let cache_path = entry.cache_path.ok_or_else(|| SyncError::Fatal("no cache_path".into()))?;
             let fh = next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             open_files.insert(fh, OpenFile { inode: ino, cache_path, flags });
-            let _ = db.touch_lru(ino).await;
+            if let Err(e) = db.touch_lru(ino).await {
+                warn!(ino, "touch_lru failed: {e}");
+            }
             Ok::<u64, SyncError>(fh)
         });
         match result { Ok(fh) => reply.opened(fh, 0), Err(e) => { error!(ino, "open: {e}"); reply.error(errno(&e)); } }

@@ -34,9 +34,14 @@ impl FsWatcher {
     ) -> Result<Self> {
         let (tx, mut rx) = mpsc::channel::<notify::Result<Event>>(512);
 
-        // notify uses a std channel internally; bridge to tokio mpsc
+        // notify uses a std channel internally; bridge to tokio mpsc.
+        // blocking_send only fails if the receiver is dropped (event handler
+        // task died). We use eprintln because this callback runs on a system
+        // thread outside the tracing subscriber context.
         let mut watcher = notify::recommended_watcher(move |res| {
-            let _ = tx.blocking_send(res);
+            if let Err(e) = tx.blocking_send(res) {
+                eprintln!("stratosync: watcher channel dead, events will be lost: {e}");
+            }
         })?;
 
         watcher.watch(&cache_dir, RecursiveMode::Recursive)?;
@@ -49,6 +54,7 @@ impl FsWatcher {
                     Err(e)    => warn!("inotify error: {e}"),
                 }
             }
+            warn!(mount_id, "watcher event loop exited — file change detection stopped");
         });
 
         Ok(Self { _watcher: watcher })

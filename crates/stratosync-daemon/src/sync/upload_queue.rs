@@ -55,7 +55,11 @@ impl UploadQueue {
     }
 
     pub async fn enqueue(&self, trigger: UploadTrigger) {
-        let _ = self.tx.send(trigger).await;
+        if let Err(e) = self.tx.send(trigger).await {
+            // Channel closed = upload_loop task died. Writes will not sync
+            // until the daemon is restarted.
+            warn!("upload queue send failed (loop dead?): {e}");
+        }
     }
 }
 
@@ -91,15 +95,18 @@ async fn upload_loop(
                     UploadTrigger::Fsync { inode } => (inode, Duration::ZERO),
                 };
 
-                // Cancel any existing timer for this inode
+                // Cancel any existing timer for this inode.
+                // Receiver dropped = timer already fired; that's fine.
                 if let Some(abort) = pending.remove(&inode) {
                     let _ = abort.send(());
                 }
 
                 // Respect concurrency limit
                 if in_flight.len() >= max_concurrent {
-                    // Re-queue with full debounce to avoid starvation
-                    let _ = tx_self.try_send(UploadTrigger::Write { inode });
+                    // Re-queue with full debounce to avoid starvation.
+                    if let Err(e) = tx_self.try_send(UploadTrigger::Write { inode }) {
+                        warn!(inode, "re-queue failed (channel full/closed): {e}");
+                    }
                     continue;
                 }
 
@@ -138,14 +145,22 @@ async fn upload_loop(
                     }
                     Ok((inode, Err(e))) if e.is_retryable() => {
                         warn!(inode, "upload transient error: {e} — will retry");
-                        let _ = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await;
-                        // Re-enqueue with full debounce
+                        if let Err(db_err) = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await {
+                            warn!(inode, "failed to record retry backoff: {db_err}");
+                        }
                         pending.remove(&inode);
-                        let _ = tx_self.try_send(UploadTrigger::Write { inode });
+                        if let Err(q_err) = tx_self.try_send(UploadTrigger::Write { inode }) {
+                            warn!(inode, "retry re-queue failed (channel full/closed): {q_err}");
+                        }
                     }
                     Ok((inode, Err(e))) => {
                         warn!(inode, "upload fatal: {e}");
-                        let _ = db.set_status(inode, SyncStatus::Dirty).await;
+                        // Reset to Dirty so the file is retried on next daemon start.
+                        // If this fails, the inode stays in Uploading; startup recovery
+                        // (get_pending_uploads) handles that case.
+                        if let Err(db_err) = db.set_status(inode, SyncStatus::Dirty).await {
+                            warn!(inode, "failed to reset status to Dirty: {db_err}");
+                        }
                         pending.remove(&inode);
                     }
                     Err(join_err) => {

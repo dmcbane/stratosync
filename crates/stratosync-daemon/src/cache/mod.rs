@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::time::{interval, Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use stratosync_core::{state::StateDb, types::SyncStatus};
 
@@ -37,7 +37,11 @@ impl CacheManager {
 
     /// Spawn the eviction loop as a background task.
     pub fn spawn(self) {
-        tokio::spawn(async move { self.run().await });
+        let mount_id = self.mount_id;
+        tokio::spawn(async move {
+            self.run().await;
+            error!(mount_id, "cache eviction loop exited unexpectedly");
+        });
     }
 
     async fn run(self) {
@@ -52,7 +56,9 @@ impl CacheManager {
 
     /// Called immediately after a successful hydration to check quota.
     pub async fn on_file_cached(&self, inode: u64, _size: u64) {
-        let _ = self.db.touch_lru(inode).await;
+        if let Err(e) = self.db.touch_lru(inode).await {
+            warn!(inode, "touch_lru failed, eviction order may be wrong: {e}");
+        }
         if let Err(e) = self.maybe_evict().await {
             warn!("post-hydrate eviction error: {e}");
         }

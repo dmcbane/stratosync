@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use stratosync_core::{
     backend::Backend,
@@ -62,18 +62,31 @@ pub async fn resolve(
 
     // ── 4. Update DB ──────────────────────────────────────────────────────────
 
-    // Fetch fresh metadata for the canonical remote path
-    let remote_meta = backend.stat(&entry.remote_path).await
-        .unwrap_or_else(|_| stratosync_core::types::RemoteMetadata {
-            path:      entry.remote_path.clone(),
-            name:      entry.name.clone(),
-            size:      fs_meta.len(),
-            mtime:     std::time::SystemTime::now(),
-            is_dir:    false,
-            etag:      None,
-            checksum:  None,
-            mime_type: None,
-        });
+    // Fetch fresh metadata for the canonical remote path.
+    // If stat fails (e.g. transient network error), fall back to local file
+    // metadata. The consequence is a missing etag, which means the next
+    // upload will skip the optimistic-lock check — acceptable because we
+    // just downloaded the winning version moments ago.
+    let remote_meta = match backend.stat(&entry.remote_path).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            warn!(
+                inode = entry.inode,
+                path = %entry.remote_path,
+                "stat after conflict download failed, using local metadata: {e}"
+            );
+            stratosync_core::types::RemoteMetadata {
+                path:      entry.remote_path.clone(),
+                name:      entry.name.clone(),
+                size:      fs_meta.len(),
+                mtime:     std::time::SystemTime::now(),
+                is_dir:    false,
+                etag:      None,
+                checksum:  None,
+                mime_type: None,
+            }
+        }
+    };
 
     // Update canonical inode with the downloaded version
     db.set_cached(
@@ -136,14 +149,26 @@ fn make_conflict_name(original_name: &str, cache_path: &Path) -> String {
     }
 }
 
-/// First 8 hex chars of the SHA-256 of the file content (or "00000000" on error).
+/// First 8 hex chars of a FNV-1a hash of the file's first 64 KiB.
+/// Returns "00000000" if the file cannot be read — this is acceptable
+/// for conflict naming (uniqueness is backstopped by the timestamp),
+/// but we log it so the I/O failure is visible.
 fn file_hash_prefix(path: &Path) -> String {
     use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else { return "00000000".into() };
+    let Ok(mut f) = std::fs::File::open(path) else {
+        warn!(?path, "conflict hash: failed to open file, using fallback hash");
+        return "00000000".into();
+    };
 
     // Read up to 64 KiB for a fast representative hash
     let mut buf = vec![0u8; 65536];
-    let n = f.read(&mut buf).unwrap_or(0);
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(?path, "conflict hash: read failed, using fallback hash: {e}");
+            return "00000000".into();
+        }
+    };
     buf.truncate(n);
 
     // Simple FNV-1a 64-bit hash (no crypto needed here — just disambiguation)
@@ -169,8 +194,10 @@ fn sibling_path(remote_path: &str, new_name: &str) -> String {
 // ── Desktop notification ──────────────────────────────────────────────────────
 
 fn emit_notification(original: &str, conflict_name: &str) {
-    // Attempt notify-send; silently ignore if not available
-    let _ = std::process::Command::new("notify-send")
+    // notify-send may not be installed (headless server, non-GNOME DE, etc.).
+    // Failure is expected and acceptable — the conflict is already logged
+    // at info level by the caller.
+    match std::process::Command::new("notify-send")
         .args([
             "--urgency=normal",
             "--icon=dialog-warning",
@@ -180,5 +207,10 @@ fn emit_notification(original: &str, conflict_name: &str) {
                  Your local version was saved as '{conflict_name}'."
             ),
         ])
-        .status();
+        .status()
+    {
+        Ok(s) if s.success() => debug!("desktop notification sent for conflict"),
+        Ok(s) => debug!("notify-send exited with {s}"),
+        Err(e) => debug!("notify-send unavailable: {e}"),
+    }
 }
