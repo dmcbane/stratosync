@@ -196,6 +196,48 @@ impl Filesystem for StratoFs {
         }
     }
 
+    fn setattr(
+        &mut self, _req: &Request<'_>, ino: u64, _mode: Option<u32>,
+        _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>, reply: ReplyAttr,
+    ) {
+        let (db, cfg, cache_dir) = (Arc::clone(&self.db), self.cfg.clone(), self.cache_dir.clone());
+        let queue = Arc::clone(&self.upload_queue);
+        let result = self.rt.block_on(async {
+            let entry = db.get_by_inode(ino).await?
+                .ok_or_else(|| anyhow::anyhow!("inode {ino}"))?;
+
+            // Handle truncate
+            if let Some(new_size) = size {
+                if let Some(cp) = &entry.cache_path {
+                    let f = tokio::fs::OpenOptions::new().write(true).open(cp).await?;
+                    f.set_len(new_size).await?;
+                } else {
+                    // File not hydrated — create a cache file at the right size
+                    let cp = cache_dir.join(entry.remote_path.trim_start_matches('/'));
+                    if let Some(p) = cp.parent() {
+                        tokio::fs::create_dir_all(p).await?;
+                    }
+                    let f = tokio::fs::File::create(&cp).await?;
+                    f.set_len(new_size).await?;
+                }
+                db.set_dirty_size(ino, new_size).await?;
+                queue.enqueue(UploadTrigger::Write { inode: ino }).await;
+            }
+
+            // Re-read to return updated attrs
+            db.get_by_inode(ino).await?
+                .ok_or_else(|| anyhow::anyhow!("inode {ino} gone after setattr"))
+        });
+        match result {
+            Ok(e) => reply.attr(&cfg.attr_timeout(), &entry_to_attr(&e)),
+            Err(e) => { error!(ino, "setattr: {e}"); reply.error(libc::EIO); }
+        }
+    }
+
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         let (db, cfg) = (Arc::clone(&self.db), self.cfg.clone());
         match self.rt.block_on(db.get_by_inode(ino)) {
