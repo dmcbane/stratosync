@@ -297,6 +297,16 @@ impl StateDb {
         Ok(())
     }
 
+    /// Mark a file as dirty and update its size (for getattr accuracy after writes).
+    pub async fn set_dirty_size(&self, inode: Inode, size: u64) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE file_index SET status='dirty', size=?1, cache_size=?1 WHERE inode=?2",
+            params![size as i64, inode as i64],
+        )?;
+        Ok(())
+    }
+
     pub async fn set_cached(
         &self,
         inode:      Inode,

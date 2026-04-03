@@ -62,11 +62,14 @@ pub async fn handle_write(
     file.write_all(data).await.map_err(|_| libc::EIO)?;
     file.flush().await.map_err(|_| libc::EIO)?;
 
-    // Mark dirty and start debounce.
-    // The FUSE write already succeeded (data is in the cache file), so we don't
-    // fail the syscall if the DB update fails — but we must surface the error.
-    if let Err(e) = db.set_status(entry.inode, SyncStatus::Dirty).await {
-        warn!(inode = entry.inode, "set_status(Dirty) failed: {e}");
+    // Get the new file size so getattr reports it correctly.
+    let new_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+
+    // Mark dirty and update size. The FUSE write already succeeded (data is
+    // in the cache file), so we don't fail the syscall if the DB update
+    // fails — but we must surface the error.
+    if let Err(e) = db.set_dirty_size(entry.inode, new_size).await {
+        warn!(inode = entry.inode, "set_dirty_size failed: {e}");
     }
     queue.enqueue(UploadTrigger::Write { inode: entry.inode }).await;
 
