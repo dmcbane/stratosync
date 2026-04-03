@@ -108,13 +108,17 @@ async fn main() -> Result<()> {
         let db_c         = Arc::clone(&db);
         let backend_c    = Arc::clone(&backend);
         let queue_c      = Arc::clone(&upload_queue);
+        // Capture the tokio Handle here (main thread has runtime context).
+        // The spawned std::thread has no tokio context, so Handle::current()
+        // would panic if called from within it.
+        let rt_handle    = tokio::runtime::Handle::current();
 
         let handle = std::thread::Builder::new()
             .name(format!("fuse-{}", mount_name))
             .spawn(move || {
                 if let Err(e) = fuse::mount(
                     &mount_name, mount_id, &mount_path,
-                    cache_dir, db_c, backend_c, queue_c, fuse_cfg,
+                    cache_dir, db_c, backend_c, queue_c, fuse_cfg, rt_handle,
                 ) {
                     error!(mount = %mount_name, "FUSE error: {e}");
                 }
@@ -129,9 +133,44 @@ async fn main() -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal — stopping");
-    for h in fuse_threads { let _ = h.join(); }
+    for h in fuse_threads {
+        if let Err(panic_val) = h.join() {
+            let msg = panic_val.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_val.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            error!("FUSE thread panicked: {msg}");
+        }
+    }
     info!("stratosyncd stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Proves the bug: Handle::current() panics when called from a bare
+    /// std::thread (no tokio runtime context). The fix is to capture the
+    /// Handle in the tokio context and pass it into the thread.
+    #[tokio::test]
+    async fn handle_current_panics_on_bare_thread() {
+        let h = std::thread::spawn(|| {
+            std::panic::catch_unwind(tokio::runtime::Handle::current)
+        });
+        let result = h.join().expect("thread itself must not panic");
+        assert!(result.is_err(), "Handle::current() must panic outside tokio context");
+    }
+
+    /// The correct pattern: capture the Handle in a tokio context, then
+    /// use it from a spawned std::thread via block_on.
+    #[tokio::test]
+    async fn captured_handle_works_on_bare_thread() {
+        let rt = tokio::runtime::Handle::current();
+        let h = std::thread::spawn(move || {
+            rt.block_on(async { 42 })
+        });
+        let result = h.join().expect("thread must not panic");
+        assert_eq!(result, 42);
+    }
 }
 
 fn init_logging(cfg: &Config) {

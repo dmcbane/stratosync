@@ -295,10 +295,9 @@ impl Filesystem for StratoFs {
 pub fn mount(
     mount_name: &str, mount_id: u32, mount_path: &std::path::Path,
     cache_dir: PathBuf, db: Arc<StateDb>, backend: Arc<dyn Backend>,
-    upload_queue: Arc<UploadQueue>, cfg: FuseConfig,
+    upload_queue: Arc<UploadQueue>, cfg: FuseConfig, rt: Handle,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
-    let rt = tokio::runtime::Handle::current();
     rt.block_on(async {
         if db.get_by_inode(FUSE_ROOT_INODE).await?.is_none() {
             db.insert_file(&NewFileEntry { mount_id, parent: FUSE_ROOT_INODE, name: "/".into(), remote_path: "/".into(), kind: FileKind::Directory, size: 0, mtime: SystemTime::now(), etag: None, status: SyncStatus::Remote, cache_path: None, cache_size: None }).await?;
