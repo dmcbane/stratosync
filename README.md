@@ -70,13 +70,19 @@ See [`docs/architecture/`](docs/architecture/) for detailed design documents.
 ## Quick Start (eventually)
 
 ```bash
-# Configure a backend
-stratosync init --backend gdrive --mount ~/GoogleDrive
+# 1. Configure a cloud remote
+rclone config
 
-# Start the daemon
-stratosync daemon start
+# 2. Edit stratosync config to add a mount
+$EDITOR ~/.config/stratosync/config.toml
 
-# Check status
+# 3. Test connectivity
+stratosync config test
+
+# 4. Start the daemon (or: systemctl --user start stratosyncd)
+RUST_LOG=stratosync=debug stratosyncd
+
+# 5. In another terminal — check status
 stratosync status
 stratosync ls ~/GoogleDrive/Documents
 ```

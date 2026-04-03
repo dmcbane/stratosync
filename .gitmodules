@@ -1,0 +1,3 @@
+[submodule "rclone-google-drive-skill"]
+	path = rclone-google-drive-skill
+	url = git@github.com:pmunin/rclone-google-drive-skill.git
