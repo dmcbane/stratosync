@@ -212,14 +212,26 @@ impl Filesystem for StratoFs {
             Err(e) => { error!(ino, "readdir: {e:#}"); reply.error(libc::EIO); }
             Ok(children) => {
                 debug!(ino, count = children.len(), offset, "readdir returning entries");
-                let dots = [(ino, FileType::Directory, "."), (ino, FileType::Directory, "..")];
-                let rest: Vec<(u64, FileType, String)> = children.iter().map(|e| {
-                    let ft = match e.kind { FileKind::Directory => FileType::Directory, FileKind::Symlink => FileType::Symlink, _ => FileType::RegularFile };
-                    (e.inode, ft, e.name.clone())
-                }).collect();
+                let dots: Vec<(u64, FileType, &str)> = vec![
+                    (ino, FileType::Directory, "."),
+                    (ino, FileType::Directory, ".."),
+                ];
                 let mut i = 0usize;
-                for (ino, ft, name) in dots.iter() { if i >= offset as usize && reply.add(*ino, (i+1) as i64, *ft, name) { return; } i += 1; }
-                for (ino, ft, name) in &rest { if i >= offset as usize && reply.add(*ino, (i+1) as i64, *ft, name.as_str()) { return; } i += 1; }
+                for &(dino, ft, name) in &dots {
+                    if i >= offset as usize && reply.add(dino, (i + 1) as i64, ft, name) {
+                        reply.ok();
+                        return;
+                    }
+                    i += 1;
+                }
+                for e in &children {
+                    let ft = match e.kind { FileKind::Directory => FileType::Directory, FileKind::Symlink => FileType::Symlink, _ => FileType::RegularFile };
+                    if i >= offset as usize && reply.add(e.inode, (i + 1) as i64, ft, e.name.as_str()) {
+                        reply.ok();
+                        return;
+                    }
+                    i += 1;
+                }
                 reply.ok();
             }
         }

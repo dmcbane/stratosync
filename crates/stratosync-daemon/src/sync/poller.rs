@@ -47,33 +47,31 @@ impl RemotePoller {
     async fn poll_once(&self) -> Result<()> {
         debug!(mount_id = self.mount_id, "polling remote");
 
-        // Fetch the complete remote listing
         let remote_files = self.backend.list_recursive("/").await?;
 
-        // Build a map: remote_path → RemoteMetadata
-        let _remote_map: HashMap<String, &RemoteMetadata> = remote_files.iter()
-            .map(|m| (m.path.clone(), m))
-            .collect();
+        // Sort so directories come before their children (shorter paths first).
+        // This ensures parent directories are upserted before their children,
+        // so we can look up parent inodes.
+        let mut sorted: Vec<&RemoteMetadata> = remote_files.iter().collect();
+        sorted.sort_by_key(|m| m.path.len());
 
-        // We process changes file by file. A full diff against DB entries is
-        // the approach here; Phase 3 replaces this with delta tokens.
-        //
-        // For each remote file:
-        //   - If not in DB → mark as Added (upsert with status=remote)
-        //   - If in DB and ETags differ → Modified (set status=stale, unless dirty/uploading)
-        //
-        // For each DB file not in remote listing → mark as Deleted
-        // (Phase 2: actually delete from DB; Phase 1: just log)
+        // Cache path → inode so we can resolve parents without DB lookups
+        let mut path_to_inode: HashMap<String, Inode> = HashMap::new();
 
-        for meta in &remote_files {
+        for meta in &sorted {
             let kind = if meta.is_dir { FileKind::Directory } else { FileKind::File };
 
-            // Determine parent inode (simplified: walk path components)
-            // In a full implementation this would resolve the parent properly.
-            // For now, we use inode 1 (root) as the parent for top-level entries.
-            let parent = FUSE_ROOT_INODE;
+            // Resolve parent inode from the entry's path.
+            // e.g. "Documents/Notes/file.txt" → parent is "Documents/Notes"
+            let parent = match meta.path.rfind('/') {
+                Some(idx) => {
+                    let parent_path = &meta.path[..idx];
+                    *path_to_inode.get(parent_path).unwrap_or(&FUSE_ROOT_INODE)
+                }
+                None => FUSE_ROOT_INODE, // top-level entry
+            };
 
-            self.db.upsert_remote_file(
+            let inode = self.db.upsert_remote_file(
                 self.mount_id,
                 parent,
                 &meta.name,
@@ -83,6 +81,10 @@ impl RemotePoller {
                 meta.mtime,
                 meta.etag.as_deref(),
             ).await?;
+
+            if meta.is_dir {
+                path_to_inode.insert(meta.path.clone(), inode);
+            }
         }
 
         debug!(
