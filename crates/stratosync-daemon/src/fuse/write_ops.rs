@@ -211,12 +211,6 @@ pub async fn handle_unlink(
         .map_err(|_| libc::EIO)?
         .ok_or(libc::ENOENT)?;
 
-    // Delete remotely (best-effort; if file doesn't exist remotely that's fine)
-    match backend.delete(&entry.remote_path).await {
-        Ok(()) | Err(SyncError::NotFound(_)) => {}
-        Err(e) => { warn!("remote delete error: {e}"); return Err(libc::EIO); }
-    }
-
     // Remove local cache file if present.
     // ENOENT is acceptable (file may not have been hydrated).
     if let Some(cp) = &entry.cache_path {
@@ -227,10 +221,23 @@ pub async fn handle_unlink(
         }
     }
 
+    // Remove DB entry first so the file disappears from listings immediately.
+    let remote_path = entry.remote_path.clone();
     db.delete_entry(entry.inode).await.map_err(|_| libc::EIO)?;
     if let Err(e) = db.invalidate_dir(parent).await {
         warn!(parent, "invalidate_dir after unlink failed: {e}");
     }
+
+    // Delete remotely in background — don't block the FUSE thread.
+    // NotFound is fine (file may not exist remotely, e.g. never uploaded).
+    let backend = Arc::clone(backend);
+    tokio::spawn(async move {
+        match backend.delete(&remote_path).await {
+            Ok(()) | Err(SyncError::NotFound(_)) => {}
+            Err(e) => warn!(path = %remote_path, "background remote delete failed: {e}"),
+        }
+    });
+
     Ok(())
 }
 
@@ -252,15 +259,21 @@ pub async fn handle_rmdir(
     let children = db.list_children(entry.inode).await.map_err(|_| libc::EIO)?;
     if !children.is_empty() { return Err(libc::ENOTEMPTY); }
 
-    match backend.delete(&entry.remote_path).await {
-        Ok(()) | Err(SyncError::NotFound(_)) => {}
-        Err(_) => return Err(libc::EIO),
-    }
-
+    let remote_path = entry.remote_path.clone();
     db.delete_entry(entry.inode).await.map_err(|_| libc::EIO)?;
     if let Err(e) = db.invalidate_dir(parent).await {
         warn!(parent, "invalidate_dir after rmdir failed: {e}");
     }
+
+    // Delete remotely in background
+    let backend = Arc::clone(backend);
+    tokio::spawn(async move {
+        match backend.delete(&remote_path).await {
+            Ok(()) | Err(SyncError::NotFound(_)) => {}
+            Err(e) => warn!(path = %remote_path, "background remote rmdir failed: {e}"),
+        }
+    });
+
     Ok(())
 }
 

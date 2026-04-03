@@ -166,6 +166,12 @@ impl RcloneBackend {
                     Err(SyncError::Conflict { local: None, remote: etag_hint })
                 } else if stderr.contains("403") || stderr.contains("Permission denied") {
                     Err(SyncError::PermissionDenied(stderr.into_owned()))
+                } else if stderr.contains("doesn't exist")
+                       || stderr.contains("not found")
+                       || stderr.contains("Not Found")
+                       || stderr.contains("404")
+                {
+                    Err(SyncError::NotFound(stderr.into_owned()))
                 } else {
                     Err(SyncError::Fatal(stderr.into_owned()))
                 }
