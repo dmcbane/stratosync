@@ -77,6 +77,13 @@ async fn main() -> Result<()> {
             upload_queue.enqueue(sync::UploadTrigger::Write { inode: entry.inode }).await;
         }
 
+        // Ensure cache directory exists before watcher and FUSE mount need it.
+        // fuse::mount() creates .meta/partial inside it, but the watcher needs
+        // the base directory to exist first.
+        let cache_dir = mount_cfg.cache_dir();
+        std::fs::create_dir_all(&cache_dir)
+            .with_context(|| format!("create cache dir {:?}", cache_dir))?;
+
         // Cache manager
         cache::CacheManager::new(mount_id, Arc::clone(&db), mount_cfg.cache_quota_bytes()?)
             .with_marks(
@@ -106,7 +113,6 @@ async fn main() -> Result<()> {
 
         // FUSE mount (blocking thread)
         let mount_path   = mount_cfg.resolved_mount_path();
-        let cache_dir    = mount_cfg.cache_dir();
         let fuse_cfg     = cfg.daemon.fuse.clone();
         let mount_name   = mount_cfg.name.clone();
         let db_c         = Arc::clone(&db);

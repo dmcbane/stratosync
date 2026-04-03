@@ -319,6 +319,7 @@ pub fn mount(
         Ok::<_, anyhow::Error>(())
     })?;
     std::fs::create_dir_all(cache_dir.join(".meta").join("partial"))?;
+    std::fs::create_dir_all(mount_path)?;
     let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters: Arc::new(DashMap::new()), upload_queue };
     let mut opts = vec![MountOption::FSName(format!("stratosync:{mount_name}")), MountOption::AutoUnmount, MountOption::DefaultPermissions];
     if cfg.allow_other { opts.push(MountOption::AllowOther); }
