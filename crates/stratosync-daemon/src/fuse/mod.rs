@@ -108,9 +108,14 @@ async fn do_hydrate(
     waiters: &Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
     entry: &FileEntry,
 ) -> Result<(), SyncError> {
-    let cache_path = cache_dir.join(entry.remote_path.trim_start_matches('/'));
+    let cache_path = write_ops::safe_cache_path(cache_dir, &entry.remote_path)
+        .map_err(|e| SyncError::Fatal(format!("unsafe cache path: errno {e}")))?;
+    // Use inode + random suffix for temp files to prevent symlink races
+    let rand: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+        .subsec_nanos() as u64;
     let tmp_path   = cache_dir.join(".meta").join("partial")
-                              .join(format!("{}.tmp", entry.inode));
+                              .join(format!("{}.{:x}.tmp", entry.inode, rand));
 
     let result: Result<(), SyncError> = async {
         backend.download(&entry.remote_path, &tmp_path).await?;
@@ -156,7 +161,14 @@ async fn populate_directory(
         .map_err(|e| anyhow::anyhow!("list {:?}: {e}", dir.remote_path))?;
     debug!(inode = dir.inode, count = children.len(), "listed children");
 
-    let entries: Vec<_> = children.iter().map(|child| {
+    let entries: Vec<_> = children.iter().filter(|child| {
+        // Reject entries with path traversal or null bytes
+        if child.name.contains("..") || child.name.contains('\0') || child.name.contains('/') {
+            warn!(name = %child.name, "skipping entry with unsafe filename");
+            return false;
+        }
+        true
+    }).map(|child| {
         let kind = if child.is_dir { FileKind::Directory } else { FileKind::File };
         // child.path from rclone lsjson is relative to the listed directory.
         // We need the full path from root to match the poller's paths and
@@ -426,7 +438,11 @@ pub fn mount(
     upload_queue: Arc<UploadQueue>, cfg: FuseConfig, rt: Handle,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
-    std::fs::create_dir_all(cache_dir.join(".meta").join("partial"))?;
+    use std::os::unix::fs::PermissionsExt;
+    let partial_dir = cache_dir.join(".meta").join("partial");
+    std::fs::create_dir_all(&partial_dir)?;
+    // Restrict partial dir to owner-only (prevents symlink attacks by other users)
+    std::fs::set_permissions(&partial_dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(mount_path)?;
     let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters: Arc::new(DashMap::new()), upload_queue };
     let mut opts = vec![MountOption::FSName(format!("stratosync:{mount_name}")), MountOption::AutoUnmount, MountOption::DefaultPermissions];

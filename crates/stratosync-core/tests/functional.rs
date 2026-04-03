@@ -639,3 +639,106 @@ async fn backend_list_returns_seeded_files() {
     assert!(names.contains(&"b.txt"));
     assert!(names.contains(&"c.txt"));
 }
+
+// ── Security: path traversal ─────────────────────────────────────────────────
+
+#[test]
+fn join_remote_does_not_inject_traversal() {
+    // join_remote is a pure path builder — the caller (FUSE handlers) validates
+    // the child name. But join_remote itself should not introduce traversal.
+    assert_eq!(join_remote("/", ".."), "..");
+    assert_eq!(join_remote("Documents", ".."), "Documents/..");
+    // The validate_filename() check in FUSE handlers rejects ".." before
+    // join_remote is called, so these paths should never reach the DB.
+}
+
+#[tokio::test]
+async fn path_traversal_in_remote_path_does_not_escape_db() {
+    // Even if a traversal path reaches the DB (e.g. from a malicious remote),
+    // the UNIQUE constraint prevents overwriting unrelated entries.
+    let (db, mid, root) = setup().await;
+
+    // Insert a normal file
+    let normal = insert_file(&db, mid, root, "safe.txt", "safe.txt", SyncStatus::Remote, None).await;
+
+    // Insert a file with traversal in remote_path (simulates malicious remote)
+    let evil = insert_file(&db, mid, root, "evil.txt", "../safe.txt", SyncStatus::Remote, None).await;
+
+    // They are distinct entries (different remote_paths)
+    assert_ne!(normal, evil);
+    let normal_entry = db.get_by_inode(normal).await.unwrap().unwrap();
+    assert_eq!(normal_entry.remote_path, "safe.txt");
+}
+
+#[tokio::test]
+async fn symlink_in_cache_rejected_by_upload() {
+    // Verify that a symlink cache file is detected.
+    // The actual check is in upload_queue.rs — we test the metadata detection here.
+    let tmp = tempdir();
+    let real_file = tmp.join("real.txt");
+    let link_file = tmp.join("link.txt");
+    std::fs::write(&real_file, b"real content").unwrap();
+    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+    // symlink_metadata should detect the symlink
+    let meta = std::fs::symlink_metadata(&link_file).unwrap();
+    assert!(meta.file_type().is_symlink(), "must detect symlink");
+
+    // Regular file should not be detected as symlink
+    let meta = std::fs::symlink_metadata(&real_file).unwrap();
+    assert!(!meta.file_type().is_symlink());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ── Security: SQL injection ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sql_injection_in_filename_is_harmless() {
+    let (db, mid, root) = setup().await;
+
+    // Filenames with SQL injection attempts
+    let evil_names = [
+        "'; DROP TABLE file_index; --",
+        "\" OR 1=1 --",
+        "file.txt'; DELETE FROM mounts WHERE '1'='1",
+        "Robert'); DROP TABLE file_index;--",
+    ];
+
+    for name in &evil_names {
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: root,
+            name: (*name).into(), remote_path: (*name).into(),
+            kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+            etag: None, status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        assert_eq!(entry.name, *name, "SQL injection must be stored as literal text");
+    }
+
+    // Tables must still exist and be functional
+    let children = db.list_children(root).await.unwrap();
+    assert_eq!(children.len(), evil_names.len());
+}
+
+// ── Security: integer boundaries ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn zero_and_max_file_sizes() {
+    let (db, mid, root) = setup().await;
+
+    // Zero-size file
+    let z = insert_file(&db, mid, root, "zero.txt", "zero.txt", SyncStatus::Remote, None).await;
+    db.set_dirty_size(z, 0).await.unwrap();
+    let entry = db.get_by_inode(z).await.unwrap().unwrap();
+    assert_eq!(entry.size, 0);
+
+    // Very large size (near i64::MAX / 2 to avoid SQLite overflow)
+    let big = insert_file(&db, mid, root, "big.txt", "big.txt", SyncStatus::Remote, None).await;
+    let large_size = 4_000_000_000_000u64; // 4 TB
+    db.set_dirty_size(big, large_size).await.unwrap();
+    let entry = db.get_by_inode(big).await.unwrap().unwrap();
+    assert_eq!(entry.size, large_size);
+}

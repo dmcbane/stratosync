@@ -49,6 +49,14 @@ impl RemotePoller {
 
         let remote_files = self.backend.list_recursive("/").await?;
 
+        const MAX_POLL_ENTRIES: usize = 500_000;
+        if remote_files.len() > MAX_POLL_ENTRIES {
+            anyhow::bail!(
+                "remote listing has {} entries (limit {}); consider selective sync",
+                remote_files.len(), MAX_POLL_ENTRIES,
+            );
+        }
+
         // Sort so directories come before their children (shorter paths first).
         // This ensures parent directories are upserted before their children,
         // so we can look up parent inodes.
@@ -59,6 +67,12 @@ impl RemotePoller {
         let mut path_to_inode: HashMap<String, Inode> = HashMap::new();
 
         for meta in &sorted {
+            // Skip entries with path traversal components or null bytes
+            if meta.path.contains("..") || meta.path.contains('\0') || meta.name.contains('/') {
+                warn!(path = %meta.path, "skipping remote entry with unsafe path");
+                continue;
+            }
+
             let kind = if meta.is_dir { FileKind::Directory } else { FileKind::File };
 
             // Resolve parent inode from the entry's path.

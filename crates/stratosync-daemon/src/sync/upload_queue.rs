@@ -192,6 +192,13 @@ async fn run_upload(
         return Err(SyncError::Fatal(format!("cache file missing: {}", cache_path.display())));
     }
 
+    // Reject symlinks — prevents uploading arbitrary files via cache dir manipulation
+    let file_meta = tokio::fs::symlink_metadata(&cache_path).await
+        .map_err(SyncError::Io)?;
+    if file_meta.file_type().is_symlink() {
+        return Err(SyncError::Fatal(format!("cache file is a symlink: {}", cache_path.display())));
+    }
+
     // Mark as UPLOADING before we start
     db.set_status(inode, SyncStatus::Uploading).await
         .map_err(|e| SyncError::Fatal(e.to_string()))?;

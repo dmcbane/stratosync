@@ -117,13 +117,14 @@ pub async fn handle_create(
     open_files:   &Arc<DashMap<u64, super::OpenFile>>,
     next_fh:      &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(Inode, u64), libc::c_int> {
-    // Derive parent's remote_path to build child's remote_path
+    validate_filename(name)?;
+
     let parent_entry = db.get_by_inode(parent).await
         .map_err(|_| libc::EIO)?
         .ok_or(libc::ENOENT)?;
 
     let remote_path = join_remote(&parent_entry.remote_path, name);
-    let cache_path  = cache_dir.join(remote_path.trim_start_matches('/'));
+    let cache_path  = safe_cache_path(cache_dir, &remote_path)?;
 
     // Create the empty cache file
     if let Some(parent_dir) = cache_path.parent() {
@@ -172,6 +173,8 @@ pub async fn handle_mkdir(
     db:       &Arc<StateDb>,
     backend:  &Arc<dyn Backend>,
 ) -> Result<Inode, libc::c_int> {
+    validate_filename(name)?;
+
     let parent_entry = db.get_by_inode(parent).await
         .map_err(|_| libc::EIO)?
         .ok_or(libc::ENOENT)?;
@@ -290,6 +293,8 @@ pub async fn handle_rename(
     db:         &Arc<StateDb>,
     backend:    &Arc<dyn Backend>,
 ) -> Result<(), libc::c_int> {
+    validate_filename(new_name)?;
+
     let entry = db.get_by_parent_name(parent, name).await
         .map_err(|_| libc::EIO)?
         .ok_or(libc::ENOENT)?;
@@ -365,6 +370,48 @@ pub async fn handle_rename(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Validate a filename from a FUSE operation or rclone listing.
+/// Rejects path traversal components, embedded slashes, and null bytes.
+pub fn validate_filename(name: &str) -> Result<(), libc::c_int> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+    {
+        warn!(name, "rejected invalid filename");
+        return Err(libc::EINVAL);
+    }
+    Ok(())
+}
+
+/// Construct a cache path and verify it stays within the cache directory.
+/// Prevents path traversal via ".." in remote_path components.
+pub fn safe_cache_path(cache_dir: &Path, remote_path: &str) -> Result<PathBuf, libc::c_int> {
+    let rel = remote_path.trim_start_matches('/');
+    let candidate = cache_dir.join(rel);
+    // Resolve ".." and symlinks — the canonical path must still be under cache_dir
+    // For files that don't exist yet, canonicalize the parent directory
+    let check_dir = if candidate.exists() {
+        match candidate.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return Err(libc::EIO),
+        }
+    } else {
+        let parent = candidate.parent().unwrap_or(cache_dir);
+        match parent.canonicalize() {
+            Ok(p) => p.join(candidate.file_name().unwrap_or_default()),
+            Err(_) => candidate.clone(),
+        }
+    };
+    let canon_cache = cache_dir.canonicalize().unwrap_or_else(|_| cache_dir.to_path_buf());
+    if !check_dir.starts_with(&canon_cache) {
+        warn!(path = ?candidate, "path traversal attempt — escapes cache dir");
+        return Err(libc::EACCES);
+    }
+    Ok(candidate)
+}
 
 /// Concatenate a parent remote path with a child name.
 /// Returns paths without a leading slash to match rclone's lsjson output.
