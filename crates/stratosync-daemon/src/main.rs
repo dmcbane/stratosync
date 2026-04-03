@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
     if reset > 0 { info!(count = reset, "reset stale hydrations"); }
 
     let mut fuse_threads = vec![];
+    let mut _watchers = vec![]; // must outlive fuse_threads to keep inotify alive
 
     for mount_cfg in cfg.mounts.iter().filter(|m| m.enabled) {
         let backend: Arc<dyn Backend> = Arc::new(
@@ -98,12 +99,13 @@ async fn main() -> Result<()> {
             )
             .spawn();
 
-        // inotify watcher
-        if let Err(e) = watcher::FsWatcher::start(
+        // inotify watcher — must be stored to keep the watcher alive
+        match watcher::FsWatcher::start(
             mount_cfg.cache_dir(), mount_id,
             Arc::clone(&db), Arc::clone(&upload_queue),
         ) {
-            warn!(mount = %mount_cfg.name, "inotify watcher failed to start: {e}");
+            Ok(w) => _watchers.push(w),
+            Err(e) => warn!(mount = %mount_cfg.name, "inotify watcher failed to start: {e}"),
         }
 
         // Remote poller

@@ -168,6 +168,7 @@ async fn populate_directory(
 impl Filesystem for StratoFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
+        let name_log = name_str.clone();
         let (db, backend, cfg, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.cfg.clone(), self.mount_id);
         let result = self.rt.block_on(async move {
             if let Some(e) = db.get_by_parent_name(parent, &name_str).await? { return Ok(Some(e)); }
@@ -182,7 +183,7 @@ impl Filesystem for StratoFs {
         match result {
             Ok(Some(e)) => reply.entry(&cfg.entry_timeout(), &entry_to_attr(&e), 0),
             Ok(None)    => reply.error(libc::ENOENT),
-            Err(e)      => { error!("lookup: {e}"); reply.error(libc::EIO); }
+            Err(e)      => { error!(parent, name = %name_log, "lookup: {e:#}"); reply.error(libc::EIO); }
         }
     }
 
@@ -203,7 +204,7 @@ impl Filesystem for StratoFs {
             db.list_children(ino).await
         });
         match result {
-            Err(e) => { error!("readdir: {e}"); reply.error(libc::EIO); }
+            Err(e) => { error!(ino, "readdir: {e:#}"); reply.error(libc::EIO); }
             Ok(children) => {
                 let dots = [(ino, FileType::Directory, "."), (ino, FileType::Directory, "..")];
                 let rest: Vec<(u64, FileType, String)> = children.iter().map(|e| {
