@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-04-04
+
+### Added
+- **Delete tombstones**: `rm` and `rm -rf` now work reliably. When files are
+  deleted locally, a tombstone record prevents the poller from re-adding them
+  before the background remote delete completes. Directory tombstones also
+  block children (prefix match). Tombstones expire after 5 minutes as a safety
+  net and are cleaned up each poll cycle.
+- New migration `0002_delete_tombstones` with `delete_tombstones` table
+- 9 new tombstone tests
+
 ## [0.2.1] - 2026-04-03
 
 ### Security
