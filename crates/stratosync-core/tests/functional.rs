@@ -640,6 +640,128 @@ async fn backend_list_returns_seeded_files() {
     assert!(names.contains(&"c.txt"));
 }
 
+// ── Tombstones ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tombstone_blocks_exact_path() {
+    let (db, mid, _root) = setup().await;
+    db.insert_tombstone(mid, "test/file.txt", 300).await.unwrap();
+
+    assert!(db.is_tombstoned(mid, "test/file.txt").await.unwrap());
+    assert!(!db.is_tombstoned(mid, "test/other.txt").await.unwrap());
+    assert!(!db.is_tombstoned(mid, "other/file.txt").await.unwrap());
+}
+
+#[tokio::test]
+async fn tombstone_blocks_children_of_directory() {
+    let (db, mid, _root) = setup().await;
+    db.insert_tombstone(mid, "mydir", 300).await.unwrap();
+
+    // Exact match
+    assert!(db.is_tombstoned(mid, "mydir").await.unwrap());
+    // Children
+    assert!(db.is_tombstoned(mid, "mydir/file.txt").await.unwrap());
+    assert!(db.is_tombstoned(mid, "mydir/sub/deep.txt").await.unwrap());
+    // Siblings are not blocked
+    assert!(!db.is_tombstoned(mid, "mydir2").await.unwrap());
+    assert!(!db.is_tombstoned(mid, "other").await.unwrap());
+}
+
+#[tokio::test]
+async fn tombstone_expires() {
+    let (db, mid, _root) = setup().await;
+    // TTL = 0 means already expired
+    db.insert_tombstone(mid, "expired.txt", 0).await.unwrap();
+
+    assert!(!db.is_tombstoned(mid, "expired.txt").await.unwrap(),
+        "expired tombstone must not block");
+}
+
+#[tokio::test]
+async fn tombstone_removal() {
+    let (db, mid, _root) = setup().await;
+    db.insert_tombstone(mid, "removed.txt", 300).await.unwrap();
+    assert!(db.is_tombstoned(mid, "removed.txt").await.unwrap());
+
+    db.remove_tombstone(mid, "removed.txt").await.unwrap();
+    assert!(!db.is_tombstoned(mid, "removed.txt").await.unwrap());
+}
+
+#[tokio::test]
+async fn tombstone_idempotent_insert() {
+    let (db, mid, _root) = setup().await;
+    db.insert_tombstone(mid, "dup.txt", 300).await.unwrap();
+    db.insert_tombstone(mid, "dup.txt", 600).await.unwrap(); // no error, updates TTL
+    assert!(db.is_tombstoned(mid, "dup.txt").await.unwrap());
+}
+
+#[tokio::test]
+async fn cleanup_expired_tombstones() {
+    let (db, mid, _root) = setup().await;
+    db.insert_tombstone(mid, "alive.txt", 300).await.unwrap();
+    db.insert_tombstone(mid, "dead.txt", 0).await.unwrap();
+
+    let cleaned = db.cleanup_expired_tombstones().await.unwrap();
+    assert!(cleaned >= 1);
+
+    // alive survives, dead is gone
+    let active = db.active_tombstones(mid).await.unwrap();
+    assert!(active.contains(&"alive.txt".to_string()));
+    assert!(!active.contains(&"dead.txt".to_string()));
+}
+
+#[tokio::test]
+async fn active_tombstones_returns_only_live_entries() {
+    let (db, mid, _root) = setup().await;
+    db.insert_tombstone(mid, "a.txt", 300).await.unwrap();
+    db.insert_tombstone(mid, "b.txt", 300).await.unwrap();
+    db.insert_tombstone(mid, "expired.txt", 0).await.unwrap();
+
+    let active = db.active_tombstones(mid).await.unwrap();
+    assert_eq!(active.len(), 2);
+    assert!(active.contains(&"a.txt".to_string()));
+    assert!(active.contains(&"b.txt".to_string()));
+}
+
+#[tokio::test]
+async fn tombstone_does_not_cross_mounts() {
+    let (db, _mid1, _root) = setup().await;
+    let mid2 = db.upsert_mount("other", "other:/", "/mnt/other", "/tmp/other", 5 << 30, 60)
+        .await.unwrap();
+
+    db.insert_tombstone(_mid1, "shared.txt", 300).await.unwrap();
+
+    assert!(db.is_tombstoned(_mid1, "shared.txt").await.unwrap());
+    assert!(!db.is_tombstoned(mid2, "shared.txt").await.unwrap());
+}
+
+#[tokio::test]
+async fn poller_skips_tombstoned_files_in_batch() {
+    // Simulates the poller's in-memory tombstone check pattern
+    let (db, mid, root) = setup().await;
+
+    // Create tombstones
+    db.insert_tombstone(mid, "deleted.txt", 300).await.unwrap();
+    db.insert_tombstone(mid, "deleted_dir", 300).await.unwrap();
+
+    // Load active tombstones (what the poller does at the start of poll_once)
+    let tombstones = db.active_tombstones(mid).await.unwrap();
+
+    // Simulate filtering remote entries
+    let remote_paths = vec![
+        "alive.txt",
+        "deleted.txt",         // exact tombstone match
+        "deleted_dir/child.txt", // under tombstoned dir
+        "other.txt",
+    ];
+
+    let should_upsert: Vec<&&str> = remote_paths.iter().filter(|path| {
+        !tombstones.iter().any(|t| *path == t || path.starts_with(&format!("{t}/")))
+    }).collect();
+
+    assert_eq!(should_upsert, vec![&"alive.txt", &"other.txt"]);
+}
+
 // ── Security: path traversal ─────────────────────────────────────────────────
 
 #[test]

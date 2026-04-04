@@ -161,18 +161,23 @@ async fn populate_directory(
         .map_err(|e| anyhow::anyhow!("list {:?}: {e}", dir.remote_path))?;
     debug!(inode = dir.inode, count = children.len(), "listed children");
 
+    // Load tombstones to skip recently-deleted entries
+    let tombstones = db.active_tombstones(mid).await.unwrap_or_default();
+
     let entries: Vec<_> = children.iter().filter(|child| {
         // Reject entries with path traversal or null bytes
         if child.name.contains("..") || child.name.contains('\0') || child.name.contains('/') {
             warn!(name = %child.name, "skipping entry with unsafe filename");
             return false;
         }
+        let full_path = write_ops::join_remote(&dir.remote_path, &child.name);
+        // Skip tombstoned entries
+        if tombstones.iter().any(|t| full_path == *t || full_path.starts_with(&format!("{t}/"))) {
+            return false;
+        }
         true
     }).map(|child| {
         let kind = if child.is_dir { FileKind::Directory } else { FileKind::File };
-        // child.path from rclone lsjson is relative to the listed directory.
-        // We need the full path from root to match the poller's paths and
-        // for correct rclone operations (delete, download, etc.).
         let full_path = write_ops::join_remote(&dir.remote_path, &child.name);
         (child.name.clone(), full_path, kind, child.size, child.mtime, child.etag.clone())
     }).collect();
@@ -371,14 +376,14 @@ impl Filesystem for StratoFs {
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
-        let (db, backend) = (Arc::clone(&self.db), Arc::clone(&self.backend));
-        match self.rt.block_on(write_ops::handle_unlink(parent, &name_str, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
+        let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
+        match self.rt.block_on(write_ops::handle_unlink(parent, &name_str, mid, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
-        let (db, backend) = (Arc::clone(&self.db), Arc::clone(&self.backend));
-        match self.rt.block_on(write_ops::handle_rmdir(parent, &name_str, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
+        let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
+        match self.rt.block_on(write_ops::handle_rmdir(parent, &name_str, mid, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
     }
 
     fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {

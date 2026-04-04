@@ -610,6 +610,7 @@ impl FileKind {
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001", include_str!("migrations/0001_initial.sql")),
+    ("0002", include_str!("migrations/0002_delete_tombstones.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -786,6 +787,74 @@ impl StateDb {
             params![inode as i64],
         )?;
         Ok(())
+    }
+
+    // ── Tombstones ─────────────────────────────────────────────────────────────
+
+    /// Record a tombstone so the poller skips this path until the remote
+    /// delete completes or the TTL expires.
+    pub async fn insert_tombstone(
+        &self,
+        mount_id:    u32,
+        remote_path: &str,
+        ttl_secs:    u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO delete_tombstones (mount_id, remote_path, expires_at)
+             VALUES (?1, ?2, unixepoch() + ?3)",
+            params![mount_id, remote_path, ttl_secs as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a tombstone after successful remote deletion.
+    pub async fn remove_tombstone(&self, mount_id: u32, remote_path: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM delete_tombstones WHERE mount_id = ?1 AND remote_path = ?2",
+            params![mount_id, remote_path],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a path is tombstoned (exact match or under a tombstoned directory).
+    pub async fn is_tombstoned(&self, mount_id: u32, remote_path: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let found: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM delete_tombstones
+                WHERE mount_id = ?1
+                  AND expires_at > unixepoch()
+                  AND (?2 = remote_path OR ?2 LIKE remote_path || '/%')
+            )",
+            params![mount_id, remote_path],
+            |r| r.get(0),
+        )?;
+        Ok(found)
+    }
+
+    /// Load all active tombstone paths for a mount into memory.
+    /// Used by the poller to batch-check without per-file DB queries.
+    pub async fn active_tombstones(&self, mount_id: u32) -> Result<Vec<String>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT remote_path FROM delete_tombstones
+             WHERE mount_id = ?1 AND expires_at > unixepoch()",
+        )?;
+        let paths = stmt.query_map(params![mount_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(paths)
+    }
+
+    /// Delete expired tombstones.
+    pub async fn cleanup_expired_tombstones(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "DELETE FROM delete_tombstones WHERE expires_at <= unixepoch()",
+            [],
+        )?;
+        Ok(n)
     }
 
     /// Delete all file_index and related entries for a mount.

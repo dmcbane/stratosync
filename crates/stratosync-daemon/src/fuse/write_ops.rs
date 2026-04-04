@@ -208,10 +208,11 @@ pub async fn handle_mkdir(
 // ── unlink ────────────────────────────────────────────────────────────────────
 
 pub async fn handle_unlink(
-    parent:  Inode,
-    name:    &str,
-    db:      &Arc<StateDb>,
-    backend: &Arc<dyn Backend>,
+    parent:   Inode,
+    name:     &str,
+    mount_id: u32,
+    db:       &Arc<StateDb>,
+    backend:  &Arc<dyn Backend>,
 ) -> Result<(), libc::c_int> {
     let entry = db.get_by_parent_name(parent, name).await
         .map_err(|_| libc::EIO)?
@@ -227,19 +228,25 @@ pub async fn handle_unlink(
         }
     }
 
-    // Remove DB entry first so the file disappears from listings immediately.
+    // Remove DB entry and insert tombstone so the poller doesn't re-add it
+    // before the background remote delete completes.
     let remote_path = entry.remote_path.clone();
     db.delete_entry(entry.inode).await.map_err(|_| libc::EIO)?;
+    if let Err(e) = db.insert_tombstone(mount_id, &remote_path, 300).await {
+        warn!(path = %remote_path, "insert_tombstone failed: {e}");
+    }
     if let Err(e) = db.invalidate_dir(parent).await {
         warn!(parent, "invalidate_dir after unlink failed: {e}");
     }
 
-    // Delete remotely in background — don't block the FUSE thread.
-    // NotFound is fine (file may not exist remotely, e.g. never uploaded).
+    // Delete remotely in background. Remove tombstone on success.
     let backend = Arc::clone(backend);
+    let db = Arc::clone(db);
     tokio::spawn(async move {
         match backend.delete(&remote_path).await {
-            Ok(()) | Err(SyncError::NotFound(_)) => {}
+            Ok(()) | Err(SyncError::NotFound(_)) => {
+                let _ = db.remove_tombstone(mount_id, &remote_path).await;
+            }
             Err(e) => warn!(path = %remote_path, "background remote delete failed: {e}"),
         }
     });
@@ -250,10 +257,11 @@ pub async fn handle_unlink(
 // ── rmdir ─────────────────────────────────────────────────────────────────────
 
 pub async fn handle_rmdir(
-    parent:  Inode,
-    name:    &str,
-    db:      &Arc<StateDb>,
-    backend: &Arc<dyn Backend>,
+    parent:   Inode,
+    name:     &str,
+    mount_id: u32,
+    db:       &Arc<StateDb>,
+    backend:  &Arc<dyn Backend>,
 ) -> Result<(), libc::c_int> {
     let entry = db.get_by_parent_name(parent, name).await
         .map_err(|_| libc::EIO)?
@@ -267,15 +275,22 @@ pub async fn handle_rmdir(
 
     let remote_path = entry.remote_path.clone();
     db.delete_entry(entry.inode).await.map_err(|_| libc::EIO)?;
+    // Directory tombstone also blocks children (e.g. rm -rf dir/)
+    if let Err(e) = db.insert_tombstone(mount_id, &remote_path, 300).await {
+        warn!(path = %remote_path, "insert_tombstone failed: {e}");
+    }
     if let Err(e) = db.invalidate_dir(parent).await {
         warn!(parent, "invalidate_dir after rmdir failed: {e}");
     }
 
-    // Remove remote directory in background (uses rclone rmdir, not deletefile)
+    // Remove remote directory in background. Remove tombstone on success.
     let backend = Arc::clone(backend);
+    let db = Arc::clone(db);
     tokio::spawn(async move {
         match backend.rmdir(&remote_path).await {
-            Ok(()) | Err(SyncError::NotFound(_)) => {}
+            Ok(()) | Err(SyncError::NotFound(_)) => {
+                let _ = db.remove_tombstone(mount_id, &remote_path).await;
+            }
             Err(e) => warn!(path = %remote_path, "background remote rmdir failed: {e}"),
         }
     });

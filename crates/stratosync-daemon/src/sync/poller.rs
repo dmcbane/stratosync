@@ -63,13 +63,24 @@ impl RemotePoller {
         let mut sorted: Vec<&RemoteMetadata> = remote_files.iter().collect();
         sorted.sort_by_key(|m| m.path.len());
 
+        // Load active tombstones once to filter deleted paths in-memory
+        let tombstones = self.db.active_tombstones(self.mount_id).await
+            .unwrap_or_default();
+
         // Cache path → inode so we can resolve parents without DB lookups
         let mut path_to_inode: HashMap<String, Inode> = HashMap::new();
+        let mut skipped_tombstoned = 0usize;
 
         for meta in &sorted {
             // Skip entries with path traversal components or null bytes
             if meta.path.contains("..") || meta.path.contains('\0') || meta.name.contains('/') {
                 warn!(path = %meta.path, "skipping remote entry with unsafe path");
+                continue;
+            }
+
+            // Skip tombstoned paths (recently deleted locally, remote delete pending)
+            if tombstones.iter().any(|t| meta.path == *t || meta.path.starts_with(&format!("{t}/"))) {
+                skipped_tombstoned += 1;
                 continue;
             }
 
@@ -99,6 +110,17 @@ impl RemotePoller {
             if meta.is_dir {
                 path_to_inode.insert(meta.path.clone(), inode);
             }
+        }
+
+        // Clean up expired tombstones
+        if let Ok(cleaned) = self.db.cleanup_expired_tombstones().await {
+            if cleaned > 0 {
+                debug!(cleaned, "expired tombstones removed");
+            }
+        }
+
+        if skipped_tombstoned > 0 {
+            debug!(skipped_tombstoned, "entries skipped due to tombstones");
         }
 
         debug!(
