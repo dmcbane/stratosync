@@ -293,7 +293,10 @@ impl Backend for RcloneBackend {
 
     async fn rmdir(&self, path: &str) -> Result<(), SyncError> {
         let rp = self.rpath(path);
-        self.run(&["rmdir", &rp]).await?;
+        // Use purge (remove dir + contents) rather than rmdir (empty dir only).
+        // During rm -rf, child file deletes run as background tasks and may not
+        // have completed on the remote when rmdir is called. purge handles this.
+        self.run(&["purge", &rp]).await?;
         Ok(())
     }
 
