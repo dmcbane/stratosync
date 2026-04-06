@@ -1,6 +1,7 @@
 /// SQLite state database — the daemon's persistent store.
 ///
 /// See docs/architecture/04-state-db.md for full schema documentation.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,6 +12,15 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::types::{FileEntry, FileKind, Inode, SyncStatus, FUSE_ROOT_INODE};
+
+/// Lightweight snapshot of a file_index row for in-memory diffing.
+#[derive(Debug, Clone)]
+pub struct RemoteSnapshot {
+    pub inode:  Inode,
+    pub etag:   Option<String>,
+    pub size:   u64,
+    pub status: SyncStatus,
+}
 
 // ── DB wrapper ────────────────────────────────────────────────────────────────
 
@@ -163,9 +173,20 @@ impl StateDb {
     /// Much faster than individual upserts (single mutex acquire, single txn).
     pub async fn batch_upsert_remote_files(
         &self,
-        mount_id: u32,
-        parent:   Inode,
-        entries:  &[(String, String, FileKind, u64, SystemTime, Option<String>)],
+        mount_id:   u32,
+        parent:     Inode,
+        entries:    &[(String, String, FileKind, u64, SystemTime, Option<String>)],
+    ) -> Result<()> {
+        self.batch_upsert_remote_files_gen(mount_id, parent, entries, 0).await
+    }
+
+    /// Batch upsert with explicit poll_generation.
+    pub async fn batch_upsert_remote_files_gen(
+        &self,
+        mount_id:       u32,
+        parent:         Inode,
+        entries:        &[(String, String, FileKind, u64, SystemTime, Option<String>)],
+        poll_generation: u64,
     ) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute_batch("BEGIN")?;
@@ -173,22 +194,24 @@ impl StateDb {
             for (name, remote_path, kind, size, mtime, etag) in entries {
                 conn.execute(
                     "INSERT INTO file_index
-                       (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote')
+                       (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status, poll_generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote', ?9)
                      ON CONFLICT(mount_id, remote_path) DO UPDATE SET
-                       parent_inode = excluded.parent_inode,
-                       name         = excluded.name,
-                       kind         = excluded.kind,
-                       size         = excluded.size,
-                       mtime        = excluded.mtime,
-                       etag         = excluded.etag,
-                       status       = CASE
+                       parent_inode    = excluded.parent_inode,
+                       name            = excluded.name,
+                       kind            = excluded.kind,
+                       size            = excluded.size,
+                       mtime           = excluded.mtime,
+                       etag            = excluded.etag,
+                       poll_generation = excluded.poll_generation,
+                       status          = CASE
                          WHEN status IN ('dirty','uploading') THEN status
                          ELSE 'stale'
                        END",
                     params![
                         mount_id, parent as i64, name, remote_path,
                         kind.as_str(), *size as i64, to_unix(*mtime), etag.as_deref(),
+                        poll_generation as i64,
                     ],
                 )?;
             }
@@ -213,25 +236,43 @@ impl StateDb {
         mtime:       SystemTime,
         etag:        Option<&str>,
     ) -> Result<Inode> {
+        self.upsert_remote_file_gen(mount_id, parent, name, remote_path, kind, size, mtime, etag, 0).await
+    }
+
+    /// Upsert with explicit poll_generation.
+    pub async fn upsert_remote_file_gen(
+        &self,
+        mount_id:        u32,
+        parent:          Inode,
+        name:            &str,
+        remote_path:     &str,
+        kind:            FileKind,
+        size:            u64,
+        mtime:           SystemTime,
+        etag:            Option<&str>,
+        poll_generation: u64,
+    ) -> Result<Inode> {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO file_index
-               (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote')
+               (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status, poll_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote', ?9)
              ON CONFLICT(mount_id, remote_path) DO UPDATE SET
-               parent_inode = excluded.parent_inode,
-               name         = excluded.name,
-               kind         = excluded.kind,
-               size         = excluded.size,
-               mtime        = excluded.mtime,
-               etag         = excluded.etag,
-               status       = CASE
-                 WHEN status IN ('dirty','uploading') THEN status  -- don't clobber
+               parent_inode    = excluded.parent_inode,
+               name            = excluded.name,
+               kind            = excluded.kind,
+               size            = excluded.size,
+               mtime           = excluded.mtime,
+               etag            = excluded.etag,
+               poll_generation = excluded.poll_generation,
+               status          = CASE
+                 WHEN status IN ('dirty','uploading') THEN status
                  ELSE 'stale'
                END",
             params![
                 mount_id, parent, name, remote_path,
                 kind.as_str(), size as i64, to_unix(mtime), etag,
+                poll_generation as i64,
             ],
         )?;
 
@@ -611,6 +652,7 @@ impl FileKind {
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001", include_str!("migrations/0001_initial.sql")),
     ("0002", include_str!("migrations/0002_delete_tombstones.sql")),
+    ("0003", include_str!("migrations/0003_poll_generation.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -855,6 +897,120 @@ impl StateDb {
             [],
         )?;
         Ok(n)
+    }
+
+    // ── Poll generation / diffing ───────────────────────────────────────────
+
+    /// Load all file_index rows for a mount into memory for diffing.
+    pub async fn snapshot_remote_index(
+        &self,
+        mount_id: u32,
+    ) -> Result<HashMap<String, RemoteSnapshot>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT remote_path, inode, etag, size, status
+             FROM file_index WHERE mount_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![mount_id], |r| {
+            let status_str: String = r.get(4)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                RemoteSnapshot {
+                    inode:  r.get::<_, i64>(1)? as u64,
+                    etag:   r.get(2)?,
+                    size:   r.get::<_, i64>(3)? as u64,
+                    status: SyncStatus::from_str(&status_str).unwrap_or(SyncStatus::Remote),
+                },
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, snap) = row?;
+            map.insert(path, snap);
+        }
+        Ok(map)
+    }
+
+    /// Update poll_generation for a batch of inodes in a single transaction.
+    pub async fn batch_mark_generation(
+        &self,
+        inodes:     &[Inode],
+        generation: u64,
+    ) -> Result<()> {
+        if inodes.is_empty() { return Ok(()); }
+        let conn = self.conn.lock().await;
+        conn.execute_batch("BEGIN")?;
+        let result: Result<()> = (|| {
+            for &inode in inodes {
+                conn.execute(
+                    "UPDATE file_index SET poll_generation = ?1 WHERE inode = ?2",
+                    params![generation as i64, inode as i64],
+                )?;
+            }
+            Ok(())
+        })();
+        match &result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+        }
+        result
+    }
+
+    /// Delete entries with old poll_generation (absent from remote listing).
+    /// Preserves dirty/uploading entries (local changes not yet synced).
+    /// Returns (inode, remote_path, cache_path) for cache cleanup.
+    pub async fn delete_stale_entries(
+        &self,
+        mount_id:   u32,
+        generation: u64,
+    ) -> Result<Vec<(Inode, String, Option<PathBuf>)>> {
+        let conn = self.conn.lock().await;
+        // Find stale entries
+        let mut stmt = conn.prepare(
+            "SELECT inode, remote_path, cache_path FROM file_index
+             WHERE mount_id = ?1
+               AND poll_generation < ?2
+               AND status NOT IN ('dirty', 'uploading')
+               AND inode != ?3",
+        )?;
+        let stale: Vec<(Inode, String, Option<PathBuf>)> = stmt.query_map(
+            params![mount_id, generation as i64, FUSE_ROOT_INODE as i64],
+            |r| Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?.map(PathBuf::from),
+            )),
+        )?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Delete them
+        for &(inode, _, _) in &stale {
+            conn.execute(
+                "DELETE FROM file_index WHERE inode = ?1",
+                params![inode as i64],
+            )?;
+        }
+        Ok(stale)
+    }
+
+    pub async fn get_poll_generation(&self, mount_id: u32) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let gen: Option<String> = conn.query_row(
+            "SELECT token FROM change_tokens WHERE mount_id = ?1",
+            params![mount_id],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(gen.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
+    pub async fn set_poll_generation(&self, mount_id: u32, generation: u64) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO change_tokens (mount_id, token, updated_at)
+             VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(mount_id) DO UPDATE SET token=excluded.token, updated_at=excluded.updated_at",
+            params![mount_id, generation.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Delete all file_index and related entries for a mount.

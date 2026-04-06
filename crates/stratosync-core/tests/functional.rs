@@ -14,7 +14,7 @@ use std::time::SystemTime;
 
 use stratosync_core::{
     backend::mock::MockBackend,
-    state::{NewFileEntry, StateDb},
+    state::{NewFileEntry, RemoteSnapshot, StateDb},
     types::{FileKind, Inode, SyncStatus, FUSE_ROOT_INODE},
     Backend,
 };
@@ -863,4 +863,225 @@ async fn zero_and_max_file_sizes() {
     db.set_dirty_size(big, large_size).await.unwrap();
     let entry = db.get_by_inode(big).await.unwrap().unwrap();
     assert_eq!(entry.size, large_size);
+}
+
+// ── Poll generation / diffing ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn snapshot_remote_index_returns_all_entries() {
+    let (db, mid, root) = setup().await;
+    insert_file(&db, mid, root, "a.txt", "a.txt", SyncStatus::Remote, None).await;
+    insert_file(&db, mid, root, "b.txt", "b.txt", SyncStatus::Cached, None).await;
+    insert_file(&db, mid, root, "c.txt", "c.txt", SyncStatus::Dirty, None).await;
+
+    let snap = db.snapshot_remote_index(mid).await.unwrap();
+    assert_eq!(snap.len(), 4); // 3 files + root
+    assert!(snap.contains_key("a.txt"));
+    assert!(snap.contains_key("b.txt"));
+    assert!(snap.contains_key("c.txt"));
+    // Root has remote_path "/"
+    assert!(snap.contains_key("/"));
+}
+
+#[tokio::test]
+async fn batch_mark_generation_updates_correctly() {
+    let (db, mid, root) = setup().await;
+    let a = insert_file(&db, mid, root, "a.txt", "a.txt", SyncStatus::Remote, None).await;
+    let b = insert_file(&db, mid, root, "b.txt", "b.txt", SyncStatus::Remote, None).await;
+
+    db.batch_mark_generation(&[a, b], 5).await.unwrap();
+
+    // Entries at generation 5 should survive delete_stale with threshold 5
+    let deleted = db.delete_stale_entries(mid, 5).await.unwrap();
+    assert!(deleted.is_empty(), "generation 5 entries should not be stale at threshold 5");
+}
+
+#[tokio::test]
+async fn delete_stale_entries_removes_old_generation() {
+    let (db, mid, root) = setup().await;
+    let a = insert_file(&db, mid, root, "old.txt", "old.txt", SyncStatus::Remote, None).await;
+    let b = insert_file(&db, mid, root, "new.txt", "new.txt", SyncStatus::Remote, None).await;
+
+    // Mark b at generation 2, leave a at generation 0
+    db.batch_mark_generation(&[b], 2).await.unwrap();
+
+    let deleted = db.delete_stale_entries(mid, 2).await.unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].1, "old.txt");
+
+    // a should be gone, b should remain
+    assert!(db.get_by_inode(a).await.unwrap().is_none());
+    assert!(db.get_by_inode(b).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn delete_stale_entries_preserves_dirty() {
+    let (db, mid, root) = setup().await;
+    let dirty = insert_file(&db, mid, root, "edited.txt", "edited.txt", SyncStatus::Dirty, None).await;
+    let uploading = insert_file(&db, mid, root, "up.txt", "up.txt", SyncStatus::Remote, None).await;
+    db.set_status(uploading, SyncStatus::Uploading).await.unwrap();
+
+    // Both at generation 0, threshold is 1
+    let deleted = db.delete_stale_entries(mid, 1).await.unwrap();
+    assert!(deleted.is_empty(), "dirty and uploading entries must be preserved");
+    assert!(db.get_by_inode(dirty).await.unwrap().is_some());
+    assert!(db.get_by_inode(uploading).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn delete_stale_entries_never_deletes_root() {
+    let (db, mid, _root) = setup().await;
+    // Root is at generation 0, threshold 1 → should NOT be deleted
+    let deleted = db.delete_stale_entries(mid, 1).await.unwrap();
+    let root_paths: Vec<&str> = deleted.iter().map(|(_, p, _)| p.as_str()).collect();
+    assert!(!root_paths.contains(&"/"), "root must never be deleted by stale cleanup");
+}
+
+#[tokio::test]
+async fn poll_generation_roundtrip() {
+    let (db, mid, _root) = setup().await;
+    assert_eq!(db.get_poll_generation(mid).await.unwrap(), 0);
+
+    db.set_poll_generation(mid, 42).await.unwrap();
+    assert_eq!(db.get_poll_generation(mid).await.unwrap(), 42);
+
+    db.set_poll_generation(mid, 43).await.unwrap();
+    assert_eq!(db.get_poll_generation(mid).await.unwrap(), 43);
+}
+
+#[tokio::test]
+async fn diff_poll_no_changes_only_bumps_generation() {
+    let (db, mid, root) = setup().await;
+    let backend = MockBackend::default();
+    backend.seed_file("/a.txt", b"aaa");
+    backend.seed_file("/b.txt", b"bbb");
+
+    // First poll: populate DB
+    let remote = backend.list("/").await.unwrap();
+    for m in &remote {
+        let path = join_remote("/", &m.name);
+        db.upsert_remote_file_gen(mid, root, &m.name, &path,
+            FileKind::File, m.size, m.mtime, m.etag.as_deref(), 1).await.unwrap();
+    }
+    db.set_poll_generation(mid, 1).await.unwrap();
+
+    // Second poll: same files, no changes
+    let remote2 = backend.list("/").await.unwrap();
+    let snap = db.snapshot_remote_index(mid).await.unwrap();
+
+    let mut to_upsert = Vec::new();
+    let mut unchanged = Vec::new();
+    for m in &remote2 {
+        let path = join_remote("/", &m.name);
+        match snap.get(&path) {
+            Some(s) if s.etag.as_deref() == m.etag.as_deref() && s.size == m.size => {
+                unchanged.push(s.inode);
+            }
+            _ => to_upsert.push(m),
+        }
+    }
+
+    assert_eq!(to_upsert.len(), 0, "no changes → 0 upserts");
+    assert_eq!(unchanged.len(), 2, "both files unchanged");
+}
+
+#[tokio::test]
+async fn diff_poll_detects_new_file() {
+    let (db, mid, root) = setup().await;
+    let backend = MockBackend::default();
+    backend.seed_file("/existing.txt", b"old");
+
+    // First poll
+    let remote = backend.list("/").await.unwrap();
+    for m in &remote {
+        let path = join_remote("/", &m.name);
+        db.upsert_remote_file_gen(mid, root, &m.name, &path,
+            FileKind::File, m.size, m.mtime, m.etag.as_deref(), 1).await.unwrap();
+    }
+
+    // Add a new file
+    backend.seed_file("/new.txt", b"new content");
+
+    // Second poll: diff
+    let remote2 = backend.list("/").await.unwrap();
+    let snap = db.snapshot_remote_index(mid).await.unwrap();
+
+    let new_entries: Vec<&str> = remote2.iter()
+        .map(|m| join_remote("/", &m.name))
+        .filter(|path| !snap.contains_key(path))
+        .map(|_| "new")
+        .collect();
+
+    assert_eq!(new_entries.len(), 1, "should detect 1 new file");
+}
+
+#[tokio::test]
+async fn diff_poll_detects_modified_file() {
+    let (db, mid, root) = setup().await;
+    let backend = MockBackend::default();
+    backend.seed_file("/doc.txt", b"original");
+
+    // First poll
+    let remote = backend.list("/").await.unwrap();
+    for m in &remote {
+        let path = join_remote("/", &m.name);
+        db.upsert_remote_file_gen(mid, root, &m.name, &path,
+            FileKind::File, m.size, m.mtime, m.etag.as_deref(), 1).await.unwrap();
+    }
+
+    // Modify the file
+    backend.modify_file("/doc.txt", b"modified content");
+
+    // Second poll: diff
+    let remote2 = backend.list("/").await.unwrap();
+    let snap = db.snapshot_remote_index(mid).await.unwrap();
+
+    let modified: Vec<_> = remote2.iter().filter(|m| {
+        let path = join_remote("/", &m.name);
+        match snap.get(&path) {
+            Some(s) => s.etag.as_deref() != m.etag.as_deref() || s.size != m.size,
+            None => false,
+        }
+    }).collect();
+
+    assert_eq!(modified.len(), 1, "should detect 1 modified file");
+    assert_eq!(modified[0].name, "doc.txt");
+}
+
+#[tokio::test]
+async fn diff_poll_detects_deleted_file() {
+    let (db, mid, root) = setup().await;
+    let backend = MockBackend::default();
+    backend.seed_file("/keep.txt", b"keep");
+    backend.seed_file("/gone.txt", b"gone");
+
+    // First poll at generation 1
+    let remote = backend.list("/").await.unwrap();
+    for m in &remote {
+        let path = join_remote("/", &m.name);
+        db.upsert_remote_file_gen(mid, root, &m.name, &path,
+            FileKind::File, m.size, m.mtime, m.etag.as_deref(), 1).await.unwrap();
+    }
+    db.set_poll_generation(mid, 1).await.unwrap();
+
+    // Remove a file from remote
+    backend.remove_file("/gone.txt");
+
+    // Second poll at generation 2: only keep.txt is in remote
+    let remote2 = backend.list("/").await.unwrap();
+    let snap = db.snapshot_remote_index(mid).await.unwrap();
+
+    // Mark remaining files at generation 2
+    for m in &remote2 {
+        let path = join_remote("/", &m.name);
+        if let Some(s) = snap.get(&path) {
+            db.batch_mark_generation(&[s.inode], 2).await.unwrap();
+        }
+    }
+
+    // Delete stale entries (generation < 2)
+    let deleted = db.delete_stale_entries(mid, 2).await.unwrap();
+    let deleted_paths: Vec<&str> = deleted.iter().map(|(_, p, _)| p.as_str()).collect();
+    assert!(deleted_paths.contains(&"gone.txt"), "should detect deletion of gone.txt");
+    assert!(!deleted_paths.contains(&"keep.txt"), "keep.txt should survive");
 }

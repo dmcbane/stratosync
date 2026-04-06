@@ -210,7 +210,9 @@ impl Backend for RcloneBackend {
 
     async fn list_recursive(&self, path: &str) -> Result<Vec<RemoteMetadata>, SyncError> {
         let rp    = self.rpath(path);
-        let bytes = self.run(&["lsjson", "--recursive", &rp]).await?;
+        // --hash requests content hashes (MD5/SHA-1) for reliable change detection.
+        // Google Drive returns MD5 for free; other backends may compute on the fly.
+        let bytes = self.run(&["lsjson", "--recursive", "--hash", &rp]).await?;
         Self::parse_lsjson(&bytes)
     }
 
@@ -398,6 +400,22 @@ pub mod mock {
                 },
                 content.to_vec(),
             ));
+        }
+
+        /// Remove a file from the mock (simulates remote deletion).
+        pub fn remove_file(&self, path: &str) {
+            self.inner.lock().unwrap().files.remove(path);
+        }
+
+        /// Modify a file's content (simulates remote edit — changes etag).
+        pub fn modify_file(&self, path: &str, new_content: &[u8]) {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some((meta, data)) = inner.files.get_mut(path) {
+                *data = new_content.to_vec();
+                meta.size = new_content.len() as u64;
+                meta.etag = Some(format!("mock-{}", new_content.len()));
+                meta.mtime = SystemTime::now();
+            }
         }
 
         pub fn fail_on(&self, path: &str) {

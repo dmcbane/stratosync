@@ -1,7 +1,8 @@
 /// RemotePoller — detects remote changes and updates the local file index.
 ///
-/// Phase 1: polling-only (lsjson diff).
-/// Phase 3: adds delta API support (GDrive pageToken, OneDrive deltaLink).
+/// Uses ETag-based diffing: fetches the full remote listing, compares against
+/// the DB snapshot in memory, and only upserts entries that actually changed.
+/// A poll generation counter detects remote deletions.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +48,9 @@ impl RemotePoller {
     async fn poll_once(&self) -> Result<()> {
         debug!(mount_id = self.mount_id, "polling remote");
 
-        let remote_files = self.backend.list_recursive("/").await?;
+        // ── Phase 1: Fetch remote listing and DB snapshot ────────────────────
+        let remote_result = self.backend.list_recursive("/").await;
+        let remote_files = remote_result?;
 
         const MAX_POLL_ENTRIES: usize = 500_000;
         if remote_files.len() > MAX_POLL_ENTRIES {
@@ -57,60 +60,100 @@ impl RemotePoller {
             );
         }
 
-        // Sort so directories come before their children (shorter paths first).
-        // This ensures parent directories are upserted before their children,
-        // so we can look up parent inodes.
-        let mut sorted: Vec<&RemoteMetadata> = remote_files.iter().collect();
-        sorted.sort_by_key(|m| m.path.len());
+        let db_snapshot = self.db.snapshot_remote_index(self.mount_id).await?;
+        let generation = self.db.get_poll_generation(self.mount_id).await? + 1;
 
-        // Load active tombstones once to filter deleted paths in-memory
+        // Load active tombstones for filtering
         let tombstones = self.db.active_tombstones(self.mount_id).await
             .unwrap_or_default();
 
-        // Cache path → inode so we can resolve parents without DB lookups
-        let mut path_to_inode: HashMap<String, Inode> = HashMap::new();
+        // ── Phase 2: Diff remote against DB ──────────────────────────────────
+        let mut to_upsert: Vec<&RemoteMetadata> = Vec::new();
+        let mut unchanged_inodes: Vec<Inode> = Vec::new();
         let mut skipped_tombstoned = 0usize;
+        let mut skipped_unsafe = 0usize;
 
-        for meta in &sorted {
-            // Skip entries with path traversal components or null bytes
+        for meta in &remote_files {
+            // Safety: skip path traversal and null bytes
             if meta.path.contains("..") || meta.path.contains('\0') || meta.name.contains('/') {
-                warn!(path = %meta.path, "skipping remote entry with unsafe path");
+                skipped_unsafe += 1;
                 continue;
             }
 
-            // Skip tombstoned paths (recently deleted locally, remote delete pending)
+            // Skip tombstoned paths
             if tombstones.iter().any(|t| meta.path == *t || meta.path.starts_with(&format!("{t}/"))) {
                 skipped_tombstoned += 1;
                 continue;
             }
 
+            match db_snapshot.get(&meta.path) {
+                Some(snap) => {
+                    // Entry exists in DB — check if content changed
+                    if snap.etag.as_deref() == meta.etag.as_deref()
+                        && snap.size == meta.size
+                    {
+                        // Unchanged — just bump the generation
+                        unchanged_inodes.push(snap.inode);
+                    } else {
+                        // Changed — needs upsert
+                        to_upsert.push(meta);
+                    }
+                }
+                None => {
+                    // New entry — needs upsert
+                    to_upsert.push(meta);
+                }
+            }
+        }
+
+        // ── Phase 3: Apply changes ───────────────────────────────────────────
+
+        // Sort upserts by path length (parent directories before children)
+        to_upsert.sort_by_key(|m| m.path.len());
+
+        // Cache path → inode for parent resolution
+        // Pre-populate from DB snapshot so unchanged dirs resolve correctly
+        let mut path_to_inode: HashMap<String, Inode> = db_snapshot.iter()
+            .map(|(path, snap)| (path.clone(), snap.inode))
+            .collect();
+
+        for meta in &to_upsert {
             let kind = if meta.is_dir { FileKind::Directory } else { FileKind::File };
 
-            // Resolve parent inode from the entry's path.
-            // e.g. "Documents/Notes/file.txt" → parent is "Documents/Notes"
             let parent = match meta.path.rfind('/') {
                 Some(idx) => {
                     let parent_path = &meta.path[..idx];
                     *path_to_inode.get(parent_path).unwrap_or(&FUSE_ROOT_INODE)
                 }
-                None => FUSE_ROOT_INODE, // top-level entry
+                None => FUSE_ROOT_INODE,
             };
 
-            let inode = self.db.upsert_remote_file(
-                self.mount_id,
-                parent,
-                &meta.name,
-                &meta.path,
-                kind,
-                meta.size,
-                meta.mtime,
-                meta.etag.as_deref(),
+            let inode = self.db.upsert_remote_file_gen(
+                self.mount_id, parent, &meta.name, &meta.path,
+                kind, meta.size, meta.mtime, meta.etag.as_deref(),
+                generation,
             ).await?;
 
-            if meta.is_dir {
-                path_to_inode.insert(meta.path.clone(), inode);
+            path_to_inode.insert(meta.path.clone(), inode);
+        }
+
+        // Bump generation for unchanged entries (single transaction)
+        self.db.batch_mark_generation(&unchanged_inodes, generation).await?;
+
+        // Detect and remove entries absent from remote listing
+        let deleted = self.db.delete_stale_entries(self.mount_id, generation).await?;
+        if !deleted.is_empty() {
+            for &(inode, ref path, ref cache_path) in &deleted {
+                info!(inode, path = %path, "remote deletion detected");
+                // Clean up local cache file if present
+                if let Some(cp) = cache_path {
+                    let _ = tokio::fs::remove_file(cp).await;
+                }
             }
         }
+
+        // Save generation for next poll
+        self.db.set_poll_generation(self.mount_id, generation).await?;
 
         // Clean up expired tombstones
         if let Ok(cleaned) = self.db.cleanup_expired_tombstones().await {
@@ -119,13 +162,17 @@ impl RemotePoller {
             }
         }
 
-        if skipped_tombstoned > 0 {
-            debug!(skipped_tombstoned, "entries skipped due to tombstones");
+        if skipped_unsafe > 0 {
+            warn!(skipped_unsafe, "entries skipped due to unsafe paths");
         }
 
         debug!(
-            mount_id = self.mount_id,
-            files = remote_files.len(),
+            mount_id    = self.mount_id,
+            total       = remote_files.len(),
+            changed     = to_upsert.len(),
+            unchanged   = unchanged_inodes.len(),
+            deleted     = deleted.len(),
+            tombstoned  = skipped_tombstoned,
             "poll complete"
         );
         Ok(())
