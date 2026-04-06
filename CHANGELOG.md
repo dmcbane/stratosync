@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-04-06
+
+### Added
+- **ETag-based poll diffing**: The poller now diffs the remote listing against a
+  DB snapshot in memory. Only entries that actually changed (new, modified, or
+  deleted) trigger DB writes. Idle polls with 2793 files go from 2793 upserts
+  to 1 SELECT + 1 batch UPDATE.
+- **Remote deletion detection**: Entries absent from the remote listing are
+  automatically removed from the DB (unless dirty/uploading). Previously,
+  remote deletions were invisible to the daemon.
+- `--hash` flag on `rclone lsjson --recursive` for content-based change
+  detection via ETags (MD5/SHA-1).
+- New migration `0003_poll_generation` adding generation counter to file_index.
+- `StateDb::snapshot_remote_index`, `batch_mark_generation`,
+  `delete_stale_entries`, `get/set_poll_generation`.
+- `MockBackend::remove_file()` and `modify_file()` for simulating remote changes.
+- 10 new tests for poll diffing behavior.
+
 ## [0.3.0] - 2026-04-04
 
 ### Added
