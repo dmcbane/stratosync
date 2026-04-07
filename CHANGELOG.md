@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-04-07
+
+### Performance
+- **Async mkdir and rename**: Both now return instantly (<1ms). Remote operations
+  run in background tasks. Previously 200-1000ms per call.
+- **Deferred hydration**: `open()` returns immediately for uncached files. The
+  download starts in the background; `read()` blocks only if data isn't ready yet.
+  Enables parallel downloads when opening multiple files.
+- **Prefetch child directories**: When a directory is first listed, its
+  subdirectories are populated in the background (4 concurrent). Next `cd`
+  into a child is instant.
+- **Stop invalidating dir_listed on local writes**: `touch file; ls` no longer
+  re-fetches the directory from rclone. Local writes update the DB directly;
+  the poller handles remote changes independently.
+- **Increase attr/entry timeout**: 5s → 60s. Kernel caches directory entries
+  and file attributes 12x longer, reducing FUSE→daemon queries.
+
 ## [0.4.0] - 2026-04-06
 
 ### Added
