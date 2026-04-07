@@ -388,8 +388,8 @@ impl Filesystem for StratoFs {
 
     fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
         let (n, nn) = match (name.to_str(), new_name.to_str()) { (Some(a), Some(b)) => (a.to_owned(), b.to_owned()), _ => { reply.error(libc::EINVAL); return; } };
-        let (db, backend) = (Arc::clone(&self.db), Arc::clone(&self.backend));
-        match self.rt.block_on(write_ops::handle_rename(parent, &n, new_parent, &nn, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
+        let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
+        match self.rt.block_on(write_ops::handle_rename(parent, &n, new_parent, &nn, mid, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
     }
 }
 

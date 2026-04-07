@@ -102,7 +102,7 @@ pub struct FuseConfig {
 
 impl Default for FuseConfig {
     fn default() -> Self {
-        Self { threads: 4, attr_timeout_s: 5, entry_timeout_s: 5, allow_other: false }
+        Self { threads: 4, attr_timeout_s: 60, entry_timeout_s: 60, allow_other: false }
     }
 }
 

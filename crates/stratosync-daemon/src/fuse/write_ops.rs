@@ -147,11 +147,8 @@ pub async fn handle_create(
         cache_size:  Some(0),
     }).await.map_err(|_| libc::EIO)?;
 
-    // Invalidate parent directory listing so the next readdir re-fetches.
-    // The create itself already succeeded, so this is best-effort.
-    if let Err(e) = db.invalidate_dir(parent).await {
-        warn!(inode, parent, "invalidate_dir after create failed: {e}");
-    }
+    // No dir invalidation needed — the DB insert above already makes this
+    // file visible in list_children. The poller handles remote changes.
 
     // Allocate file handle
     let fh = next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -181,10 +178,7 @@ pub async fn handle_mkdir(
 
     let remote_path = join_remote(&parent_entry.remote_path, name);
 
-    // Create remotely
-    backend.mkdir(&remote_path).await.map_err(|_| libc::EIO)?;
-
-    // Insert DB entry
+    // Insert DB entry immediately so the directory is visible in listings
     let inode = db.insert_file(&NewFileEntry {
         mount_id,
         parent,
@@ -199,9 +193,15 @@ pub async fn handle_mkdir(
         cache_size:  None,
     }).await.map_err(|_| libc::EIO)?;
 
-    if let Err(e) = db.invalidate_dir(parent).await {
-        warn!(inode, parent, "invalidate_dir after mkdir failed: {e}");
-    }
+    // Create remotely in background. If this fails, uploads inside the dir
+    // will implicitly create the parent on most cloud backends.
+    let backend = Arc::clone(backend);
+    tokio::spawn(async move {
+        if let Err(e) = backend.mkdir(&remote_path).await {
+            warn!(path = %remote_path, "background remote mkdir failed: {e}");
+        }
+    });
+
     Ok(inode)
 }
 
@@ -234,9 +234,6 @@ pub async fn handle_unlink(
     db.delete_entry(entry.inode).await.map_err(|_| libc::EIO)?;
     if let Err(e) = db.insert_tombstone(mount_id, &remote_path, 300).await {
         warn!(path = %remote_path, "insert_tombstone failed: {e}");
-    }
-    if let Err(e) = db.invalidate_dir(parent).await {
-        warn!(parent, "invalidate_dir after unlink failed: {e}");
     }
 
     // Delete remotely in background. Remove tombstone on success.
@@ -279,9 +276,6 @@ pub async fn handle_rmdir(
     if let Err(e) = db.insert_tombstone(mount_id, &remote_path, 300).await {
         warn!(path = %remote_path, "insert_tombstone failed: {e}");
     }
-    if let Err(e) = db.invalidate_dir(parent).await {
-        warn!(parent, "invalidate_dir after rmdir failed: {e}");
-    }
 
     // Remove remote directory in background. Remove tombstone on success.
     let backend = Arc::clone(backend);
@@ -305,6 +299,7 @@ pub async fn handle_rename(
     name:       &str,
     new_parent: Inode,
     new_name:   &str,
+    mount_id:   u32,
     db:         &Arc<StateDb>,
     backend:    &Arc<dyn Backend>,
 ) -> Result<(), libc::c_int> {
@@ -320,37 +315,16 @@ pub async fn handle_rename(
 
     let new_remote = join_remote(&new_parent_entry.remote_path, new_name);
 
-    // If destination exists, delete it first (POSIX rename semantics)
-    if let Ok(Some(dest)) = db.get_by_parent_name(new_parent, new_name).await {
-        match backend.delete(&dest.remote_path).await {
-            Ok(()) | Err(SyncError::NotFound(_)) => {}
-            Err(_) => return Err(libc::EIO),
-        }
+    // If destination exists, delete it from DB (POSIX rename semantics)
+    let dest_remote = if let Ok(Some(dest)) = db.get_by_parent_name(new_parent, new_name).await {
+        let rp = dest.remote_path.clone();
         if let Err(e) = db.delete_entry(dest.inode).await {
             warn!(inode = dest.inode, "delete_entry for rename overwrite failed: {e}");
         }
-    }
-
-    // Only rename on the remote if the file exists there (Cached/Stale/Uploading).
-    // Dirty files haven't been uploaded yet — the upload queue will use the new
-    // remote_path from the DB when it eventually runs.
-    let needs_remote_rename = matches!(
-        entry.status,
-        SyncStatus::Cached | SyncStatus::Stale | SyncStatus::Uploading | SyncStatus::Conflict
-    );
-    if needs_remote_rename {
-        match backend.rename(&entry.remote_path, &new_remote).await {
-            Ok(()) => {}
-            Err(SyncError::NotFound(_)) => {
-                // File was deleted remotely between DB lookup and rename — proceed locally
-                debug!(inode = entry.inode, "remote rename: source not found, proceeding locally");
-            }
-            Err(e) => {
-                warn!(inode = entry.inode, "remote rename failed: {e}");
-                return Err(libc::EIO);
-            }
-        }
-    }
+        Some(rp)
+    } else {
+        None
+    };
 
     // Update local cache path if hydrated.
     let new_cache_path = if let Some(old_cache) = &entry.cache_path {
@@ -359,7 +333,6 @@ pub async fn handle_rename(
             .unwrap_or_else(|| PathBuf::from(new_name));
         if let Err(e) = tokio::fs::rename(old_cache, &new_cache).await {
             warn!(inode = entry.inode, ?old_cache, ?new_cache, "cache rename failed: {e}");
-            // Cache file didn't move — keep old path so open() can still find it
             Some(old_cache.clone())
         } else {
             Some(new_cache)
@@ -368,17 +341,45 @@ pub async fn handle_rename(
         None
     };
 
+    // Update DB immediately so the file appears at its new location
     db.rename_entry(entry.inode, new_parent, new_name, &new_remote,
         new_cache_path.as_deref()).await
         .map_err(|_| libc::EIO)?;
 
-    if let Err(e) = db.invalidate_dir(parent).await {
-        warn!(parent, "invalidate_dir after rename (src) failed: {e}");
-    }
-    if new_parent != parent {
-        if let Err(e) = db.invalidate_dir(new_parent).await {
-            warn!(new_parent, "invalidate_dir after rename (dst) failed: {e}");
+    // Queue remote operations in background
+    let needs_remote_rename = matches!(
+        entry.status,
+        SyncStatus::Cached | SyncStatus::Stale | SyncStatus::Uploading | SyncStatus::Conflict
+    );
+
+    if needs_remote_rename || dest_remote.is_some() {
+        let old_remote = entry.remote_path.clone();
+        let new_remote_bg = new_remote.clone();
+        let backend = Arc::clone(backend);
+        let db = Arc::clone(db);
+
+        // Tombstone the old path so poller doesn't re-add it
+        if needs_remote_rename {
+            let _ = db.insert_tombstone(mount_id, &old_remote, 300).await;
         }
+
+        tokio::spawn(async move {
+            // Delete destination if it existed on remote
+            if let Some(ref dest_rp) = dest_remote {
+                match backend.delete(dest_rp).await {
+                    Ok(()) | Err(SyncError::NotFound(_)) => {}
+                    Err(e) => warn!(path = %dest_rp, "background rename dest delete failed: {e}"),
+                }
+            }
+            // Rename on remote
+            if needs_remote_rename {
+                match backend.rename(&old_remote, &new_remote_bg).await {
+                    Ok(()) | Err(SyncError::NotFound(_)) => {}
+                    Err(e) => warn!(from = %old_remote, to = %new_remote_bg, "background rename failed: {e}"),
+                }
+                let _ = db.remove_tombstone(mount_id, &old_remote).await;
+            }
+        });
     }
 
     Ok(())
