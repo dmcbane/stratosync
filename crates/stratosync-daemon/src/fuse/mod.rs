@@ -188,7 +188,50 @@ async fn populate_directory(
     debug!(inode = dir.inode, "upserts complete");
     db.mark_dir_listed(dir.inode).await?;
     debug!(inode = dir.inode, "directory populated");
+
+    // Prefetch: populate child directories in the background so the next
+    // cd/ls into a subdirectory is instant (one level of lookahead).
+    spawn_prefetch_child_dirs(Arc::clone(db), Arc::clone(backend), mid, dir.inode);
+
     Ok(())
+}
+
+fn spawn_prefetch_child_dirs(
+    db: Arc<StateDb>, backend: Arc<dyn Backend>, mid: u32, parent_inode: Inode,
+) {
+    tokio::spawn(async move {
+        let children = db.list_children(parent_inode).await.unwrap_or_default();
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        for child in children {
+            if child.kind != FileKind::Directory || child.dir_listed.is_some() {
+                continue;
+            }
+            let db = Arc::clone(&db);
+            let backend = Arc::clone(&backend);
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move {
+                let Ok(_permit) = sem.acquire().await else { return };
+                // Inline the populate logic to avoid the !Send issue
+                let list = match backend.list(&child.remote_path).await {
+                    Ok(l) => l,
+                    Err(e) => { debug!(inode = child.inode, "prefetch list failed: {e}"); return; }
+                };
+                let entries: Vec<_> = list.iter().filter(|c| {
+                    !c.name.contains("..") && !c.name.contains('\0') && !c.name.contains('/')
+                }).map(|c| {
+                    let kind = if c.is_dir { FileKind::Directory } else { FileKind::File };
+                    let full_path = write_ops::join_remote(&child.remote_path, &c.name);
+                    (c.name.clone(), full_path, kind, c.size, c.mtime, c.etag.clone())
+                }).collect();
+                if let Err(e) = db.batch_upsert_remote_files(mid, child.inode, &entries).await {
+                    debug!(inode = child.inode, "prefetch upsert failed: {e}");
+                    return;
+                }
+                let _ = db.mark_dir_listed(child.inode).await;
+                debug!(inode = child.inode, count = entries.len(), "prefetched directory");
+            });
+        }
+    });
 }
 
 impl Filesystem for StratoFs {
