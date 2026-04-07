@@ -29,6 +29,7 @@ pub struct OpenFile {
     pub inode:      Inode,
     pub cache_path: PathBuf,
     pub flags:      i32,
+    pub hydrating:  bool,
 }
 
 pub struct StratoFs {
@@ -347,14 +348,42 @@ impl Filesystem for StratoFs {
         let (db, backend, cache_dir) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.cache_dir.clone());
         let (open_files, next_fh, waiters) = (Arc::clone(&self.open_files), Arc::clone(&self.next_fh), Arc::clone(&self.hydration_waiters));
         let result = self.rt.block_on(async move {
-            hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters).await?;
             let entry = db.get_by_inode(ino).await?.ok_or_else(|| SyncError::NotFound(format!("{ino}")))?;
-            let cache_path = entry.cache_path.ok_or_else(|| SyncError::Fatal("no cache_path".into()))?;
-            let fh = next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            open_files.insert(fh, OpenFile { inode: ino, cache_path, flags });
-            if let Err(e) = db.touch_lru(ino).await {
-                warn!(ino, "touch_lru failed: {e}");
+
+            let needs_hydration = entry.status.needs_hydration();
+            let is_hydrating = entry.status.is_hydrating();
+            let cache_path = entry.cache_path.clone().unwrap_or_else(|| {
+                cache_dir.join(entry.remote_path.trim_start_matches('/'))
+            });
+
+            if needs_hydration {
+                // Start download in background — don't block open()
+                db.set_status(ino, SyncStatus::Hydrating).await
+                    .map_err(|e| SyncError::Fatal(e.to_string()))?;
+                let (db2, be2, cd2, w2) = (
+                    Arc::clone(&db), Arc::clone(&backend), cache_dir.clone(), Arc::clone(&waiters),
+                );
+                tokio::spawn(async move {
+                    let entry = match db2.get_by_inode(ino).await {
+                        Ok(Some(e)) => e,
+                        _ => return,
+                    };
+                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &entry).await;
+                });
+            } else if !is_hydrating {
+                // Already cached/dirty — touch LRU
+                if let Err(e) = db.touch_lru(ino).await {
+                    warn!(ino, "touch_lru failed: {e}");
+                }
             }
+
+            let fh = next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            open_files.insert(fh, OpenFile {
+                inode: ino,
+                cache_path,
+                flags,
+                hydrating: needs_hydration || is_hydrating,
+            });
             Ok::<u64, SyncError>(fh)
         });
         match result { Ok(fh) => reply.opened(fh, 0), Err(e) => { error!(ino, "open: {e}"); reply.error(errno(&e)); } }
@@ -362,7 +391,32 @@ impl Filesystem for StratoFs {
 
     fn read(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
         let open_files = Arc::clone(&self.open_files);
+        let (db, backend, cache_dir, waiters) = (
+            Arc::clone(&self.db), Arc::clone(&self.backend),
+            self.cache_dir.clone(), Arc::clone(&self.hydration_waiters),
+        );
         let result = self.rt.block_on(async move {
+            // If file is still hydrating, wait for download to complete
+            let (ino, needs_wait) = {
+                let entry = open_files.get(&fh).ok_or_else(|| SyncError::Fatal(format!("bad fh {fh}")))?;
+                (entry.inode, entry.hydrating)
+            };
+            if needs_wait {
+                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters).await?;
+                // Update the OpenFile with the actual cache path
+                if let Some(mut entry) = open_files.get_mut(&fh) {
+                    if let Ok(Some(fe)) = db.get_by_inode(entry.inode).await {
+                        if let Some(cp) = fe.cache_path {
+                            entry.cache_path = cp;
+                        }
+                    }
+                    entry.hydrating = false;
+                }
+                if let Err(e) = db.touch_lru(ino).await {
+                    warn!(ino, "touch_lru failed: {e}");
+                }
+            }
+
             let entry = open_files.get(&fh).ok_or_else(|| SyncError::Fatal(format!("bad fh {fh}")))?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut f = tokio::fs::File::open(&entry.cache_path).await.map_err(SyncError::Io)?;

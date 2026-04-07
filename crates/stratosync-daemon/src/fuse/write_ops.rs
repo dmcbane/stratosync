@@ -156,6 +156,7 @@ pub async fn handle_create(
         inode,
         cache_path,
         flags: libc::O_WRONLY,
+        hydrating: false,
     });
 
     Ok((inode, fh))
