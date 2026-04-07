@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::types::{RemoteMetadata, RcloneLsJsonEntry, SyncError};
@@ -88,6 +87,34 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<(Vec<crate::types::RemoteChange>, String), SyncError>;
 }
 
+// ── Rclone error parsing ─────────────────────────────────────────────────────
+
+/// Extract human-readable message from rclone's JSON stderr.
+/// Rclone outputs lines like: {"level":"error","msg":"the actual message",...}
+/// Falls back to first line of stderr (truncated to 200 chars) if not JSON.
+fn parse_rclone_error(stderr: &str) -> String {
+    // Try to find the last "msg" value from rclone's JSON log lines
+    for line in stderr.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{') {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(msg) = parsed.get("msg").and_then(|v| v.as_str()) {
+                    return msg.to_string();
+                }
+            }
+        }
+    }
+    // Fall back: first meaningful line, truncated
+    let first = stderr.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(stderr);
+    if first.len() > 200 {
+        format!("{}...", &first[..200])
+    } else {
+        first.to_string()
+    }
+}
+
 // ── RcloneBackend ─────────────────────────────────────────────────────────────
 
 /// Drives rclone as an external subprocess.
@@ -130,53 +157,77 @@ impl RcloneBackend {
         }
     }
 
-    /// Run an rclone command, returning (stdout, stderr, exit_code).
+    /// Run an rclone command, returning stdout bytes.
+    /// Kills the process on timeout. Limits output to 256MB.
     async fn run(&self, args: &[&str]) -> Result<Vec<u8>, SyncError> {
-        let mut cmd = Command::new(&self.rclone_bin);
+        use tokio::process::Command as TokioCommand;
+
+        let mut cmd = TokioCommand::new(&self.rclone_bin);
         cmd.args(args);
         for f in &self.extra_flags {
             cmd.arg(f);
         }
+        // Kill the process if it outlives the timeout (don't orphan it)
+        cmd.kill_on_drop(true);
 
         debug!(args = ?args, "rclone invocation");
 
-        let output = tokio::time::timeout(self.timeout, cmd.output())
-            .await
-            .map_err(|_| SyncError::Transient("rclone timed out".into()))?
-            .map_err(|e| SyncError::Fatal(format!("failed to spawn rclone: {e}")))?;
+        let output = match tokio::time::timeout(self.timeout, cmd.output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(SyncError::Fatal(format!("failed to spawn rclone: {e}"))),
+            Err(_) => {
+                // kill_on_drop handles cleanup
+                return Err(SyncError::Network("rclone timed out".into()));
+            }
+        };
+
+        // Guard against pathologically large output
+        const MAX_OUTPUT: usize = 256 * 1024 * 1024;
+        if output.stdout.len() > MAX_OUTPUT {
+            return Err(SyncError::Fatal(format!(
+                "rclone output exceeded {}MB limit", MAX_OUTPUT / (1024 * 1024),
+            )));
+        }
 
         if output.status.success() {
             return Ok(output.stdout);
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let code   = output.status.code().unwrap_or(-1);
+        let raw_stderr = String::from_utf8_lossy(&output.stderr);
+        let code       = output.status.code().unwrap_or(-1);
+        let msg        = parse_rclone_error(&raw_stderr);
 
-        debug!(code, stderr = %stderr, "rclone non-zero exit");
+        debug!(code, stderr = %msg, "rclone non-zero exit");
 
         // Map rclone exit codes (see docs/architecture/05-backend.md)
         match code {
-            3 | 4 => Err(SyncError::NotFound(stderr.into_owned())),
-            5 | 6 => Err(SyncError::Transient(stderr.into_owned())),
+            3 | 4 => Err(SyncError::NotFound(msg)),
+            5 | 6 => Err(SyncError::Transient(msg)),
             8     => Err(SyncError::QuotaExceeded),
             _     => {
-                // Inspect stderr for common patterns
-                if stderr.contains("didn't match") || stderr.contains("sourceMD5") {
-                    let etag_hint = stderr.lines()
-                        .find(|l| l.contains("etag"))
-                        .map(|s| s.to_owned());
-                    warn!(hint = ?etag_hint, "ETag conflict detected");
-                    Err(SyncError::Conflict { local: None, remote: etag_hint })
-                } else if stderr.contains("403") || stderr.contains("Permission denied") {
-                    Err(SyncError::PermissionDenied(stderr.into_owned()))
-                } else if stderr.contains("doesn't exist")
-                       || stderr.contains("not found")
-                       || stderr.contains("Not Found")
-                       || stderr.contains("404")
+                // Inspect message for common patterns
+                let lower = msg.to_lowercase();
+                if lower.contains("didn't match") || lower.contains("sourcemd5") {
+                    warn!("ETag conflict detected: {msg}");
+                    Err(SyncError::Conflict { local: None, remote: Some(msg) })
+                } else if lower.contains("invalid_grant") || lower.contains("token")
+                       && (lower.contains("expired") || lower.contains("revoked"))
                 {
-                    Err(SyncError::NotFound(stderr.into_owned()))
+                    Err(SyncError::PermissionDenied(msg))
+                } else if lower.contains("403") || lower.contains("permission denied") {
+                    Err(SyncError::PermissionDenied(msg))
+                } else if lower.contains("timeout") || lower.contains("deadline")
+                       || lower.contains("connection refused") || lower.contains("dns")
+                {
+                    Err(SyncError::Network(msg))
+                } else if lower.contains("doesn't exist") || lower.contains("not found")
+                       || lower.contains("404")
+                {
+                    Err(SyncError::NotFound(msg))
+                } else if lower.contains("quota") || lower.contains("storage full") {
+                    Err(SyncError::QuotaExceeded)
                 } else {
-                    Err(SyncError::Fatal(stderr.into_owned()))
+                    Err(SyncError::Fatal(msg))
                 }
             }
         }

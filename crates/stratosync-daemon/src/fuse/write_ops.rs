@@ -31,6 +31,16 @@ use stratosync_core::{
 };
 use crate::sync::upload_queue::{UploadQueue, UploadTrigger};
 
+/// Map IO errors to appropriate FUSE errno. Distinguishes disk-full from generic IO.
+fn io_errno(e: &std::io::Error) -> libc::c_int {
+    match e.raw_os_error() {
+        Some(libc::ENOSPC) => libc::ENOSPC,
+        Some(libc::EDQUOT) => libc::ENOSPC,
+        Some(code)         => code,
+        None               => libc::EIO,
+    }
+}
+
 /// Context passed to each write operation.
 pub struct WriteCtx {
     pub mount_id:     u32,
@@ -55,12 +65,12 @@ pub async fn handle_write(
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(&entry.cache_path).await
-        .map_err(|_| libc::EIO)?;
+        .map_err(|e| io_errno(&e))?;
 
     file.seek(std::io::SeekFrom::Start(offset as u64)).await
-        .map_err(|_| libc::EIO)?;
-    file.write_all(data).await.map_err(|_| libc::EIO)?;
-    file.flush().await.map_err(|_| libc::EIO)?;
+        .map_err(|e| io_errno(&e))?;
+    file.write_all(data).await.map_err(|e| io_errno(&e))?;
+    file.flush().await.map_err(|e| io_errno(&e))?;
 
     // Get the new file size so getattr reports it correctly.
     let new_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);

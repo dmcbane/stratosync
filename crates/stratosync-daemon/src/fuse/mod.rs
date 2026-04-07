@@ -70,6 +70,9 @@ fn errno(e: &SyncError) -> libc::c_int {
         SyncError::NotFound(_)         => libc::ENOENT,
         SyncError::PermissionDenied(_) => libc::EACCES,
         SyncError::QuotaExceeded       => libc::ENOSPC,
+        SyncError::Network(_)          => libc::EHOSTUNREACH,
+        SyncError::Transient(_)        => libc::EAGAIN,
+        SyncError::Conflict { .. }     => libc::EEXIST,
         SyncError::Io(io)              => io.raw_os_error().unwrap_or(libc::EIO),
         _                              => libc::EIO,
     }
@@ -80,7 +83,10 @@ pub async fn hydrate_if_needed(
     inode: Inode,
     waiters: &Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
 ) -> Result<(), SyncError> {
-    loop {
+    const MAX_RETRIES: u32 = 3;
+    const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    for attempt in 0..MAX_RETRIES {
         let entry = db.get_by_inode(inode).await?
             .ok_or_else(|| SyncError::NotFound(format!("inode {inode}")))?;
         match entry.status {
@@ -94,14 +100,27 @@ pub async fn hydrate_if_needed(
             SyncStatus::Hydrating => {
                 let (tx, rx) = oneshot::channel();
                 waiters.entry(inode).or_default().push(tx);
-                match rx.await {
-                    Ok(Ok(())) => return Ok(()),
-                    Ok(Err(e)) => return Err(SyncError::Transient(format!("hydration: {e}"))),
-                    Err(_)     => {}
+                match tokio::time::timeout(WAIT_TIMEOUT, rx).await {
+                    Ok(Ok(Ok(()))) => return Ok(()),
+                    Ok(Ok(Err(e))) => return Err(SyncError::Transient(format!("hydration failed: {e}"))),
+                    Ok(Err(_)) => {
+                        // Sender dropped — retry (download may have crashed)
+                    }
+                    Err(_) => {
+                        // Timeout — reset to Remote so next attempt retries download
+                        warn!(inode, attempt, "hydration wait timed out after 5 min, resetting");
+                        let _ = db.set_status(inode, SyncStatus::Remote).await;
+                        if attempt + 1 >= MAX_RETRIES {
+                            return Err(SyncError::Transient(
+                                format!("hydration timed out after {MAX_RETRIES} attempts"),
+                            ));
+                        }
+                    }
                 }
             }
         }
     }
+    Err(SyncError::Transient("hydration failed after retries".into()))
 }
 
 async fn do_hydrate(

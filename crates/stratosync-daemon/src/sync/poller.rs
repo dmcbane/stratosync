@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use stratosync_core::{
     backend::Backend, state::StateDb, types::*, RemoteMetadata,
@@ -34,13 +34,42 @@ impl RemotePoller {
     /// Run the poll loop forever. Call from a dedicated tokio task.
     pub async fn run(self) {
         info!(mount_id = self.mount_id, interval = ?self.poll_interval, "remote poller started");
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let base_interval = self.poll_interval;
+        let mut current_interval = base_interval;
+        let mut consecutive_failures: u32 = 0;
 
         loop {
-            interval.tick().await;
-            if let Err(e) = self.poll_once().await {
-                warn!(mount_id = self.mount_id, "poll error: {e}");
+            tokio::time::sleep(current_interval).await;
+            match self.poll_once().await {
+                Ok(()) => {
+                    if consecutive_failures > 0 {
+                        info!(mount_id = self.mount_id, "poll recovered after {} failures", consecutive_failures);
+                        current_interval = base_interval;
+                        consecutive_failures = 0;
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 10 {
+                        error!(
+                            mount_id = self.mount_id,
+                            failures = consecutive_failures,
+                            "remote sync halted after {consecutive_failures} consecutive failures; \
+                             check rclone auth and network connectivity: {e}"
+                        );
+                    } else if consecutive_failures >= 3 {
+                        // Exponential backoff: double interval, cap at 10 minutes
+                        current_interval = (current_interval * 2).min(Duration::from_secs(600));
+                        warn!(
+                            mount_id = self.mount_id,
+                            failures = consecutive_failures,
+                            next_in = ?current_interval,
+                            "poll failed, backing off: {e}"
+                        );
+                    } else {
+                        warn!(mount_id = self.mount_id, "poll error: {e}");
+                    }
+                }
             }
         }
     }

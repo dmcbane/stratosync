@@ -188,40 +188,45 @@ impl StateDb {
         entries:        &[(String, String, FileKind, u64, SystemTime, Option<String>)],
         poll_generation: u64,
     ) -> Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute_batch("BEGIN")?;
-        let result: Result<()> = (|| {
-            for (name, remote_path, kind, size, mtime, etag) in entries {
-                conn.execute(
-                    "INSERT INTO file_index
-                       (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status, poll_generation)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote', ?9)
-                     ON CONFLICT(mount_id, remote_path) DO UPDATE SET
-                       parent_inode    = excluded.parent_inode,
-                       name            = excluded.name,
-                       kind            = excluded.kind,
-                       size            = excluded.size,
-                       mtime           = excluded.mtime,
-                       etag            = excluded.etag,
-                       poll_generation = excluded.poll_generation,
-                       status          = CASE
-                         WHEN status IN ('dirty','uploading') THEN status
-                         ELSE 'stale'
-                       END",
-                    params![
-                        mount_id, parent as i64, name, remote_path,
-                        kind.as_str(), *size as i64, to_unix(*mtime), etag.as_deref(),
-                        poll_generation as i64,
-                    ],
-                )?;
+        // Process in chunks to avoid holding the mutex for too long
+        const CHUNK_SIZE: usize = 1000;
+        for chunk in entries.chunks(CHUNK_SIZE) {
+            let conn = self.conn.lock().await;
+            conn.execute_batch("BEGIN")?;
+            let result: Result<()> = (|| {
+                for (name, remote_path, kind, size, mtime, etag) in chunk {
+                    conn.execute(
+                        "INSERT INTO file_index
+                           (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status, poll_generation)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote', ?9)
+                         ON CONFLICT(mount_id, remote_path) DO UPDATE SET
+                           parent_inode    = excluded.parent_inode,
+                           name            = excluded.name,
+                           kind            = excluded.kind,
+                           size            = excluded.size,
+                           mtime           = excluded.mtime,
+                           etag            = excluded.etag,
+                           poll_generation = excluded.poll_generation,
+                           status          = CASE
+                             WHEN status IN ('dirty','uploading') THEN status
+                             ELSE 'stale'
+                           END",
+                        params![
+                            mount_id, parent as i64, name, remote_path,
+                            kind.as_str(), *size as i64, to_unix(*mtime), etag.as_deref(),
+                            poll_generation as i64,
+                        ],
+                    )?;
+                }
+                Ok(())
+            })();
+            match &result {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
             }
-            Ok(())
-        })();
-        match &result {
-            Ok(()) => conn.execute_batch("COMMIT")?,
-            Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+            result?;
         }
-        result
+        Ok(())
     }
 
     /// Upsert by (mount_id, remote_path) — used during remote listing.
@@ -538,6 +543,17 @@ impl StateDb {
             [],
         )?;
         if n > 0 { info!(count = n, "reset hydrating entries after restart"); }
+        Ok(n)
+    }
+
+    /// Reset all UPLOADING entries back to DIRTY (upload loop crashed).
+    pub async fn reset_uploading(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE file_index SET status='dirty' WHERE status='uploading'",
+            [],
+        )?;
+        if n > 0 { info!(count = n, "reset uploading entries to dirty"); }
         Ok(n)
     }
 
@@ -938,22 +954,27 @@ impl StateDb {
         generation: u64,
     ) -> Result<()> {
         if inodes.is_empty() { return Ok(()); }
-        let conn = self.conn.lock().await;
-        conn.execute_batch("BEGIN")?;
-        let result: Result<()> = (|| {
-            for &inode in inodes {
-                conn.execute(
-                    "UPDATE file_index SET poll_generation = ?1 WHERE inode = ?2",
-                    params![generation as i64, inode as i64],
-                )?;
+        // Process in chunks to avoid holding the mutex for too long
+        const CHUNK_SIZE: usize = 1000;
+        for chunk in inodes.chunks(CHUNK_SIZE) {
+            let conn = self.conn.lock().await;
+            conn.execute_batch("BEGIN")?;
+            let result: Result<()> = (|| {
+                for &inode in chunk {
+                    conn.execute(
+                        "UPDATE file_index SET poll_generation = ?1 WHERE inode = ?2",
+                        params![generation as i64, inode as i64],
+                    )?;
+                }
+                Ok(())
+            })();
+            match &result {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
             }
-            Ok(())
-        })();
-        match &result {
-            Ok(()) => conn.execute_batch("COMMIT")?,
-            Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+            result?;
         }
-        result
+        Ok(())
     }
 
     /// Delete entries with old poll_generation (absent from remote listing).

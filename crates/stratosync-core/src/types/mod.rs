@@ -249,6 +249,6 @@ pub enum SyncError {
 
 impl SyncError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Network(_) | Self::Transient(_))
+        matches!(self, Self::Network(_) | Self::Transient(_) | Self::QuotaExceeded)
     }
 }

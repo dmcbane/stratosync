@@ -13,7 +13,7 @@ use anyhow::Result;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use stratosync_core::{
     backend::Backend,
@@ -47,10 +47,20 @@ impl UploadQueue {
         max_concurrent:  usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel(512);
-        tokio::spawn(upload_loop(
-            tx.clone(), rx, mount_id, db, backend,
-            debounce, close_debounce, max_concurrent,
-        ));
+        let tx_inner = tx.clone();
+        let db2 = Arc::clone(&db);
+        tokio::spawn(async move {
+            upload_loop(
+                tx_inner, rx, mount_id, db, backend,
+                debounce, close_debounce, max_concurrent,
+            ).await;
+            // If we get here, the loop exited (channel closed or unexpected return).
+            // Reset any stuck Uploading inodes so they're retried on restart.
+            if let Err(e) = db2.reset_uploading().await {
+                error!("failed to reset uploading inodes after upload loop exit: {e}");
+            }
+            error!("upload loop exited — file uploads will not work until daemon restart");
+        });
         Self { tx }
     }
 
