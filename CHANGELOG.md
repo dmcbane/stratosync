@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-04-07
+
+### Fixed
+- **Hydration timeout**: `read()` no longer hangs forever if a download dies.
+  Waits up to 5 minutes with 3 retries, then returns EAGAIN (retry later).
+- **Errno mapping**: Network errors → EHOSTUNREACH ("No route to host"),
+  transient errors → EAGAIN ("Resource temporarily unavailable"), conflicts →
+  EEXIST, disk full → ENOSPC. Users now see "No space left on device" instead
+  of generic "Input/output error" for quota/disk issues.
+- **Rclone error parsing**: Extracts human-readable messages from rclone's JSON
+  log format. Auth errors (invalid_grant, token expired/revoked) map to
+  "Permission denied". Timeout/DNS → "Host unreachable".
+- **Poller backoff**: Exponential backoff after 3 consecutive failures (doubles
+  interval, caps at 10 min). After 10 failures, logs ERROR with actionable
+  guidance instead of spamming identical warnings.
+- **Upload queue resilience**: On loop exit, resets stuck Uploading inodes to
+  Dirty and logs ERROR. Previously, writes silently stopped syncing.
+- **Rclone process cleanup**: `kill_on_drop` ensures timed-out rclone processes
+  are killed (not orphaned). 256MB output cap prevents OOM from huge listings.
+- **Batch chunking**: DB operations process in chunks of 1000, releasing the
+  mutex between chunks so FUSE operations aren't starved during large polls.
+- **QuotaExceeded is now retryable** with exponential backoff.
+
 ## [0.5.0] - 2026-04-07
 
 ### Performance
