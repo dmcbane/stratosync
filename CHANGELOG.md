@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2026-04-09
+
+### Fixed
+- **Systemd service: remove PrivateTmp and NoNewPrivileges** — `PrivateTmp=true`
+  creates a private mount namespace that makes the FUSE mount invisible outside
+  the daemon's process. `NoNewPrivileges=true` blocks the setuid `fusermount3`
+  binary from elevating privileges, causing "Operation not permitted" on mount.
+  Both directives have been removed from the service template with explanatory
+  comments documenting why they are incompatible with FUSE.
+
 ## [0.5.1] - 2026-04-07
 
 ### Fixed

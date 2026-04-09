@@ -19,16 +19,14 @@ Environment="RUST_LOG=stratosync=info"
 # Uncomment to override config path:
 # Environment="STRATOSYNC_CONFIG=%h/.config/stratosync/config.toml"
 
-# Security hardening (user service — no root required)
-PrivateTmp=true
-NoNewPrivileges=true
+# FUSE compatibility notes:
+# - PrivateTmp=true is NOT used because it creates a private mount namespace,
+#   which makes the FUSE mount invisible to the user's session.
+# - NoNewPrivileges=true is NOT used because fusermount3 is a setuid binary
+#   and requires privilege escalation to perform the mount.
 
 # FUSE requires access to /dev/fuse
 DeviceAllow=/dev/fuse rw
-
-# Allow the mount namespace to be visible to other processes (required by FUSE)
-# Without this, the mount is invisible outside the daemon's namespace
-PrivateMounts=false
 
 # Resource limits
 LimitNOFILE=65536

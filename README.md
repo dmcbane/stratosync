@@ -35,7 +35,7 @@ Linux has excellent cloud sync tools, but none that provide all three: **on-dema
 
 ## Status
 
-🚧 **Pre-alpha (v0.5.1)** — Phase 1 (read-only VFS) and Phase 2 (bidirectional sync) are implemented and tested with Google Drive. The daemon mounts, lists, reads, writes, renames, and deletes files. Conflict resolution, LRU cache eviction, and inotify-based change detection are functional. See the [CHANGELOG](CHANGELOG.md) for details.
+🚧 **Pre-alpha (v0.5.2)** — Phase 1 (read-only VFS) and Phase 2 (bidirectional sync) are implemented and tested with Google Drive. The daemon mounts, lists, reads, writes, renames, and deletes files. Conflict resolution, LRU cache eviction, and inotify-based change detection are functional. See the [CHANGELOG](CHANGELOG.md) for details.
 
 ## Prerequisites
 
@@ -113,6 +113,12 @@ systemctl --user start stratosyncd
 systemctl --user status stratosyncd    # check it's running
 journalctl --user -u stratosyncd -f    # view logs
 ```
+
+> **Note on systemd sandboxing:** The service unit intentionally omits
+> `PrivateTmp=true` and `NoNewPrivileges=true`. `PrivateTmp` creates a private
+> mount namespace that makes the FUSE mount invisible outside the daemon, and
+> `NoNewPrivileges` blocks the setuid `fusermount3` binary from performing the
+> mount. If you customize the unit file, do not re-enable these directives.
 
 **Option B — foreground (for development/debugging):**
 
