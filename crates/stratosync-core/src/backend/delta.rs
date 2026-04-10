@@ -5,6 +5,7 @@
 //! to the appropriate provider when available.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::types::{RemoteChange, RemoteMetadata, SyncError};
-use super::rclone_config::OAuthToken;
+use super::rclone_config::{self, OAuthToken};
 
 // ── DeltaProvider trait ──────────────────────────────────────────────────────
 
@@ -47,6 +48,9 @@ pub(crate) struct GoogleDriveDelta {
     /// The folder ID that corresponds to the rclone remote root.
     /// "root" for the drive root, or a specific folder ID for sub-paths.
     root_folder_id: String,
+    /// rclone binary path + remote name for fallback token refresh.
+    rclone_bin: PathBuf,
+    remote_name: String,
     /// OAuth state, refreshed as needed.
     auth: Mutex<GoogleAuth>,
 }
@@ -65,10 +69,14 @@ impl GoogleDriveDelta {
         client_secret: String,
         oauth_token: OAuthToken,
         root_folder_id: String,
+        rclone_bin: PathBuf,
+        remote_name: String,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
             root_folder_id,
+            rclone_bin,
+            remote_name,
             auth: Mutex::new(GoogleAuth {
                 client_id,
                 client_secret,
@@ -80,46 +88,71 @@ impl GoogleDriveDelta {
     }
 
     /// Ensure we have a valid access token, refreshing if needed.
+    ///
+    /// Two refresh strategies:
+    /// - If client_id/secret are available, refresh directly with Google's
+    ///   token endpoint (faster, no subprocess).
+    /// - If client_id is empty (rclone uses built-in credentials), re-read
+    ///   the token from `rclone config show` — rclone auto-refreshes its
+    ///   own tokens.
     async fn ensure_valid_token(&self) -> Result<String, SyncError> {
         let mut auth = self.auth.lock().await;
         let now = Utc::now();
 
         // Refresh if within 60 seconds of expiry
         if auth.expiry <= now + chrono::Duration::seconds(60) {
-            debug!("refreshing Google OAuth token");
-            let resp = self.client
-                .post(GOOGLE_TOKEN_URL)
-                .form(&[
-                    ("client_id", auth.client_id.as_str()),
-                    ("client_secret", auth.client_secret.as_str()),
-                    ("refresh_token", auth.refresh_token.as_str()),
-                    ("grant_type", "refresh_token"),
-                ])
-                .send()
-                .await
-                .map_err(|e| SyncError::Network(format!("token refresh request failed: {e}")))?;
+            if auth.client_id.is_empty() {
+                // rclone manages its own credentials — re-read the token
+                debug!("re-reading OAuth token from rclone config (rclone-managed credentials)");
+                let config = rclone_config::rclone_config_show(&self.rclone_bin, &self.remote_name)
+                    .await
+                    .map_err(|e| SyncError::Transient(format!("rclone config re-read: {e}")))?;
+                let token_json = config.get("token")
+                    .ok_or_else(|| SyncError::Fatal("no token in rclone config after re-read".into()))?;
+                let oauth = rclone_config::parse_oauth_token(token_json)
+                    .map_err(|e| SyncError::Fatal(format!("parse refreshed token: {e}")))?;
 
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                || resp.status() == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(SyncError::PermissionDenied(
-                    "OAuth token refresh failed — credentials revoked or expired".into(),
-                ));
+                auth.access_token = oauth.access_token;
+                auth.refresh_token = oauth.refresh_token;
+                auth.expiry = oauth.expiry;
+                debug!("OAuth token re-read from rclone config");
+            } else {
+                // We have client credentials — refresh directly
+                debug!("refreshing Google OAuth token");
+                let resp = self.client
+                    .post(GOOGLE_TOKEN_URL)
+                    .form(&[
+                        ("client_id", auth.client_id.as_str()),
+                        ("client_secret", auth.client_secret.as_str()),
+                        ("refresh_token", auth.refresh_token.as_str()),
+                        ("grant_type", "refresh_token"),
+                    ])
+                    .send()
+                    .await
+                    .map_err(|e| SyncError::Network(format!("token refresh request failed: {e}")))?;
+
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN
+                {
+                    return Err(SyncError::PermissionDenied(
+                        "OAuth token refresh failed — credentials revoked or expired".into(),
+                    ));
+                }
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncError::Transient(
+                        format!("token refresh HTTP {status}: {body}"),
+                    ));
+                }
+
+                let token_resp: GoogleTokenResponse = resp.json().await
+                    .map_err(|e| SyncError::Fatal(format!("parse token response: {e}")))?;
+
+                auth.access_token = token_resp.access_token;
+                auth.expiry = now + chrono::Duration::seconds(token_resp.expires_in);
+                debug!("Google OAuth token refreshed, expires in {}s", token_resp.expires_in);
             }
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(SyncError::Transient(
-                    format!("token refresh HTTP {status}: {body}"),
-                ));
-            }
-
-            let token_resp: GoogleTokenResponse = resp.json().await
-                .map_err(|e| SyncError::Fatal(format!("parse token response: {e}")))?;
-
-            auth.access_token = token_resp.access_token;
-            auth.expiry = now + chrono::Duration::seconds(token_resp.expires_in);
-            debug!("Google OAuth token refreshed, expires in {}s", token_resp.expires_in);
         }
 
         Ok(auth.access_token.clone())
@@ -475,6 +508,9 @@ pub(crate) struct OneDriveDelta {
     /// Personal: "https://graph.microsoft.com/v1.0/me/drive"
     /// Business: may use a different drive_id
     drive_url: String,
+    /// rclone binary path + remote name for fallback token refresh.
+    rclone_bin: PathBuf,
+    remote_name: String,
     /// OAuth state, refreshed as needed.
     auth: Mutex<OneDriveAuth>,
 }
@@ -494,11 +530,15 @@ impl OneDriveDelta {
         oauth_token: OAuthToken,
         root_path: String,
         drive_url: String,
+        rclone_bin: PathBuf,
+        remote_name: String,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
             root_path,
             drive_url,
+            rclone_bin,
+            remote_name,
             auth: Mutex::new(OneDriveAuth {
                 client_id,
                 client_secret,
@@ -515,40 +555,56 @@ impl OneDriveDelta {
         let now = Utc::now();
 
         if auth.expiry <= now + chrono::Duration::seconds(60) {
-            debug!("refreshing OneDrive OAuth token");
-            let resp = self.client
-                .post(MICROSOFT_TOKEN_URL)
-                .form(&[
-                    ("client_id", auth.client_id.as_str()),
-                    ("client_secret", auth.client_secret.as_str()),
-                    ("refresh_token", auth.refresh_token.as_str()),
-                    ("grant_type", "refresh_token"),
-                ])
-                .send()
-                .await
-                .map_err(|e| SyncError::Network(format!("OneDrive token refresh failed: {e}")))?;
+            if auth.client_id.is_empty() {
+                debug!("re-reading OAuth token from rclone config (rclone-managed credentials)");
+                let config = rclone_config::rclone_config_show(&self.rclone_bin, &self.remote_name)
+                    .await
+                    .map_err(|e| SyncError::Transient(format!("rclone config re-read: {e}")))?;
+                let token_json = config.get("token")
+                    .ok_or_else(|| SyncError::Fatal("no token in rclone config after re-read".into()))?;
+                let oauth = rclone_config::parse_oauth_token(token_json)
+                    .map_err(|e| SyncError::Fatal(format!("parse refreshed token: {e}")))?;
 
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                || resp.status() == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(SyncError::PermissionDenied(
-                    "OneDrive OAuth token refresh failed — credentials revoked or expired".into(),
-                ));
+                auth.access_token = oauth.access_token;
+                auth.refresh_token = oauth.refresh_token;
+                auth.expiry = oauth.expiry;
+                debug!("OneDrive OAuth token re-read from rclone config");
+            } else {
+                debug!("refreshing OneDrive OAuth token");
+                let resp = self.client
+                    .post(MICROSOFT_TOKEN_URL)
+                    .form(&[
+                        ("client_id", auth.client_id.as_str()),
+                        ("client_secret", auth.client_secret.as_str()),
+                        ("refresh_token", auth.refresh_token.as_str()),
+                        ("grant_type", "refresh_token"),
+                    ])
+                    .send()
+                    .await
+                    .map_err(|e| SyncError::Network(format!("OneDrive token refresh failed: {e}")))?;
+
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN
+                {
+                    return Err(SyncError::PermissionDenied(
+                        "OneDrive OAuth token refresh failed — credentials revoked or expired".into(),
+                    ));
+                }
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncError::Transient(
+                        format!("OneDrive token refresh HTTP {status}: {body}"),
+                    ));
+                }
+
+                let token_resp: MicrosoftTokenResponse = resp.json().await
+                    .map_err(|e| SyncError::Fatal(format!("parse OneDrive token response: {e}")))?;
+
+                auth.access_token = token_resp.access_token;
+                auth.expiry = now + chrono::Duration::seconds(token_resp.expires_in);
+                debug!("OneDrive OAuth token refreshed, expires in {}s", token_resp.expires_in);
             }
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(SyncError::Transient(
-                    format!("OneDrive token refresh HTTP {status}: {body}"),
-                ));
-            }
-
-            let token_resp: MicrosoftTokenResponse = resp.json().await
-                .map_err(|e| SyncError::Fatal(format!("parse OneDrive token response: {e}")))?;
-
-            auth.access_token = token_resp.access_token;
-            auth.expiry = now + chrono::Duration::seconds(token_resp.expires_in);
-            debug!("OneDrive OAuth token refreshed, expires in {}s", token_resp.expires_in);
         }
 
         Ok(auth.access_token.clone())
@@ -983,9 +1039,8 @@ mod tests {
 
     // ── Path resolution tests ────────────────────────────────────────────
 
-    #[test]
-    fn test_resolve_path_direct_child_of_root() {
-        let delta = GoogleDriveDelta::new(
+    fn make_gdrive_delta(root_folder_id: &str) -> GoogleDriveDelta {
+        GoogleDriveDelta::new(
             String::new(), String::new(),
             OAuthToken {
                 access_token: String::new(),
@@ -993,8 +1048,15 @@ mod tests {
                 expiry: Utc::now(),
                 token_type: "Bearer".into(),
             },
-            "root".into(),
-        );
+            root_folder_id.into(),
+            PathBuf::from("/usr/bin/rclone"),
+            "test".into(),
+        )
+    }
+
+    #[test]
+    fn test_resolve_path_direct_child_of_root() {
+        let delta = make_gdrive_delta("root");
 
         let id_map = HashMap::new();
         let path = delta.resolve_path("file1", "report.pdf", &["root".into()], &id_map);
@@ -1003,16 +1065,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_nested() {
-        let delta = GoogleDriveDelta::new(
-            String::new(), String::new(),
-            OAuthToken {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expiry: Utc::now(),
-                token_type: "Bearer".into(),
-            },
-            "root".into(),
-        );
+        let delta = make_gdrive_delta("root");
 
         let mut id_map = HashMap::new();
         id_map.insert("folder_a".into(), ("Documents".into(), vec!["root".into()]));
@@ -1024,16 +1077,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_not_under_root() {
-        let delta = GoogleDriveDelta::new(
-            String::new(), String::new(),
-            OAuthToken {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expiry: Utc::now(),
-                token_type: "Bearer".into(),
-            },
-            "specific_folder_id".into(),
-        );
+        let delta = make_gdrive_delta("specific_folder_id");
 
         let mut id_map = HashMap::new();
         // Parent chain doesn't reach our root folder
@@ -1045,16 +1089,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_no_parents() {
-        let delta = GoogleDriveDelta::new(
-            String::new(), String::new(),
-            OAuthToken {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expiry: Utc::now(),
-                token_type: "Bearer".into(),
-            },
-            "root".into(),
-        );
+        let delta = make_gdrive_delta("root");
 
         let id_map = HashMap::new();
         let path = delta.resolve_path("file1", "orphan.txt", &[], &id_map);
@@ -1222,6 +1257,8 @@ mod tests {
             },
             root_path.into(),
             "https://graph.microsoft.com/v1.0/me/drive".into(),
+            PathBuf::from("/usr/bin/rclone"),
+            "test".into(),
         )
     }
 

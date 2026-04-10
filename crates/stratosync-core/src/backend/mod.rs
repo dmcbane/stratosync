@@ -219,6 +219,8 @@ impl RcloneBackend {
                     client_secret,
                     oauth,
                     root_folder_id,
+                    self.rclone_bin.clone(),
+                    remote_name.to_string(),
                 )));
                 debug!("delta init: Google Drive delta enabled for {remote_name}");
             }
@@ -259,6 +261,8 @@ impl RcloneBackend {
                     oauth,
                     root_path,
                     drive_url,
+                    self.rclone_bin.clone(),
+                    remote_name.to_string(),
                 )));
                 debug!("delta init: OneDrive delta enabled for {remote_name}");
             }
