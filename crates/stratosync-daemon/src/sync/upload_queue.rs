@@ -100,7 +100,9 @@ async fn upload_loop(
 ) {
     // inode → in-flight abort handle
     let mut pending: HashMap<Inode, tokio::sync::oneshot::Sender<()>> = HashMap::new();
-    let mut in_flight: JoinSet<(Inode, Result<(), SyncError>)> = JoinSet::new();
+    // (inode, result, was_aborted) — the bool distinguishes aborted debounce
+    // timers from actual upload outcomes so we don't remove the wrong pending entry.
+    let mut in_flight: JoinSet<(Inode, Result<(), SyncError>, bool)> = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -136,28 +138,35 @@ async fn upload_loop(
                 let sc_c  = Arc::clone(&sync_config);
 
                 in_flight.spawn(async move {
-                    // Wait for window, unless aborted
+                    // Wait for window, unless aborted (new write came in,
+                    // or the pending entry was removed by a prior task's
+                    // completion handler — which drops the sender).
                     tokio::select! {
                         _ = sleep(window) => {}
                         _ = abort_rx      => {
-                            // Aborted (new write came in); caller re-enqueues
-                            return (inode, Ok(()));
+                            // Aborted — signal caller to NOT remove from pending.
+                            return (inode, Err(SyncError::Transient("debounce aborted".into())), true);
                         }
                     }
 
                     let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c).await;
-                    (inode, result)
+                    (inode, result, false)
                 });
             }
 
             // Completed upload
             Some(result) = in_flight.join_next() => {
                 match result {
-                    Ok((inode, Ok(()))) => {
+                    // Debounce was aborted (new write reset the timer, or the
+                    // pending entry's sender was dropped). Do NOT remove from
+                    // pending — the replacement task owns the current entry.
+                    Ok((_, _, true)) => {}
+
+                    Ok((inode, Ok(()), _)) => {
                         debug!(inode, "upload complete");
                         pending.remove(&inode);
                     }
-                    Ok((inode, Err(SyncError::Conflict { local, remote }))) => {
+                    Ok((inode, Err(SyncError::Conflict { local, remote }), _)) => {
                         warn!(inode, ?local, ?remote, "upload conflict — invoking resolver");
                         if let Ok(Some(entry)) = db.get_by_inode(inode).await {
                             let has_git = super::conflict::git_available();
@@ -170,7 +179,7 @@ async fn upload_loop(
                         }
                         pending.remove(&inode);
                     }
-                    Ok((inode, Err(e))) if e.is_retryable() => {
+                    Ok((inode, Err(e), _)) if e.is_retryable() => {
                         warn!(inode, "upload transient error: {e} — will retry");
                         if let Err(db_err) = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await {
                             warn!(inode, "failed to record retry backoff: {db_err}");
@@ -180,7 +189,7 @@ async fn upload_loop(
                             warn!(inode, "retry re-queue failed (channel full/closed): {q_err}");
                         }
                     }
-                    Ok((inode, Err(e))) => {
+                    Ok((inode, Err(e), _)) => {
                         warn!(inode, "upload fatal: {e}");
                         // Reset to Dirty so the file is retried on next daemon start.
                         // If this fails, the inode stays in Uploading; startup recovery
