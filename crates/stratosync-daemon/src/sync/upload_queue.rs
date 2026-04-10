@@ -80,14 +80,14 @@ impl UploadQueue {
 
 // ── Internal loop ─────────────────────────────────────────────────────────────
 
+/// A pending upload waiting for its debounce window to expire.
 struct PendingUpload {
-    inode:      Inode,
-    due_at:     Instant,
-    abort_tx:   tokio::sync::oneshot::Sender<()>,
+    /// When the debounce expires and the upload should start.
+    due_at: tokio::time::Instant,
 }
 
 async fn upload_loop(
-    tx_self:        mpsc::Sender<UploadTrigger>,
+    _tx_self:       mpsc::Sender<UploadTrigger>,
     mut rx:         mpsc::Receiver<UploadTrigger>,
     mount_id:       u32,
     db:             Arc<StateDb>,
@@ -98,13 +98,16 @@ async fn upload_loop(
     close_debounce: Duration,
     max_concurrent: usize,
 ) {
-    // inode → in-flight abort handle
-    let mut pending: HashMap<Inode, tokio::sync::oneshot::Sender<()>> = HashMap::new();
-    // (inode, result, was_aborted) — the bool distinguishes aborted debounce
-    // timers from actual upload outcomes so we don't remove the wrong pending entry.
-    let mut in_flight: JoinSet<(Inode, Result<(), SyncError>, bool)> = JoinSet::new();
+    // Debounce tracking: inode → when the upload should fire.
+    // New triggers push the deadline forward (Write) or shorten it (Close/Fsync).
+    let mut pending: HashMap<Inode, PendingUpload> = HashMap::new();
+    let mut in_flight: JoinSet<(Inode, Result<(), SyncError>)> = JoinSet::new();
 
     loop {
+        // Find the soonest deadline among pending items.
+        let next_deadline = pending.values().map(|p| p.due_at).min();
+        let at_capacity = in_flight.len() >= max_concurrent;
+
         tokio::select! {
             // Inbound trigger
             Some(trigger) = rx.recv() => {
@@ -114,64 +117,71 @@ async fn upload_loop(
                     UploadTrigger::Fsync { inode } => (inode, Duration::ZERO),
                 };
 
-                // Cancel any existing timer for this inode.
-                // Receiver dropped = timer already fired; that's fine.
-                let had_pending = pending.remove(&inode).map(|abort| {
-                    let _ = abort.send(());
-                }).is_some();
+                let new_due = tokio::time::Instant::now() + window;
 
-                // Respect concurrency limit — but if we just aborted an
-                // existing task for this inode, allow the replacement through
-                // (it's recycling the same slot, not adding a new one).
-                if !had_pending && in_flight.len() >= max_concurrent {
-                    // At capacity with no existing task to replace. Re-queue
-                    // via the async send (not try_send) to apply backpressure
-                    // rather than silently dropping the trigger.
-                    let tx = tx_self.clone();
-                    tokio::spawn(async move {
-                        let _ = tx.send(UploadTrigger::Write { inode }).await;
-                    });
-                    continue;
-                }
-
-                let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
-                pending.insert(inode, abort_tx);
-
-                let db_c  = Arc::clone(&db);
-                let be_c  = Arc::clone(&backend);
-                let bs_c  = Arc::clone(&base_store);
-                let sc_c  = Arc::clone(&sync_config);
-
-                in_flight.spawn(async move {
-                    // Wait for window, unless aborted (new write came in,
-                    // or the pending entry was removed by a prior task's
-                    // completion handler — which drops the sender).
-                    tokio::select! {
-                        _ = sleep(window) => {}
-                        _ = abort_rx      => {
-                            // Aborted — signal caller to NOT remove from pending.
-                            return (inode, Err(SyncError::Transient("debounce aborted".into())), true);
+                match pending.get_mut(&inode) {
+                    Some(entry) => {
+                        // Already pending — only move the deadline EARLIER
+                        // (Close/Fsync shorten the window, Write resets it).
+                        if matches!(trigger, UploadTrigger::Write { .. }) {
+                            // Write: reset debounce from now
+                            entry.due_at = new_due;
+                        } else {
+                            // Close/Fsync: shorten to min(current, new)
+                            entry.due_at = entry.due_at.min(new_due);
                         }
                     }
+                    None => {
+                        pending.insert(inode, PendingUpload { due_at: new_due });
+                    }
+                }
+            }
 
-                    let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c).await;
-                    (inode, result, false)
-                });
+            // A deadline expired — launch upload if under concurrency limit.
+            // When at capacity, wait for a completion via join_next instead.
+            _ = async {
+                if at_capacity {
+                    // Don't busy-loop on past deadlines while at capacity.
+                    // The join_next arm will fire when a slot opens, then
+                    // the next iteration will process the deadline.
+                    std::future::pending::<()>().await;
+                }
+                match next_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None    => std::future::pending().await,
+                }
+            } => {
+                let now = tokio::time::Instant::now();
+                let ready: Vec<Inode> = pending.iter()
+                    .filter(|(_, p)| p.due_at <= now)
+                    .map(|(&inode, _)| inode)
+                    .collect();
+
+                for inode in ready {
+                    if in_flight.len() >= max_concurrent {
+                        break;
+                    }
+                    pending.remove(&inode);
+
+                    let db_c  = Arc::clone(&db);
+                    let be_c  = Arc::clone(&backend);
+                    let bs_c  = Arc::clone(&base_store);
+                    let sc_c  = Arc::clone(&sync_config);
+
+                    in_flight.spawn(async move {
+                        let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c).await;
+                        (inode, result)
+                    });
+                }
             }
 
             // Completed upload
             Some(result) = in_flight.join_next() => {
                 match result {
-                    // Debounce was aborted (new write reset the timer, or the
-                    // pending entry's sender was dropped). Do NOT remove from
-                    // pending — the replacement task owns the current entry.
-                    Ok((_, _, true)) => {}
-
-                    Ok((inode, Ok(()), _)) => {
+                    Ok((inode, Ok(()))) => {
                         debug!(inode, "upload complete");
-                        pending.remove(&inode);
                     }
-                    Ok((inode, Err(SyncError::Conflict { local, remote }), _)) => {
+                    Ok((inode, Err(SyncError::Conflict { local, remote }))) => {
                         warn!(inode, ?local, ?remote, "upload conflict — invoking resolver");
                         if let Ok(Some(entry)) = db.get_by_inode(inode).await {
                             let has_git = super::conflict::git_available();
@@ -182,27 +192,22 @@ async fn upload_loop(
                                 warn!(inode, "conflict resolution failed: {e}");
                             }
                         }
-                        pending.remove(&inode);
                     }
-                    Ok((inode, Err(e), _)) if e.is_retryable() => {
+                    Ok((inode, Err(e))) if e.is_retryable() => {
                         warn!(inode, "upload transient error: {e} — will retry");
                         if let Err(db_err) = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await {
                             warn!(inode, "failed to record retry backoff: {db_err}");
                         }
-                        pending.remove(&inode);
-                        if let Err(q_err) = tx_self.try_send(UploadTrigger::Write { inode }) {
-                            warn!(inode, "retry re-queue failed (channel full/closed): {q_err}");
-                        }
+                        // Re-add to pending with debounce delay for retry
+                        pending.insert(inode, PendingUpload {
+                            due_at: tokio::time::Instant::now() + debounce,
+                        });
                     }
-                    Ok((inode, Err(e), _)) => {
+                    Ok((inode, Err(e))) => {
                         warn!(inode, "upload fatal: {e}");
-                        // Reset to Dirty so the file is retried on next daemon start.
-                        // If this fails, the inode stays in Uploading; startup recovery
-                        // (get_pending_uploads) handles that case.
                         if let Err(db_err) = db.set_status(inode, SyncStatus::Dirty).await {
                             warn!(inode, "failed to reset status to Dirty: {db_err}");
                         }
-                        pending.remove(&inode);
                     }
                     Err(join_err) => {
                         warn!("upload task panicked: {join_err}");
