@@ -233,9 +233,18 @@ impl RemotePoller {
                 // skip the expensive listing and just get the token.
                 let snap = self.db.snapshot_remote_index(self.mount_id).await?;
                 if snap.len() <= 1 {
-                    // Empty or root-only — need a full listing first
+                    // Empty or root-only — try a full listing first.
+                    // If the listing fails, proceed anyway: get a start token
+                    // and let delta mode catch up incrementally. The index
+                    // may be incomplete until a full listing succeeds.
                     info!(mount_id = self.mount_id, "no change token; running initial full listing");
-                    self.poll_once().await?;
+                    if let Err(e) = self.poll_once().await {
+                        warn!(
+                            mount_id = self.mount_id,
+                            "initial full listing failed ({e}); \
+                             proceeding with delta-only mode — index may be incomplete"
+                        );
+                    }
                 } else {
                     debug!(
                         mount_id = self.mount_id,
