@@ -225,7 +225,7 @@ pub async fn handle_unlink(
     db:       &Arc<StateDb>,
     backend:  &Arc<dyn Backend>,
 ) -> Result<(), libc::c_int> {
-    let entry = db.get_by_parent_name(parent, name).await
+    let entry = db.get_by_parent_name(mount_id, parent, name).await
         .map_err(|_| libc::EIO)?
         .ok_or(libc::ENOENT)?;
 
@@ -271,14 +271,14 @@ pub async fn handle_rmdir(
     db:       &Arc<StateDb>,
     backend:  &Arc<dyn Backend>,
 ) -> Result<(), libc::c_int> {
-    let entry = db.get_by_parent_name(parent, name).await
+    let entry = db.get_by_parent_name(mount_id, parent, name).await
         .map_err(|_| libc::EIO)?
         .ok_or(libc::ENOENT)?;
 
     if entry.kind != FileKind::Directory { return Err(libc::ENOTDIR); }
 
     // Check for children — refuse to rmdir non-empty
-    let children = db.list_children(entry.inode).await.map_err(|_| libc::EIO)?;
+    let children = db.list_children(mount_id, entry.inode).await.map_err(|_| libc::EIO)?;
     if !children.is_empty() { return Err(libc::ENOTEMPTY); }
 
     let remote_path = entry.remote_path.clone();
@@ -316,7 +316,7 @@ pub async fn handle_rename(
 ) -> Result<(), libc::c_int> {
     validate_filename(new_name)?;
 
-    let entry = db.get_by_parent_name(parent, name).await
+    let entry = db.get_by_parent_name(mount_id, parent, name).await
         .map_err(|_| libc::EIO)?
         .ok_or(libc::ENOENT)?;
 
@@ -327,7 +327,7 @@ pub async fn handle_rename(
     let new_remote = join_remote(&new_parent_entry.remote_path, new_name);
 
     // If destination exists, delete it from DB (POSIX rename semantics)
-    let dest_remote = if let Ok(Some(dest)) = db.get_by_parent_name(new_parent, new_name).await {
+    let dest_remote = if let Ok(Some(dest)) = db.get_by_parent_name(mount_id, new_parent, new_name).await {
         let rp = dest.remote_path.clone();
         if let Err(e) = db.delete_entry(dest.inode).await {
             warn!(inode = dest.inode, "delete_entry for rename overwrite failed: {e}");

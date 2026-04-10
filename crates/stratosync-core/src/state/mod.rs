@@ -306,28 +306,29 @@ impl StateDb {
 
     pub async fn get_by_parent_name(
         &self,
-        parent: Inode,
-        name:   &str,
+        mount_id: u32,
+        parent:   Inode,
+        name:     &str,
     ) -> Result<Option<FileEntry>> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT inode, mount_id, parent_inode, name, remote_path, kind,
                     size, mtime, etag, status, cache_path, cache_size, dir_listed
-             FROM file_index WHERE parent_inode = ?1 AND name = ?2",
-            params![parent as i64, name],
+             FROM file_index WHERE mount_id = ?1 AND parent_inode = ?2 AND name = ?3",
+            params![mount_id, parent as i64, name],
             row_to_entry,
         ).optional().map_err(Into::into)
     }
 
-    pub async fn list_children(&self, parent: Inode) -> Result<Vec<FileEntry>> {
+    pub async fn list_children(&self, mount_id: u32, parent: Inode) -> Result<Vec<FileEntry>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT inode, mount_id, parent_inode, name, remote_path, kind,
                     size, mtime, etag, status, cache_path, cache_size, dir_listed
-             FROM file_index WHERE parent_inode = ?1
+             FROM file_index WHERE mount_id = ?1 AND parent_inode = ?2
              ORDER BY inode ASC",
         )?;
-        let rows = stmt.query_map(params![parent as i64], row_to_entry)?
+        let rows = stmt.query_map(params![mount_id, parent as i64], row_to_entry)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

@@ -32,19 +32,24 @@ async fn main() -> Result<()> {
     init_logging(&cfg);
     info!(version = env!("CARGO_PKG_VERSION"), "stratosyncd starting");
 
-    let db_path = default_data_dir().join("state.db");
-    let db = Arc::new(StateDb::open(&db_path)?);
-    db.migrate().await.context("DB migrations")?;
-
-    // Crash recovery
-    let reset = db.reset_hydrating().await?;
-    if reset > 0 { info!(count = reset, "reset stale hydrations"); }
-
     let mut fuse_threads = vec![];
     let mut mount_paths = vec![];
     let mut _watchers = vec![]; // must outlive fuse_threads to keep inotify alive
 
     for mount_cfg in cfg.mounts.iter().filter(|m| m.enabled) {
+        // Per-mount database — each mount gets its own SQLite file so inodes
+        // and file entries are fully isolated.  This prevents the bug where
+        // two mounts sharing a single DB would return cross-mount children
+        // (the root inode 1 collision + unfiltered list_children).
+        let db_path = default_data_dir().join(format!("{}.db", mount_cfg.name));
+        let db = Arc::new(StateDb::open(&db_path)?);
+        db.migrate().await
+            .with_context(|| format!("DB migration for mount {:?}", mount_cfg.name))?;
+
+        // Crash recovery (per-mount)
+        let reset = db.reset_hydrating().await?;
+        if reset > 0 { info!(count = reset, mount = %mount_cfg.name, "reset stale hydrations"); }
+
         let backend: Arc<dyn Backend> = Arc::new(
             RcloneBackend::new(&mount_cfg.remote)
                 .with_context(|| format!("backend for {:?}", mount_cfg.name))?,

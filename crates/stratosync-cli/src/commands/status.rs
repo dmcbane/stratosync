@@ -1,21 +1,20 @@
 use std::path::Path;
 use anyhow::Result;
 use bytesize::ByteSize;
-use stratosync_core::{state::StateDb};
+use stratosync_core::{config::default_data_dir, state::StateDb};
 
 pub async fn run(config_path: &Path) -> Result<()> {
     let cfg = crate::config_io::load(config_path)?;
-    let db_path = stratosync_core::config::default_data_dir().join("state.db");
-
-    if !db_path.exists() {
-        println!("No state database found — daemon has not run yet.");
-        println!("Start with:  stratosyncd");
-        return Ok(());
-    }
-
-    let db = StateDb::open(&db_path)?;
 
     for mount in &cfg.mounts {
+        let db_path = default_data_dir().join(format!("{}.db", mount.name));
+
+        if !db_path.exists() {
+            println!("  {} — not yet mounted", mount.name);
+            continue;
+        }
+
+        let db = StateDb::open(&db_path)?;
         let Some(mount_id) = db.get_mount_id(&mount.name).await? else {
             println!("  {} — not yet mounted", mount.name);
             continue;
@@ -34,8 +33,6 @@ pub async fn run(config_path: &Path) -> Result<()> {
             pct,
         );
 
-        // Count files by status
-        // (In a full implementation, we'd have a summary query in StateDb)
         println!("    mount: {}", mount.mount_path.display());
         println!("    remote: {}", mount.remote);
     }

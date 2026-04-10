@@ -220,7 +220,7 @@ fn spawn_prefetch_child_dirs(
     db: Arc<StateDb>, backend: Arc<dyn Backend>, mid: u32, parent_inode: Inode,
 ) {
     tokio::spawn(async move {
-        let children = db.list_children(parent_inode).await.unwrap_or_default();
+        let children = db.list_children(mid, parent_inode).await.unwrap_or_default();
         let sem = Arc::new(tokio::sync::Semaphore::new(4));
         for child in children {
             if child.kind != FileKind::Directory || child.dir_listed.is_some() {
@@ -260,11 +260,11 @@ impl Filesystem for StratoFs {
         let name_log = name_str.clone();
         let (db, backend, cfg, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.cfg.clone(), self.mount_id);
         let result = self.rt.block_on(async move {
-            if let Some(e) = db.get_by_parent_name(parent, &name_str).await? { return Ok(Some(e)); }
+            if let Some(e) = db.get_by_parent_name(mid, parent, &name_str).await? { return Ok(Some(e)); }
             if let Some(dir) = db.get_by_inode(parent).await? {
                 if dir.kind == FileKind::Directory && dir.dir_listed.is_none() {
                     populate_directory(&db, &backend, mid, &dir).await?;
-                    return db.get_by_parent_name(parent, &name_str).await;
+                    return db.get_by_parent_name(mid, parent, &name_str).await;
                 }
             }
             Ok(None)
@@ -332,7 +332,7 @@ impl Filesystem for StratoFs {
         let result = self.rt.block_on(async move {
             let dir = db.get_by_inode(ino).await?.ok_or_else(|| anyhow::anyhow!("inode {ino}"))?;
             if dir.dir_listed.is_none() { populate_directory(&db, &backend, mid, &dir).await?; }
-            db.list_children(ino).await
+            db.list_children(mid, ino).await
         });
         match result {
             Err(e) => { error!(ino, "readdir: {e:#}"); reply.error(libc::EIO); }

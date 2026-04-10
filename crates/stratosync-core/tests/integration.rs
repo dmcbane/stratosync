@@ -83,10 +83,10 @@ async fn db_lookup_by_parent_and_name() {
     db.insert_file(&file_entry(mid, root, "alpha.rs")).await.unwrap();
     db.insert_file(&file_entry(mid, root, "beta.rs")).await.unwrap();
 
-    let entry = db.get_by_parent_name(root, "alpha.rs").await.unwrap().unwrap();
+    let entry = db.get_by_parent_name(mid, root,"alpha.rs").await.unwrap().unwrap();
     assert_eq!(entry.name, "alpha.rs");
 
-    let missing = db.get_by_parent_name(root, "gamma.rs").await.unwrap();
+    let missing = db.get_by_parent_name(mid, root,"gamma.rs").await.unwrap();
     assert!(missing.is_none());
 }
 
@@ -97,7 +97,7 @@ async fn db_list_children_ordered() {
     for name in ["c.rs", "a.rs", "b.rs"] {
         db.insert_file(&file_entry(mid, root, name)).await.unwrap();
     }
-    let children = db.list_children(root).await.unwrap();
+    let children = db.list_children(mid, root).await.unwrap();
     assert_eq!(children.len(), 3);
     let mut names: Vec<&str> = children.iter()
         .map(|e| e.name.as_str())
@@ -164,7 +164,7 @@ async fn db_reset_hydrating_on_restart() {
     assert_eq!(reset, 2);
 
     // Both should now be Remote
-    let children = db.list_children(root).await.unwrap();
+    let children = db.list_children(mid, root).await.unwrap();
     for c in children {
         assert_eq!(c.status, SyncStatus::Remote, "{} should be Remote", c.name);
     }
@@ -464,12 +464,12 @@ async fn db_delete_mount_entries_clears_all() {
     for name in ["a.txt", "b.txt", "c.txt"] {
         db.insert_file(&file_entry(mid, root, name)).await.unwrap();
     }
-    assert_eq!(db.list_children(root).await.unwrap().len(), 3);
+    assert_eq!(db.list_children(mid, root).await.unwrap().len(), 3);
 
     // delete_mount_entries should clear everything including root
     db.delete_mount_entries(mid).await.unwrap();
     assert!(db.get_by_inode(root).await.unwrap().is_none());
-    assert!(db.list_children(root).await.unwrap().is_empty());
+    assert!(db.list_children(mid, root).await.unwrap().is_empty());
 
     // Must be able to re-insert root at inode 1 after clearing
     let new_root = insert_root(&db, mid).await;
@@ -502,11 +502,84 @@ async fn populate_root_from_mock_backend() {
     db.mark_dir_listed(root).await.unwrap();
 
     // Verify list_children returns the two files
-    let listed = db.list_children(root).await.unwrap();
+    let listed = db.list_children(mid, root).await.unwrap();
     assert_eq!(listed.len(), 2);
     let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"hello.txt"));
     assert!(names.contains(&"world.pdf"));
+}
+
+// ── Multi-mount isolation ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn multi_mount_list_children_isolated() {
+    // Per-mount databases ensure mount isolation. Each mount gets its own DB
+    // with its own root at inode 1 — no cross-mount contamination possible.
+    let db_a = Arc::new(StateDb::in_memory().unwrap());
+    db_a.migrate().await.unwrap();
+    let mid_a = db_a.upsert_mount("gdrive", "gdrive:/", "/mnt/gdrive", "/tmp/cache_a", 5 << 30, 60).await.unwrap();
+    let root_a = db_a.insert_root(&root_entry(mid_a)).await.unwrap();
+
+    let db_b = Arc::new(StateDb::in_memory().unwrap());
+    db_b.migrate().await.unwrap();
+    let mid_b = db_b.upsert_mount("onedrive", "onedrive:/", "/mnt/onedrive", "/tmp/cache_b", 5 << 30, 60).await.unwrap();
+    let root_b = db_b.insert_root(&root_entry(mid_b)).await.unwrap();
+
+    // Both roots should be inode 1 in their respective DBs
+    assert_eq!(root_a, FUSE_ROOT_INODE);
+    assert_eq!(root_b, FUSE_ROOT_INODE);
+
+    // Insert children: "alpha.txt" under mount A, "beta.txt" under mount B
+    db_a.insert_file(&file_entry(mid_a, root_a, "alpha.txt")).await.unwrap();
+    db_b.insert_file(&file_entry(mid_b, root_b, "beta.txt")).await.unwrap();
+
+    // list_children for mount A should return ONLY alpha.txt
+    let children_a = db_a.list_children(mid_a, root_a).await.unwrap();
+    let names_a: Vec<&str> = children_a.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names_a, vec!["alpha.txt"], "mount A must only see its own children");
+
+    // list_children for mount B should return ONLY beta.txt
+    let children_b = db_b.list_children(mid_b, root_b).await.unwrap();
+    let names_b: Vec<&str> = children_b.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names_b, vec!["beta.txt"], "mount B must only see its own children");
+}
+
+#[tokio::test]
+async fn multi_mount_get_by_parent_name_isolated() {
+    // Per-mount databases ensure mount isolation.
+    let db_a = Arc::new(StateDb::in_memory().unwrap());
+    db_a.migrate().await.unwrap();
+    let mid_a = db_a.upsert_mount("gdrive", "gdrive:/", "/mnt/gdrive", "/tmp/cache_a", 5 << 30, 60).await.unwrap();
+    let root_a = db_a.insert_root(&root_entry(mid_a)).await.unwrap();
+
+    let db_b = Arc::new(StateDb::in_memory().unwrap());
+    db_b.migrate().await.unwrap();
+    let mid_b = db_b.upsert_mount("onedrive", "onedrive:/", "/mnt/onedrive", "/tmp/cache_b", 5 << 30, 60).await.unwrap();
+    let root_b = db_b.insert_root(&root_entry(mid_b)).await.unwrap();
+
+    // Both mounts have a file named "shared_name.txt"
+    db_a.insert_file(&NewFileEntry {
+        mount_id: mid_a, parent: root_a,
+        name: "shared_name.txt".into(), remote_path: "/shared_name.txt".into(),
+        kind: FileKind::File, size: 100, mtime: SystemTime::UNIX_EPOCH,
+        etag: Some("etag-a".into()), status: SyncStatus::Remote, cache_path: None, cache_size: None,
+    }).await.unwrap();
+    db_b.insert_file(&NewFileEntry {
+        mount_id: mid_b, parent: root_b,
+        name: "shared_name.txt".into(), remote_path: "/shared_name.txt".into(),
+        kind: FileKind::File, size: 200, mtime: SystemTime::UNIX_EPOCH,
+        etag: Some("etag-b".into()), status: SyncStatus::Remote, cache_path: None, cache_size: None,
+    }).await.unwrap();
+
+    // Lookup in each DB returns only that mount's entry
+    let entry_a = db_a.get_by_parent_name(mid_a, root_a, "shared_name.txt").await.unwrap().unwrap();
+    assert_eq!(entry_a.mount_id, mid_a);
+    assert_eq!(entry_a.size, 100);
+
+    let entry_b = db_b.get_by_parent_name(mid_b, root_b, "shared_name.txt").await.unwrap().unwrap();
+    assert_eq!(entry_b.mount_id, mid_b);
+    assert_eq!(entry_b.size, 200);
+
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

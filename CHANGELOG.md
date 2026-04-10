@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-04-09
+
+### Fixed
+- **Multi-mount isolation bug**: Two mounts with different rclone remotes showed
+  identical content. Root cause: all mounts shared a single `state.db`, causing
+  root inode collisions (`INSERT OR REPLACE` at inode 1) and unfiltered
+  `list_children`/`get_by_parent_name` queries that returned cross-mount entries.
+
+### Changed
+- **Per-mount database files**: Each mount now gets its own SQLite database
+  (`{name}.db`) instead of sharing `state.db`. This provides complete isolation
+  of inode namespaces and file entries between mounts.
+- **`StateDb::list_children` and `get_by_parent_name`** now require a `mount_id`
+  parameter for defense-in-depth filtering (breaking API change for downstream
+  consumers of `stratosync-core`).
+- CLI commands (`status`, `conflicts`) open per-mount database files.
+
+### Migration
+- The old shared `state.db` is no longer used. The daemon will create new
+  per-mount databases on first run. Cached files from the old DB will need to
+  be re-hydrated.
+
 ## [0.5.2] - 2026-04-09
 
 ### Fixed

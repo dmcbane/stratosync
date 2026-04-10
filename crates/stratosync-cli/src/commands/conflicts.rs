@@ -1,20 +1,17 @@
 use std::path::Path;
 use anyhow::Result;
-use stratosync_core::{state::StateDb};
+use stratosync_core::{config::default_data_dir, state::StateDb};
 
 pub async fn run(config_path: &Path) -> Result<()> {
     let cfg = crate::config_io::load(config_path)?;
-    let db_path = stratosync_core::config::default_data_dir().join("state.db");
-
-    if !db_path.exists() {
-        println!("No state database found — daemon has not run yet.");
-        return Ok(());
-    }
-
-    let db = StateDb::open(&db_path)?;
     let mut found_any = false;
 
     for mount in cfg.mounts.iter().filter(|m| m.enabled) {
+        let db_path = default_data_dir().join(format!("{}.db", mount.name));
+
+        if !db_path.exists() { continue; }
+
+        let db = StateDb::open(&db_path)?;
         let Some(mount_id) = db.get_mount_id(&mount.name).await? else { continue };
 
         // Query for all conflict entries

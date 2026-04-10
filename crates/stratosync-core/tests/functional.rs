@@ -124,7 +124,7 @@ async fn populate_root_lists_immediate_children_only() {
     db.batch_upsert_remote_files(mid, root, &entries).await.unwrap();
     db.mark_dir_listed(root).await.unwrap();
 
-    let listed = db.list_children(root).await.unwrap();
+    let listed = db.list_children(mid,root).await.unwrap();
     assert_eq!(listed.len(), 3);
     let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"file1.txt"));
@@ -151,7 +151,7 @@ async fn populate_subdir_builds_full_remote_paths() {
 
     db.batch_upsert_remote_files(mid, docs, &entries).await.unwrap();
 
-    let listed = db.list_children(docs).await.unwrap();
+    let listed = db.list_children(mid,docs).await.unwrap();
     assert_eq!(listed.len(), 2);
     // Paths must include the parent directory
     for entry in &listed {
@@ -302,9 +302,9 @@ async fn rename_updates_name_path_and_cache_path() {
     assert_eq!(entry.cache_path, Some(new_cache));
 
     // Old name should not be found
-    assert!(db.get_by_parent_name(root, "old.txt").await.unwrap().is_none());
+    assert!(db.get_by_parent_name(mid,root, "old.txt").await.unwrap().is_none());
     // New name should be found
-    assert!(db.get_by_parent_name(root, "new.txt").await.unwrap().is_some());
+    assert!(db.get_by_parent_name(mid,root, "new.txt").await.unwrap().is_some());
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -323,8 +323,8 @@ async fn rename_across_directories() {
     assert_eq!(entry.parent, dir_b);
     assert_eq!(entry.remote_path, "b/file.txt");
 
-    assert!(db.get_by_parent_name(dir_a, "file.txt").await.unwrap().is_none());
-    assert!(db.get_by_parent_name(dir_b, "file.txt").await.unwrap().is_some());
+    assert!(db.get_by_parent_name(mid,dir_a, "file.txt").await.unwrap().is_none());
+    assert!(db.get_by_parent_name(mid,dir_b, "file.txt").await.unwrap().is_some());
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────────
@@ -348,7 +348,7 @@ async fn delete_removes_entry_and_cascades_lru() {
     db.delete_entry(inode).await.unwrap();
 
     assert!(db.get_by_inode(inode).await.unwrap().is_none());
-    assert!(db.get_by_parent_name(root, "del.txt").await.unwrap().is_none());
+    assert!(db.get_by_parent_name(mid,root, "del.txt").await.unwrap().is_none());
     // LRU entry should be cascade-deleted
     let candidates = db.lru_eviction_candidates(mid, 100).await.unwrap();
     assert!(candidates.iter().all(|c| c.inode != inode));
@@ -395,7 +395,7 @@ async fn nested_directory_structure() {
 
     // Insert file at deepest level
     let file = insert_file(&db, mid, c, "deep.txt", "a/b/c/deep.txt", SyncStatus::Remote, None).await;
-    let children = db.list_children(c).await.unwrap();
+    let children = db.list_children(mid,c).await.unwrap();
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].inode, file);
 }
@@ -406,12 +406,12 @@ async fn rmdir_only_works_on_empty_dir() {
     let dir = insert_dir(&db, mid, root, "stuff", "stuff").await;
     let _file = insert_file(&db, mid, dir, "child.txt", "stuff/child.txt", SyncStatus::Remote, None).await;
 
-    let children = db.list_children(dir).await.unwrap();
+    let children = db.list_children(mid,dir).await.unwrap();
     assert_eq!(children.len(), 1, "dir must be non-empty for this test");
 
     // After removing the child, rmdir should work
     db.delete_entry(_file).await.unwrap();
-    let children = db.list_children(dir).await.unwrap();
+    let children = db.list_children(mid,dir).await.unwrap();
     assert!(children.is_empty());
     db.delete_entry(dir).await.unwrap();
     assert!(db.get_by_inode(dir).await.unwrap().is_none());
@@ -462,7 +462,7 @@ async fn root_does_not_appear_as_own_child() {
     let (db, mid, root) = setup().await;
     insert_file(&db, mid, root, "a.txt", "a.txt", SyncStatus::Remote, None).await;
 
-    let children = db.list_children(root).await.unwrap();
+    let children = db.list_children(mid,root).await.unwrap();
     // Root has NULL parent so it should NOT appear in its own children
     assert!(children.iter().all(|c| c.inode != root),
         "root must not appear as its own child");
@@ -499,12 +499,12 @@ async fn batch_upsert_is_atomic_on_error() {
     ];
 
     db.batch_upsert_remote_files(mid, root, &entries).await.unwrap();
-    let children = db.list_children(root).await.unwrap();
+    let children = db.list_children(mid,root).await.unwrap();
     assert_eq!(children.len(), 2);
 
     // Upserting again should update, not duplicate
     db.batch_upsert_remote_files(mid, root, &entries).await.unwrap();
-    let children = db.list_children(root).await.unwrap();
+    let children = db.list_children(mid,root).await.unwrap();
     assert_eq!(children.len(), 2, "batch upsert must not create duplicates");
 }
 
@@ -544,7 +544,7 @@ async fn concurrent_upserts_to_different_files() {
     }
     for h in handles { h.await.unwrap(); }
 
-    let children = db.list_children(root).await.unwrap();
+    let children = db.list_children(mid,root).await.unwrap();
     assert_eq!(children.len(), 20);
 }
 
@@ -841,7 +841,7 @@ async fn sql_injection_in_filename_is_harmless() {
     }
 
     // Tables must still exist and be functional
-    let children = db.list_children(root).await.unwrap();
+    let children = db.list_children(mid,root).await.unwrap();
     assert_eq!(children.len(), evil_names.len());
 }
 
