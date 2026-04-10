@@ -159,13 +159,17 @@ impl TryFrom<RcloneLsJsonEntry> for RemoteMetadata {
 
         // Prefer SHA-1 or MD5 as a stable content identifier; fall back to
         // provider-specific ID (Google Drive file ID, etc.) as a poor-man's
-        // etag.
+        // etag. rclone uses lowercase hash names (sha1, md5) in its JSON.
         let etag = e.hashes.as_ref()
-            .and_then(|h| h.get("SHA-1").or_else(|| h.get("MD5")).cloned())
+            .and_then(|h| {
+                h.get("sha1").or_else(|| h.get("SHA-1"))
+                    .or_else(|| h.get("md5")).or_else(|| h.get("MD5"))
+                    .cloned()
+            })
             .or_else(|| e.id.clone());
 
         let checksum = e.hashes.as_ref()
-            .and_then(|h| h.get("SHA-256").cloned());
+            .and_then(|h| h.get("sha256").or_else(|| h.get("SHA-256")).cloned());
 
         Ok(Self {
             path:      e.path,

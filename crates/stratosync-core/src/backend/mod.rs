@@ -364,7 +364,7 @@ impl RcloneBackend {
 impl Backend for RcloneBackend {
     async fn stat(&self, path: &str) -> Result<RemoteMetadata, SyncError> {
         let rp    = self.rpath(path);
-        let bytes = self.run(&["lsjson", "--no-modtime=false", &rp]).await?;
+        let bytes = self.run(&["lsjson", "--no-modtime=false", "--hash", &rp]).await?;
         let mut list = Self::parse_lsjson(&bytes)?;
         list.pop().ok_or_else(|| SyncError::NotFound(path.to_owned()))
     }
