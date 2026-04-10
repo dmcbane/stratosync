@@ -102,35 +102,61 @@ Comparison with existing tools:
 
 For plain text files, a 3-way merge can often resolve conflicts automatically. This requires knowing the common ancestor — the version of the file when both sides last agreed.
 
+### Base Version Store
+
+Base versions are stored locally in a content-addressed object store at
+`~/.cache/stratosync/{mount_name}/.bases/objects/`, following git's layout
+convention (`{sha256[..2]}/{sha256[2..]}`). Content-addressing gives free
+deduplication.
+
+Bases are captured at two points:
+- **On hydration**: when a file is first downloaded from the remote
+- **On upload**: when a file is successfully uploaded, the uploaded content becomes the new base
+
+Only text-mergeable files get base snapshots (gated by extension allowlist,
+size threshold ≤ `base_max_file_size`, and NUL-byte binary detection).
+
+The `base_versions` table in StateDb maps `(inode, mount_id)` → `object_hash`.
+Stale entries are evicted every 6 hours based on `base_retention_days`.
+
 ```toml
 [sync]
 text_conflict_strategy = "merge"   # default: "keep_both"
 text_extensions = ["md", "txt", "rs", "py", "toml", "yaml", "json"]
+base_retention_days = 30           # how long to keep base objects
+base_max_file_size = "10 MB"       # skip base capture for larger files
 ```
 
-Algorithm when `text_conflict_strategy = "merge"`:
+### Merge Algorithm
+
+When `text_conflict_strategy = "merge"` and a base version exists:
 
 ```
-ancestor = fetch version at known_etag from rclone (if provider supports
-           content-addressed retrieval; else skip to keep_both)
-local    = current dirty cache file
-remote   = downloaded winning version
+base   = content-addressed blob from .bases/objects/
+local  = current dirty cache file
+remote = downloaded from backend to temp file
 
-result   = merge3(ancestor, local, remote)
+result = git merge-file --stdout local base remote
 
-if result.has_conflicts:
-    // diff3 conflict markers present; treat as keep_both
-    create conflict file for local version
-    write result (with markers) to canonical path
-    notify user: "Partial merge — review conflict markers"
-else:
-    // clean merge
-    write result to canonical path
-    upload merged result
+exit 0 (clean merge):
+    write merged content to canonical path
+    upload merged result (no ETag check)
+    update base version to merged result
     no conflict file created
+
+exit 1 (conflict markers):
+    write merged-with-markers to canonical path
+    create .conflict.* sibling with original local version
+    notify user: "Partial merge — review conflict markers"
+
+other/failed/git not found:
+    fall back to keep_both (existing behavior)
 ```
 
-We use the `diffy` crate for Rust-native Myers diff / 3-way merge.
+We shell out to `git merge-file` — it is the gold standard for 3-way text
+merge, available on virtually all Linux systems, and produces standard
+`<<<<<<<` / `=======` / `>>>>>>>` conflict markers. If `git` is not
+installed, merge is silently skipped and the keep-both strategy applies.
 
 ---
 

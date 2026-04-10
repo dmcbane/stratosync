@@ -17,6 +17,8 @@ use tracing::{debug, error, info, warn};
 
 use stratosync_core::{
     backend::Backend,
+    base_store::BaseStore,
+    config::SyncConfig,
     state::{StateDb, SyncQueueJob},
     types::{Inode, SyncError, SyncStatus},
 };
@@ -42,6 +44,8 @@ impl UploadQueue {
         mount_id:        u32,
         db:              Arc<StateDb>,
         backend:         Arc<dyn Backend>,
+        base_store:      Arc<BaseStore>,
+        sync_config:     Arc<SyncConfig>,
         debounce:        Duration,
         close_debounce:  Duration,
         max_concurrent:  usize,
@@ -52,6 +56,7 @@ impl UploadQueue {
         tokio::spawn(async move {
             upload_loop(
                 tx_inner, rx, mount_id, db, backend,
+                base_store, sync_config,
                 debounce, close_debounce, max_concurrent,
             ).await;
             // If we get here, the loop exited (channel closed or unexpected return).
@@ -87,6 +92,8 @@ async fn upload_loop(
     mount_id:       u32,
     db:             Arc<StateDb>,
     backend:        Arc<dyn Backend>,
+    base_store:     Arc<BaseStore>,
+    sync_config:    Arc<SyncConfig>,
     debounce:       Duration,
     close_debounce: Duration,
     max_concurrent: usize,
@@ -125,6 +132,8 @@ async fn upload_loop(
 
                 let db_c  = Arc::clone(&db);
                 let be_c  = Arc::clone(&backend);
+                let bs_c  = Arc::clone(&base_store);
+                let sc_c  = Arc::clone(&sync_config);
 
                 in_flight.spawn(async move {
                     // Wait for window, unless aborted
@@ -136,7 +145,7 @@ async fn upload_loop(
                         }
                     }
 
-                    let result = run_upload(inode, mount_id, &db_c, &be_c).await;
+                    let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c).await;
                     (inode, result)
                 });
             }
@@ -150,7 +159,15 @@ async fn upload_loop(
                     }
                     Ok((inode, Err(SyncError::Conflict { local, remote }))) => {
                         warn!(inode, ?local, ?remote, "upload conflict — invoking resolver");
-                        // ConflictResolver is called inline; see below
+                        if let Ok(Some(entry)) = db.get_by_inode(inode).await {
+                            let has_git = super::conflict::git_available();
+                            if let Err(e) = super::conflict::resolve(
+                                &entry, &db, &backend,
+                                &base_store, &sync_config, has_git,
+                            ).await {
+                                warn!(inode, "conflict resolution failed: {e}");
+                            }
+                        }
                         pending.remove(&inode);
                     }
                     Ok((inode, Err(e))) if e.is_retryable() => {
@@ -185,10 +202,12 @@ async fn upload_loop(
 }
 
 async fn run_upload(
-    inode:    Inode,
-    _mount_id: u32,
-    db:       &Arc<StateDb>,
-    backend:  &Arc<dyn Backend>,
+    inode:       Inode,
+    mount_id:    u32,
+    db:          &Arc<StateDb>,
+    backend:     &Arc<dyn Backend>,
+    base_store:  &Arc<BaseStore>,
+    sync_config: &Arc<SyncConfig>,
 ) -> Result<(), SyncError> {
     // Load the job spec from DB
     let entry = db.get_by_inode(inode).await
@@ -230,6 +249,28 @@ async fn run_upload(
         meta.mtime,
         meta.size,
     ).await.map_err(|e| SyncError::Fatal(e.to_string()))?;
+
+    // Snapshot base version for 3-way merge (best-effort)
+    let max_size = sync_config.base_max_file_size_bytes().unwrap_or(10 * 1024 * 1024);
+    if BaseStore::is_text_mergeable(&cache_path, meta.size, max_size, &sync_config.text_extensions) {
+        let bs = Arc::clone(base_store);
+        let cp = cache_path.clone();
+        let db2 = Arc::clone(db);
+        let mid = mount_id;
+        tokio::task::spawn_blocking(move || {
+            match bs.store_base(&cp) {
+                Ok(hash) => {
+                    let _ = tokio::runtime::Handle::current().block_on(
+                        db2.set_base_hash(inode, mid, &hash, 0)
+                    );
+                    debug!(inode, %hash, "base version captured on upload");
+                }
+                Err(e) => {
+                    warn!(inode, "failed to capture base version after upload: {e}");
+                }
+            }
+        });
+    }
 
     info!(inode, path = %entry.remote_path, "upload ok");
     Ok(())

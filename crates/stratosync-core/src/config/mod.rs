@@ -121,6 +121,9 @@ pub struct SyncConfig {
     pub upload_debounce_ms:        u64,
     pub upload_close_debounce_ms:  u64,
     pub text_conflict_strategy:    ConflictStrategy,
+    pub base_retention_days:       u32,
+    pub base_max_file_size:        String,
+    pub text_extensions:           Vec<String>,
 }
 
 impl Default for SyncConfig {
@@ -131,6 +134,10 @@ impl Default for SyncConfig {
             upload_debounce_ms:        2000,
             upload_close_debounce_ms:  500,
             text_conflict_strategy:    ConflictStrategy::KeepBoth,
+            base_retention_days:       30,
+            base_max_file_size:        "10 MB".into(),
+            text_extensions:           crate::base_store::DEFAULT_TEXT_EXTENSIONS
+                                           .iter().map(|s| (*s).to_string()).collect(),
         }
     }
 }
@@ -138,6 +145,7 @@ impl Default for SyncConfig {
 impl SyncConfig {
     pub fn upload_debounce(&self)       -> Duration { Duration::from_millis(self.upload_debounce_ms)       }
     pub fn upload_close_debounce(&self) -> Duration { Duration::from_millis(self.upload_close_debounce_ms) }
+    pub fn base_max_file_size_bytes(&self) -> anyhow::Result<u64> { parse_size(&self.base_max_file_size) }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

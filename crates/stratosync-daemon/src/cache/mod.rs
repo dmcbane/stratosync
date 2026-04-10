@@ -8,7 +8,7 @@ use anyhow::Result;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
-use stratosync_core::{state::StateDb, types::SyncStatus};
+use stratosync_core::{base_store::BaseStore, state::StateDb, types::SyncStatus};
 
 pub struct CacheManager {
     mount_id:   u32,
@@ -142,4 +142,60 @@ impl CacheManager {
         )?;
         Ok(())
     }
+}
+
+// ── Base version eviction ────────────────────────────────────────────────────
+
+/// Spawn a background loop that periodically evicts stale base-version objects.
+///
+/// Removes base entries for files that haven't been modified locally
+/// for `retention_days` days and whose sync status is not dirty/uploading.
+/// Also GCs orphan blobs on disk that have no DB references.
+pub fn spawn_base_eviction(
+    mount_id:       u32,
+    db:             Arc<StateDb>,
+    base_store:     Arc<BaseStore>,
+    retention_days: u32,
+) {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(6 * 3600)); // every 6 hours
+        loop {
+            ticker.tick().await;
+            if let Err(e) = evict_stale_bases(mount_id, &db, &base_store, retention_days).await {
+                warn!(mount_id, "base eviction error: {e}");
+            }
+        }
+    });
+}
+
+async fn evict_stale_bases(
+    mount_id:       u32,
+    db:             &Arc<StateDb>,
+    base_store:     &Arc<BaseStore>,
+    retention_days: u32,
+) -> Result<()> {
+    let stale = db.stale_base_entries(mount_id, retention_days, 500).await?;
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    let mut removed = 0u64;
+    for (inode, hash, _size) in &stale {
+        // Check if other inodes still reference this blob
+        let refs = db.base_hash_ref_count(hash).await?;
+
+        db.remove_base_hash(*inode, mount_id).await?;
+
+        // Only delete the blob file if this was the last reference
+        if refs <= 1 {
+            base_store.remove_object(hash)?;
+        }
+
+        removed += 1;
+    }
+
+    if removed > 0 {
+        info!(mount_id, count = removed, "evicted stale base versions");
+    }
+    Ok(())
 }

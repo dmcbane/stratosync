@@ -670,6 +670,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0001", include_str!("migrations/0001_initial.sql")),
     ("0002", include_str!("migrations/0002_delete_tombstones.sql")),
     ("0003", include_str!("migrations/0003_poll_generation.sql")),
+    ("0004", include_str!("migrations/0004_base_versions.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -907,6 +908,191 @@ mod tests {
         let result = db.delete_remote_entry_by_path(mount_id, "uploading.txt").await.unwrap();
         assert!(result.is_none());
         assert!(db.get_by_inode(inode).await.unwrap().is_some());
+    }
+
+    // ── Base version tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn base_hash_round_trip() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "notes.txt".into(),
+            remote_path: "notes.txt".into(),
+            kind: FileKind::File,
+            size: 100,
+            mtime: SystemTime::now(),
+            etag: Some("etag1".into()),
+            status: SyncStatus::Cached,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        // Initially no base
+        assert!(db.get_base_hash(inode, mount_id).await.unwrap().is_none());
+
+        // Store a base hash
+        db.set_base_hash(inode, mount_id, "abcdef1234567890", 100).await.unwrap();
+        assert_eq!(
+            db.get_base_hash(inode, mount_id).await.unwrap().unwrap(),
+            "abcdef1234567890"
+        );
+
+        // Overwrite with new hash
+        db.set_base_hash(inode, mount_id, "fedcba0987654321", 200).await.unwrap();
+        assert_eq!(
+            db.get_base_hash(inode, mount_id).await.unwrap().unwrap(),
+            "fedcba0987654321"
+        );
+
+        // Remove
+        db.remove_base_hash(inode, mount_id).await.unwrap();
+        assert!(db.get_base_hash(inode, mount_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_base_hash_nonexistent() {
+        let (db, mount_id, _) = setup_db_with_mount().await;
+        // Removing a nonexistent base hash should not error
+        db.remove_base_hash(999, mount_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn base_hash_ref_count_tracks_references() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode1 = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "a.txt".into(),
+            remote_path: "a.txt".into(),
+            kind: FileKind::File,
+            size: 50,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Cached,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        let inode2 = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "b.txt".into(),
+            remote_path: "b.txt".into(),
+            kind: FileKind::File,
+            size: 50,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Cached,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        let hash = "same_content_hash";
+        db.set_base_hash(inode1, mount_id, hash, 50).await.unwrap();
+        db.set_base_hash(inode2, mount_id, hash, 50).await.unwrap();
+        assert_eq!(db.base_hash_ref_count(hash).await.unwrap(), 2);
+
+        db.remove_base_hash(inode1, mount_id).await.unwrap();
+        assert_eq!(db.base_hash_ref_count(hash).await.unwrap(), 1);
+
+        db.remove_base_hash(inode2, mount_id).await.unwrap();
+        assert_eq!(db.base_hash_ref_count(hash).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_base_entries_respects_dirty_status() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "dirty.txt".into(),
+            remote_path: "dirty.txt".into(),
+            kind: FileKind::File,
+            size: 50,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Dirty,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        db.set_base_hash(inode, mount_id, "hash123", 50).await.unwrap();
+
+        // Even with max_age_days=0, dirty files should not appear
+        let stale = db.stale_base_entries(mount_id, 0, 100).await.unwrap();
+        assert!(stale.is_empty(), "dirty files should not be evicted");
+    }
+
+    #[tokio::test]
+    async fn stale_base_entries_returns_old_cached_entries() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "old.txt".into(),
+            remote_path: "old.txt".into(),
+            kind: FileKind::File,
+            size: 50,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Cached,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        db.set_base_hash(inode, mount_id, "oldhash", 50).await.unwrap();
+
+        // With max_age_days=0, the entry was just created so updated_at ~= now.
+        // It should NOT be returned because updated_at >= now - 0 days.
+        // Use a very large max_age_days to confirm it's excluded when fresh.
+        let stale = db.stale_base_entries(mount_id, 365, 100).await.unwrap();
+        assert!(stale.is_empty(), "fresh entries should not be stale");
+
+        // Manually backdate the updated_at to simulate an old entry
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE base_versions SET updated_at = unixepoch() - 100*86400 WHERE inode=?1",
+                params![inode as i64],
+            ).unwrap();
+        }
+
+        let stale = db.stale_base_entries(mount_id, 30, 100).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].0, inode);
+        assert_eq!(stale[0].1, "oldhash");
+    }
+
+    #[tokio::test]
+    async fn base_version_cascade_deletes() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "del.txt".into(),
+            remote_path: "del.txt".into(),
+            kind: FileKind::File,
+            size: 50,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        db.set_base_hash(inode, mount_id, "hash_del", 50).await.unwrap();
+        assert!(db.get_base_hash(inode, mount_id).await.unwrap().is_some());
+
+        // Deleting the file_index entry should cascade to base_versions
+        db.delete_entry(inode).await.unwrap();
+        assert!(db.get_base_hash(inode, mount_id).await.unwrap().is_none());
     }
 }
 
@@ -1214,6 +1400,100 @@ impl StateDb {
             params![mount_id],
         )?;
         Ok(())
+    }
+
+    // ── Base version methods (for 3-way merge) ────────────────────────────
+
+    /// Record the object hash of the last known-good base version for a file.
+    pub async fn set_base_hash(
+        &self,
+        inode:    Inode,
+        mount_id: u32,
+        hash:     &str,
+        size:     u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO base_versions (inode, mount_id, object_hash, file_size, updated_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())
+             ON CONFLICT(inode, mount_id) DO UPDATE SET
+               object_hash=excluded.object_hash,
+               file_size=excluded.file_size,
+               updated_at=unixepoch()",
+            params![inode as i64, mount_id, hash, size as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Look up the base version object hash for a file.
+    pub async fn get_base_hash(
+        &self,
+        inode:    Inode,
+        mount_id: u32,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let hash: Option<String> = conn.query_row(
+            "SELECT object_hash FROM base_versions WHERE inode=?1 AND mount_id=?2",
+            params![inode as i64, mount_id],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(hash)
+    }
+
+    /// Remove the base version mapping for a file.
+    pub async fn remove_base_hash(&self, inode: Inode, mount_id: u32) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM base_versions WHERE inode=?1 AND mount_id=?2",
+            params![inode as i64, mount_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count how many base_versions rows reference a given object hash.
+    /// Used to decide whether it's safe to delete the blob file.
+    pub async fn base_hash_ref_count(&self, hash: &str) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM base_versions WHERE object_hash=?1",
+            params![hash],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Find base version entries that are stale and eligible for eviction.
+    /// Returns entries where the corresponding file is not dirty/uploading
+    /// and the base was last updated more than `max_age_days` ago.
+    pub async fn stale_base_entries(
+        &self,
+        mount_id:     u32,
+        max_age_days: u32,
+        limit:        u32,
+    ) -> Result<Vec<(Inode, String, u64)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT b.inode, b.object_hash, b.file_size
+             FROM base_versions b
+             JOIN file_index f ON f.inode = b.inode AND f.mount_id = b.mount_id
+             WHERE b.mount_id = ?1
+               AND f.status NOT IN ('dirty', 'uploading')
+               AND b.updated_at < unixepoch() - (?2 * 86400)
+             ORDER BY b.updated_at ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![mount_id, max_age_days, limit],
+                |r| Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                )),
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     /// Delete a single file_index entry by remote path.

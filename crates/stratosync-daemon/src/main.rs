@@ -14,6 +14,7 @@ mod watcher;
 
 use stratosync_core::{
     backend::RcloneBackend,
+    base_store::BaseStore,
     config::{default_data_dir, Config},
     state::StateDb,
     Backend,
@@ -71,6 +72,20 @@ async fn main() -> Result<()> {
         // inode 1 is actually the root directory.
         fuse::ensure_root(&db, mount_id).await?;
 
+        // Ensure cache directory exists before watcher and FUSE mount need it.
+        // fuse::mount() creates .meta/partial inside it, but the watcher needs
+        // the base directory to exist first.
+        let cache_dir = mount_cfg.cache_dir();
+        std::fs::create_dir_all(&cache_dir)
+            .with_context(|| format!("create cache dir {:?}", cache_dir))?;
+
+        // Base-version object store (for 3-way merge conflict resolution)
+        let base_store = Arc::new(
+            BaseStore::new(cache_dir.join(".bases"))
+                .with_context(|| format!("create base store for mount {:?}", mount_cfg.name))?
+        );
+        let sync_config = Arc::new(cfg.daemon.sync.clone());
+
         // Re-queue any dirty/uploading files from prior run
         let pending = db.get_pending_uploads(mount_id).await?;
         if !pending.is_empty() {
@@ -80,6 +95,7 @@ async fn main() -> Result<()> {
         // Upload queue
         let upload_queue = Arc::new(UploadQueue::new(
             mount_id, Arc::clone(&db), Arc::clone(&backend),
+            Arc::clone(&base_store), Arc::clone(&sync_config),
             mount_cfg.poll_duration()?,               // reuse poll interval as debounce base
             std::time::Duration::from_millis(
                 cfg.daemon.sync.upload_close_debounce_ms),
@@ -90,13 +106,6 @@ async fn main() -> Result<()> {
             upload_queue.enqueue(sync::UploadTrigger::Write { inode: entry.inode }).await;
         }
 
-        // Ensure cache directory exists before watcher and FUSE mount need it.
-        // fuse::mount() creates .meta/partial inside it, but the watcher needs
-        // the base directory to exist first.
-        let cache_dir = mount_cfg.cache_dir();
-        std::fs::create_dir_all(&cache_dir)
-            .with_context(|| format!("create cache dir {:?}", cache_dir))?;
-
         // Cache manager
         cache::CacheManager::new(mount_id, Arc::clone(&db), mount_cfg.cache_quota_bytes()?)
             .with_marks(
@@ -104,6 +113,12 @@ async fn main() -> Result<()> {
                 mount_cfg.eviction.high_mark,
             )
             .spawn();
+
+        // Base version eviction (stale base objects for 3-way merge)
+        cache::spawn_base_eviction(
+            mount_id, Arc::clone(&db), Arc::clone(&base_store),
+            cfg.daemon.sync.base_retention_days,
+        );
 
         // inotify watcher — must be stored to keep the watcher alive
         match watcher::FsWatcher::start(
@@ -132,6 +147,8 @@ async fn main() -> Result<()> {
         let db_c         = Arc::clone(&db);
         let backend_c    = Arc::clone(&backend);
         let queue_c      = Arc::clone(&upload_queue);
+        let base_store_c = Arc::clone(&base_store);
+        let sync_cfg_c   = Arc::clone(&sync_config);
         // Capture the tokio Handle here (main thread has runtime context).
         // The spawned std::thread has no tokio context, so Handle::current()
         // would panic if called from within it.
@@ -142,7 +159,8 @@ async fn main() -> Result<()> {
             .spawn(move || {
                 if let Err(e) = fuse::mount(
                     &mount_name, mount_id, &mount_path,
-                    cache_dir, db_c, backend_c, queue_c, fuse_cfg, rt_handle,
+                    cache_dir, db_c, backend_c, queue_c,
+                    base_store_c, sync_cfg_c, fuse_cfg, rt_handle,
                 ) {
                     error!(mount = %mount_name, "FUSE error: {e}");
                 }

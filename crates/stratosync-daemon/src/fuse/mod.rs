@@ -21,7 +21,9 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
 use stratosync_core::{
-    backend::Backend, config::FuseConfig, state::{NewFileEntry, StateDb}, types::*,
+    backend::Backend, base_store::BaseStore,
+    config::{FuseConfig, SyncConfig},
+    state::{NewFileEntry, StateDb}, types::*,
 };
 use crate::sync::upload_queue::{UploadQueue, UploadTrigger};
 
@@ -37,6 +39,8 @@ pub struct StratoFs {
     pub mount_name:        String,
     pub db:                Arc<StateDb>,
     pub backend:           Arc<dyn Backend>,
+    pub base_store:        Arc<BaseStore>,
+    pub sync_config:       Arc<SyncConfig>,
     pub cache_dir:         PathBuf,
     pub cfg:               FuseConfig,
     pub rt:                Handle,
@@ -82,6 +86,7 @@ pub async fn hydrate_if_needed(
     db: &Arc<StateDb>, backend: &Arc<dyn Backend>, cache_dir: &PathBuf,
     inode: Inode,
     waiters: &Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    base_store: &Arc<BaseStore>, sync_config: &Arc<SyncConfig>,
 ) -> Result<(), SyncError> {
     const MAX_RETRIES: u32 = 3;
     const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -95,7 +100,7 @@ pub async fn hydrate_if_needed(
             SyncStatus::Remote | SyncStatus::Stale => {
                 db.set_status(inode, SyncStatus::Hydrating).await
                     .map_err(|e| SyncError::Fatal(e.to_string()))?;
-                return do_hydrate(db, backend, cache_dir, waiters, &entry).await;
+                return do_hydrate(db, backend, cache_dir, waiters, &entry, base_store, sync_config).await;
             }
             SyncStatus::Hydrating => {
                 let (tx, rx) = oneshot::channel();
@@ -127,6 +132,7 @@ async fn do_hydrate(
     db: &Arc<StateDb>, backend: &Arc<dyn Backend>, cache_dir: &PathBuf,
     waiters: &Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
     entry: &FileEntry,
+    base_store: &Arc<BaseStore>, sync_config: &Arc<SyncConfig>,
 ) -> Result<(), SyncError> {
     let cache_path = write_ops::safe_cache_path(cache_dir, &entry.remote_path)
         .map_err(|e| SyncError::Fatal(format!("unsafe cache path: errno {e}")))?;
@@ -147,6 +153,32 @@ async fn do_hydrate(
         db.set_cached(entry.inode, &cache_path, meta.len(),
             entry.etag.as_deref(), entry.mtime, entry.size).await
             .map_err(|e| SyncError::Fatal(e.to_string()))?;
+
+        // Snapshot base version for 3-way merge (best-effort, non-blocking)
+        let max_size = sync_config.base_max_file_size_bytes().unwrap_or(10 * 1024 * 1024);
+        let text_exts = sync_config.text_extensions.clone();
+        if BaseStore::is_text_mergeable(&cache_path, meta.len(), max_size, &text_exts) {
+            let bs = Arc::clone(base_store);
+            let cp = cache_path.clone();
+            let db2 = Arc::clone(db);
+            let mount_id = entry.mount_id;
+            let inode = entry.inode;
+            tokio::task::spawn_blocking(move || {
+                match bs.store_base(&cp) {
+                    Ok(hash) => {
+                        // Record the mapping in the DB (fire-and-forget via block_on)
+                        let _ = tokio::runtime::Handle::current().block_on(
+                            db2.set_base_hash(inode, mount_id, &hash, 0)
+                        );
+                        debug!(inode, %hash, "base version captured on hydration");
+                    }
+                    Err(e) => {
+                        warn!(inode, "failed to capture base version: {e}");
+                    }
+                }
+            });
+        }
+
         debug!(inode = entry.inode, "hydrated");
         Ok(())
     }.await;
@@ -377,6 +409,7 @@ impl Filesystem for StratoFs {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let (db, backend, cache_dir) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.cache_dir.clone());
         let (open_files, next_fh, waiters) = (Arc::clone(&self.open_files), Arc::clone(&self.next_fh), Arc::clone(&self.hydration_waiters));
+        let (base_store, sync_config) = (Arc::clone(&self.base_store), Arc::clone(&self.sync_config));
         let result = self.rt.block_on(async move {
             let entry = db.get_by_inode(ino).await?.ok_or_else(|| SyncError::NotFound(format!("{ino}")))?;
 
@@ -393,12 +426,13 @@ impl Filesystem for StratoFs {
                 let (db2, be2, cd2, w2) = (
                     Arc::clone(&db), Arc::clone(&backend), cache_dir.clone(), Arc::clone(&waiters),
                 );
+                let (bs2, sc2) = (Arc::clone(&base_store), Arc::clone(&sync_config));
                 tokio::spawn(async move {
                     let entry = match db2.get_by_inode(ino).await {
                         Ok(Some(e)) => e,
                         _ => return,
                     };
-                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &entry).await;
+                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &entry, &bs2, &sc2).await;
                 });
             } else if !is_hydrating {
                 // Already cached/dirty — touch LRU
@@ -425,6 +459,7 @@ impl Filesystem for StratoFs {
             Arc::clone(&self.db), Arc::clone(&self.backend),
             self.cache_dir.clone(), Arc::clone(&self.hydration_waiters),
         );
+        let (base_store, sync_config) = (Arc::clone(&self.base_store), Arc::clone(&self.sync_config));
         let result = self.rt.block_on(async move {
             // If file is still hydrating, wait for download to complete
             let (ino, needs_wait) = {
@@ -432,7 +467,7 @@ impl Filesystem for StratoFs {
                 (entry.inode, entry.hydrating)
             };
             if needs_wait {
-                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters).await?;
+                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &base_store, &sync_config).await?;
                 // Update the OpenFile with the actual cache path
                 if let Some(mut entry) = open_files.get_mut(&fh) {
                     if let Ok(Some(fe)) = db.get_by_inode(entry.inode).await {
@@ -567,7 +602,9 @@ pub async fn ensure_root(db: &Arc<StateDb>, mount_id: u32) -> anyhow::Result<()>
 pub fn mount(
     mount_name: &str, mount_id: u32, mount_path: &std::path::Path,
     cache_dir: PathBuf, db: Arc<StateDb>, backend: Arc<dyn Backend>,
-    upload_queue: Arc<UploadQueue>, cfg: FuseConfig, rt: Handle,
+    upload_queue: Arc<UploadQueue>,
+    base_store: Arc<BaseStore>, sync_config: Arc<SyncConfig>,
+    cfg: FuseConfig, rt: Handle,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
     use std::os::unix::fs::PermissionsExt;
@@ -576,7 +613,7 @@ pub fn mount(
     // Restrict partial dir to owner-only (prevents symlink attacks by other users)
     std::fs::set_permissions(&partial_dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(mount_path)?;
-    let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters: Arc::new(DashMap::new()), upload_queue };
+    let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, base_store, sync_config, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters: Arc::new(DashMap::new()), upload_queue };
     let mut opts = vec![MountOption::FSName(format!("stratosync:{mount_name}")), MountOption::AutoUnmount, MountOption::DefaultPermissions];
     if cfg.allow_other { opts.push(MountOption::AllowOther); }
     fuser::mount2(fs, mount_path, &opts)?;
