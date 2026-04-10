@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>stratosync - Linux cloud sync daemon</title>
+  <meta name="description" content="A first-class Linux cloud sync daemon with on-demand virtual filesystem via FUSE3, multi-backend support through rclone, and conflict-safe bidirectional sync.">
+  <link rel="stylesheet" href="assets/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9729;</text></svg>">
+</head>
+<body>
+
+<!-- Nav -->
+<nav class="nav">
+  <div class="nav-inner">
+    <div class="nav-logo">strato<span>sync</span></div>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#quickstart">Quick Start</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#roadmap">Roadmap</a></li>
+      <li><a href="https://github.com/dmcbane/stratosync">GitHub</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- Hero -->
+<header class="hero">
+  <h1>Cloud sync for <span>Linux</span>,<br>done right.</h1>
+  <p class="tagline">
+    On-demand virtual filesystem. Multi-backend via rclone.
+    Conflict-safe bidirectional sync. No data loss.
+  </p>
+  <div class="badge-row">
+    <span class="badge green">FUSE3</span>
+    <span class="badge orange">70+ backends</span>
+    <span class="badge purple">Rust</span>
+    <span class="badge">MIT / Apache-2.0</span>
+  </div>
+  <div class="hero-buttons">
+    <a href="#quickstart" class="btn btn-primary">Get Started</a>
+    <a href="https://github.com/dmcbane/stratosync" class="btn btn-secondary">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      View on GitHub
+    </a>
+  </div>
+
+  <div class="tree-block">
+<pre><span class="hl">~/GoogleDrive/</span>                  <span class="dim">&larr; FUSE3 virtual mount</span>
+<span class="file">&boxvr;&boxh;&boxh; Documents/</span>
+<span class="file">&boxv;   &boxvr;&boxh;&boxh; report.pdf</span>              <span class="dim">&larr; hydrated (local cache)</span>
+<span class="file">&boxv;   &boxur;&boxh;&boxh; draft.docx</span>              <span class="dim">&larr; placeholder (fetched on open)</span>
+<span class="file">&boxur;&boxh;&boxh; Photos/</span>
+<span class="file">    &boxur;&boxh;&boxh; 2025/</span>                   <span class="dim">&larr; listing from remote index</span></pre>
+  </div>
+</header>
+
+<!-- Why -->
+<section id="features">
+  <h2 class="section-title">Why stratosync?</h2>
+  <p class="section-sub">
+    Linux has excellent cloud sync tools, but none that combine on-demand hydration,
+    native filesystem integration, and conflict safety.
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Approach</th><th>On-demand</th><th>Native FS</th><th>Conflict-safe</th><th>Multi-backend</th></tr>
+      </thead>
+      <tbody>
+        <tr class="highlight-row"><td>stratosync</td><td class="yes">yes</td><td class="yes">yes (FUSE)</td><td class="yes">yes</td><td class="yes">yes (70+)</td></tr>
+        <tr><td>rclone mount</td><td class="yes">yes</td><td class="yes">yes (FUSE)</td><td class="no">no</td><td class="yes">yes</td></tr>
+        <tr><td>rclone bisync</td><td class="no">no</td><td class="no">no (CLI)</td><td class="partial">partial</td><td class="yes">yes</td></tr>
+        <tr><td>Insync / OverGrive</td><td class="no">no</td><td class="partial">partial</td><td class="partial">partial</td><td class="no">limited</td></tr>
+        <tr><td>GNOME Online Accounts</td><td class="no">no</td><td class="no">GVFS only</td><td class="no">no</td><td class="no">limited</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="features">
+    <div class="feature-card">
+      <span class="icon">&#9729;</span>
+      <h3>On-demand hydration</h3>
+      <p>Files appear instantly with real names and sizes. Content downloads only when you open a file. Subsequent reads use the local cache.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#8645;</span>
+      <h3>Bidirectional sync</h3>
+      <p>Edits save to local cache immediately and upload in the background after a debounce window. <code>fsync()</code> triggers instant upload.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#9878;</span>
+      <h3>Conflict resolution</h3>
+      <p>Concurrent edits produce <code>.conflict</code> siblings instead of silent overwrites. Optimistic locking via ETags ensures no data loss.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128230;</span>
+      <h3>Cache management</h3>
+      <p>Bounded LRU cache with configurable quota. Least-recently-used files are evicted locally but remain in the cloud. Pinned files are never evicted.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128268;</span>
+      <h3>70+ cloud backends</h3>
+      <p>Powered by rclone. Google Drive, OneDrive, Dropbox, S3, Nextcloud, SFTP&mdash;any rclone remote works as a stratosync mount.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128736;</span>
+      <h3>Native filesystem</h3>
+      <p>FUSE3 mount works with every tool: <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code>, your IDE, your file manager. No special client needed.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Quick Start -->
+<section id="quickstart">
+  <h2 class="section-title">Quick Start</h2>
+  <p class="section-sub">From zero to mounted cloud drive in four steps.</p>
+
+  <p class="code-label">1. Configure an rclone remote</p>
+  <div class="code-block">
+<pre><span class="cmd">rclone config</span>                     <span class="comment"># interactive setup for your cloud provider</span>
+<span class="cmd">rclone lsd</span> <span class="str">gdrive:</span>                <span class="comment"># verify it works</span></pre>
+  </div>
+
+  <p class="code-label">2. Install stratosync</p>
+  <div class="code-block">
+<pre><span class="cmd">git clone</span> <span class="str">https://github.com/dmcbane/stratosync</span>
+<span class="cmd">cd</span> stratosync
+<span class="cmd">./install.sh</span>                       <span class="comment"># builds, installs to ~/.local/bin, enables systemd service</span></pre>
+  </div>
+
+  <p class="code-label">3. Configure a mount</p>
+  <div class="code-block">
+<pre><span class="comment"># ~/.config/stratosync/config.toml</span>
+
+[<span class="str">daemon</span>]
+<span class="flag">log_level</span> = <span class="str">"info"</span>
+
+[[<span class="str">mount</span>]]
+<span class="flag">name</span>          = <span class="str">"gdrive"</span>
+<span class="flag">remote</span>        = <span class="str">"gdrive:/"</span>          <span class="comment"># rclone remote name</span>
+<span class="flag">mount_path</span>    = <span class="str">"~/GoogleDrive"</span>     <span class="comment"># where files appear</span>
+<span class="flag">cache_quota</span>   = <span class="str">"10 GiB"</span>
+<span class="flag">poll_interval</span> = <span class="str">"30s"</span></pre>
+  </div>
+
+  <p class="code-label">4. Start the daemon</p>
+  <div class="code-block">
+<pre><span class="cmd">systemctl</span> <span class="flag">--user</span> start stratosyncd
+<span class="cmd">ls</span> ~/GoogleDrive/                  <span class="comment"># your cloud files are here</span></pre>
+  </div>
+</section>
+
+<!-- Usage -->
+<section>
+  <h2 class="section-title">Usage</h2>
+  <p class="section-sub">Once mounted, cloud files work like any local directory.</p>
+
+  <div class="config-grid">
+    <div>
+      <p class="code-label">Filesystem operations</p>
+      <div class="code-block">
+<pre><span class="comment"># Browse</span>
+<span class="cmd">ls</span> ~/GoogleDrive/Documents/
+
+<span class="comment"># Read (downloads on first access)</span>
+<span class="cmd">cat</span> ~/GoogleDrive/report.pdf
+
+<span class="comment"># Edit (uploads automatically)</span>
+<span class="cmd">vim</span> ~/GoogleDrive/notes.md
+
+<span class="comment"># Create, copy, move, delete</span>
+<span class="cmd">cp</span> local.txt ~/GoogleDrive/
+<span class="cmd">mv</span> ~/GoogleDrive/old.txt ~/GoogleDrive/new.txt
+<span class="cmd">mkdir</span> ~/GoogleDrive/NewFolder</pre>
+      </div>
+    </div>
+    <div>
+      <p class="code-label">CLI commands</p>
+      <div class="code-block">
+<pre><span class="comment"># Sync status across all mounts</span>
+<span class="cmd">stratosync</span> status
+
+<span class="comment"># List remote contents</span>
+<span class="cmd">stratosync</span> ls [path]
+
+<span class="comment"># Configuration</span>
+<span class="cmd">stratosync</span> config show
+<span class="cmd">stratosync</span> config test
+<span class="cmd">stratosync</span> config edit
+
+<span class="comment"># Conflict management</span>
+<span class="cmd">stratosync</span> conflicts</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Architecture -->
+<section id="architecture">
+  <h2 class="section-title">Architecture</h2>
+  <p class="section-sub">
+    Three-crate Rust workspace. No runtime dependencies beyond rclone and FUSE3.
+  </p>
+
+  <div class="arch-diagram">
+<pre>
+<span class="layer">  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;</span>
+<span class="layer">  &boxv;</span>                      <span class="component">~/Cloud/</span> (FUSE3 mount)                          <span class="layer">&boxv;</span>
+<span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
+                                           &boxv;
+<span class="layer">  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;</span>
+<span class="layer">  &boxv;</span>   <span class="component">stratosync-daemon</span>                      stratosyncd binary               <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>                                                                             <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv; <span class="component">FUSE layer</span>        &boxv;    &boxv; <span class="component">Sync Engine</span>       &boxv;    &boxv; <span class="component">Cache Manager</span>      &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;  (fuser crate)    &boxv;    &boxv;  upload queue    &boxv;    &boxv;  LRU eviction       &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  remote poller   &boxv;    &boxv;  configurable quota &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  conflict detect &boxv;    &boxv;                    &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>                                                                             <span class="layer">&boxv;</span>
+<span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
+                                           &boxv;
+<span class="layer">  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;</span>
+<span class="layer">  &boxv;</span>   <span class="component">stratosync-core</span>                                                        <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>                                                                             <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv; <span class="component">Backend trait</span>    &boxv;    &boxv; <span class="component">StateDb</span>           &boxv;    &boxv; <span class="component">Config</span>             &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;  RcloneBackend   &boxv;    &boxv;  SQLite + WAL    &boxv;    &boxv;  TOML parsing       &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;  MockBackend     &boxv;    &boxv;  per-mount DB    &boxv;    &boxv;  mount configs      &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>                            &boxv;                                                <span class="layer">&boxv;</span>
+<span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
+                                           &boxv; rclone subprocess
+                                &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;
+                                &boxv; <span class="note">rclone</span> (any provider) &boxv;
+                                &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;
+</pre>
+  </div>
+
+  <div class="features" style="grid-template-columns: repeat(3, 1fr);">
+    <div class="feature-card">
+      <h3>stratosync-core</h3>
+      <p>Pure types, Backend trait, StateDb (SQLite), config structs. No FUSE, no network. Fast to compile, easy to unit test.</p>
+    </div>
+    <div class="feature-card">
+      <h3>stratosync-daemon</h3>
+      <p>FUSE filesystem, sync engine, cache manager, inotify watcher. Tokio async runtime with FUSE bridge.</p>
+    </div>
+    <div class="feature-card">
+      <h3>stratosync-cli</h3>
+      <p>User-facing CLI via clap. Status, file listing, config management, conflict resolution.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Configuration -->
+<section id="config">
+  <h2 class="section-title">Configuration</h2>
+  <p class="section-sub">All settings in a single TOML file at <code>~/.config/stratosync/config.toml</code>.</p>
+
+  <div class="config-grid">
+    <div>
+      <p class="code-label">Daemon settings</p>
+      <div class="code-block">
+<pre>[<span class="str">daemon</span>]
+<span class="flag">log_level</span> = <span class="str">"info"</span>
+
+[<span class="str">daemon.fuse</span>]
+<span class="flag">threads</span>         = <span class="str">4</span>
+<span class="flag">attr_timeout_s</span>  = <span class="str">5</span>
+<span class="flag">entry_timeout_s</span> = <span class="str">5</span>
+<span class="flag">allow_other</span>     = <span class="str">false</span>
+
+[<span class="str">daemon.sync</span>]
+<span class="flag">max_hydration_concurrent</span> = <span class="str">4</span>
+<span class="flag">max_upload_concurrent</span>    = <span class="str">2</span>
+<span class="flag">upload_debounce_ms</span>       = <span class="str">2000</span></pre>
+      </div>
+    </div>
+    <div>
+      <p class="code-label">Mount settings (repeatable)</p>
+      <div class="code-block">
+<pre>[[<span class="str">mount</span>]]
+<span class="flag">name</span>          = <span class="str">"gdrive"</span>
+<span class="flag">remote</span>        = <span class="str">"gdrive:/"</span>
+<span class="flag">mount_path</span>    = <span class="str">"~/GoogleDrive"</span>
+<span class="flag">cache_quota</span>   = <span class="str">"10 GiB"</span>
+<span class="flag">poll_interval</span> = <span class="str">"30s"</span>
+<span class="flag">enabled</span>       = <span class="str">true</span>
+
+[<span class="str">mount.eviction</span>]
+<span class="flag">policy</span>    = <span class="str">"lru"</span>
+<span class="flag">low_mark</span>  = <span class="str">0.80</span>
+<span class="flag">high_mark</span> = <span class="str">0.90</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Roadmap -->
+<section id="roadmap">
+  <h2 class="section-title">Roadmap</h2>
+  <p class="section-sub">Stratosync is pre-alpha. Here's what's done and what's next.</p>
+
+  <div class="roadmap">
+    <div class="phase">
+      <span class="phase-badge done">Done</span>
+      <h3>Phase 1: Read-Only VFS</h3>
+      <p>FUSE3 mount with on-demand hydration. Files appear instantly, content downloads on <code>open()</code>. Systemd service, basic CLI.</p>
+    </div>
+    <div class="phase">
+      <span class="phase-badge done">Done</span>
+      <h3>Phase 2: Bidirectional Sync</h3>
+      <p>Write, create, mkdir, rename, delete. Upload queue with debounce. Remote poller. LRU cache eviction. Crash recovery.</p>
+    </div>
+    <div class="phase">
+      <span class="phase-badge current">Next</span>
+      <h3>Phase 3: Conflict Resolution & Safety</h3>
+      <p>Desktop notifications on conflict. xattr sync status. Delta API support for Google Drive and OneDrive. 3-way text merge.</p>
+    </div>
+    <div class="phase">
+      <span class="phase-badge planned">Planned</span>
+      <h3>Phase 4: Performance & UX</h3>
+      <p>Partial/range hydration. Prefetch heuristics. Pin/unpin for offline. GNOME/Nautilus status overlays. Tray indicator. Packaging.</p>
+    </div>
+    <div class="phase">
+      <span class="phase-badge planned">Planned</span>
+      <h3>Phase 5: Advanced Features</h3>
+      <p>Selective sync with ignore patterns. File versioning. Bandwidth scheduling. Prometheus metrics. Encrypted cache.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Prerequisites -->
+<section>
+  <h2 class="section-title">Prerequisites</h2>
+  <div class="features" style="grid-template-columns: repeat(4, 1fr);">
+    <div class="feature-card" style="text-align:center;">
+      <h3>Linux</h3>
+      <p>with FUSE3 support</p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>Rust 1.80+</h3>
+      <p><code>rustup update stable</code></p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>rclone</h3>
+      <p><a href="https://rclone.org/install/">rclone.org/install</a></p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>libfuse3-dev</h3>
+      <p><code>apt install libfuse3-dev</code></p>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="footer-links">
+    <a href="https://github.com/dmcbane/stratosync">Source</a>
+    <a href="https://github.com/dmcbane/stratosync/blob/main/CHANGELOG.md">Changelog</a>
+    <a href="https://github.com/dmcbane/stratosync/blob/main/CONTRIBUTING.md">Contributing</a>
+    <a href="https://github.com/dmcbane/stratosync/issues">Issues</a>
+    <a href="architecture/01-overview.html">Architecture Docs</a>
+  </div>
+  <p>Licensed under MIT or Apache-2.0. Built with Rust.</p>
+</footer>
+
+</body>
+</html>
