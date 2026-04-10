@@ -79,15 +79,11 @@ impl GoogleDriveDelta {
 
     /// Ensure we have a valid access token, refreshing if needed.
     ///
-    /// Re-reads the token from `rclone config show`, which always returns a
-    /// valid token because rclone handles its own OAuth refresh internally.
-    /// This avoids needing the client_id/secret (which may be rclone's
-    /// built-in credentials, not stored in the config).
+    /// Get a valid access token, refreshing via rclone if expired.
     async fn ensure_valid_token(&self) -> Result<String, SyncError> {
         let mut auth = self.auth.lock().await;
         let now = Utc::now();
 
-        // Refresh if within 60 seconds of expiry
         if auth.expiry <= now + chrono::Duration::seconds(60) {
             debug!("refreshing Google OAuth token via rclone");
             let oauth = rclone_config::get_fresh_oauth_token(
@@ -99,6 +95,19 @@ impl GoogleDriveDelta {
             debug!("Google OAuth token refreshed");
         }
 
+        Ok(auth.access_token.clone())
+    }
+
+    /// Force-refresh the token (used after receiving a 401 from the API).
+    async fn force_refresh_token(&self) -> Result<String, SyncError> {
+        let mut auth = self.auth.lock().await;
+        debug!("force-refreshing Google OAuth token via rclone");
+        let oauth = rclone_config::get_fresh_oauth_token(
+            &self.rclone_bin, &self.remote_name,
+        ).await.map_err(|e| SyncError::Transient(format!("token refresh: {e}")))?;
+
+        auth.access_token = oauth.access_token;
+        auth.expiry = oauth.expiry;
         Ok(auth.access_token.clone())
     }
 
@@ -205,34 +214,45 @@ impl GoogleDriveDelta {
 #[async_trait]
 impl DeltaProvider for GoogleDriveDelta {
     async fn start_token(&self) -> Result<String, SyncError> {
-        let token = self.ensure_valid_token().await?;
+        let mut token = self.ensure_valid_token().await?;
 
-        let resp = self.client
-            .get(GDRIVE_START_TOKEN_URL)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| SyncError::Network(format!("get start token: {e}")))?;
+        for attempt in 0..2 {
+            let resp = self.client
+                .get(GDRIVE_START_TOKEN_URL)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .map_err(|e| SyncError::Network(format!("get start token: {e}")))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_http_error(status, &body));
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                warn!("Google API returned 401 on start_token; force-refreshing");
+                token = self.force_refresh_token().await?;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Self::map_http_error(status, &body));
+            }
+
+            let body: GDriveStartTokenResponse = resp.json().await
+                .map_err(|e| SyncError::Fatal(format!("parse start token: {e}")))?;
+
+            return Ok(body.start_page_token);
         }
 
-        let body: GDriveStartTokenResponse = resp.json().await
-            .map_err(|e| SyncError::Fatal(format!("parse start token: {e}")))?;
-
-        Ok(body.start_page_token)
+        Err(SyncError::Fatal("start_token failed after retry".into()))
     }
 
     async fn changes_since(
         &self,
         page_token: &str,
     ) -> Result<(Vec<RemoteChange>, String), SyncError> {
-        let access_token = self.ensure_valid_token().await?;
+        let mut access_token = self.ensure_valid_token().await?;
         let mut changes = Vec::new();
         let mut current_token = page_token.to_string();
+        let mut retried_auth = false;
 
         // id → (name, parents) for path resolution
         let mut id_map: HashMap<String, (String, Vec<String>)> = HashMap::new();
@@ -258,6 +278,16 @@ impl DeltaProvider for GoogleDriveDelta {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
+
+                // On 401, the token may have expired between our check and
+                // the API call. Force-refresh once and retry.
+                if status == reqwest::StatusCode::UNAUTHORIZED && !retried_auth {
+                    warn!("Google API returned 401; force-refreshing token and retrying");
+                    access_token = self.force_refresh_token().await?;
+                    retried_auth = true;
+                    continue;
+                }
+
                 return Err(Self::map_http_error(status, &body));
             }
 
@@ -499,6 +529,19 @@ impl OneDriveDelta {
         Ok(auth.access_token.clone())
     }
 
+    /// Force-refresh the token (used after receiving a 401 from the API).
+    async fn force_refresh_token(&self) -> Result<String, SyncError> {
+        let mut auth = self.auth.lock().await;
+        debug!("force-refreshing OneDrive OAuth token via rclone");
+        let oauth = rclone_config::get_fresh_oauth_token(
+            &self.rclone_bin, &self.remote_name,
+        ).await.map_err(|e| SyncError::Transient(format!("token refresh: {e}")))?;
+
+        auth.access_token = oauth.access_token;
+        auth.expiry = oauth.expiry;
+        Ok(auth.access_token.clone())
+    }
+
     /// Map an HTTP response status to a SyncError.
     fn map_http_error(status: reqwest::StatusCode, body: &str) -> SyncError {
         match status.as_u16() {
@@ -569,15 +612,7 @@ impl OneDriveDelta {
 #[async_trait]
 impl DeltaProvider for OneDriveDelta {
     async fn start_token(&self) -> Result<String, SyncError> {
-        // For OneDrive, the "start token" is actually the initial delta URL.
-        // The first call to the delta endpoint with no token returns all items
-        // and a deltaLink. We store the deltaLink as our token.
-        //
-        // However, since the poller does a full listing first and then calls
-        // start_token(), we don't need the initial items — we just need the
-        // deltaLink. We can get it by requesting delta with `token=latest`,
-        // which returns an empty change set and a fresh deltaLink.
-        let access_token = self.ensure_valid_token().await?;
+        let mut access_token = self.ensure_valid_token().await?;
 
         let delta_url = if self.root_path.is_empty() || self.root_path == "/" {
             format!("{}/root/delta", self.drive_url)
@@ -586,38 +621,46 @@ impl DeltaProvider for OneDriveDelta {
             format!("{}/root:/{path}:/delta", self.drive_url)
         };
 
-        // Request with token=latest to get a deltaLink without enumerating
-        // all items (since the poller already did a full listing).
-        let resp = self.client
-            .get(&delta_url)
-            .bearer_auth(&access_token)
-            .query(&[("token", "latest")])
-            .send()
-            .await
-            .map_err(|e| SyncError::Network(format!("OneDrive get start token: {e}")))?;
+        for attempt in 0..2 {
+            let resp = self.client
+                .get(&delta_url)
+                .bearer_auth(&access_token)
+                .query(&[("token", "latest")])
+                .send()
+                .await
+                .map_err(|e| SyncError::Network(format!("OneDrive get start token: {e}")))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_http_error(status, &body));
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                warn!("OneDrive API returned 401 on start_token; force-refreshing");
+                access_token = self.force_refresh_token().await?;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Self::map_http_error(status, &body));
+            }
+
+            let page: OneDriveDeltaResponse = resp.json().await
+                .map_err(|e| SyncError::Fatal(format!("parse OneDrive delta response: {e}")))?;
+
+            return page.delta_link.ok_or_else(|| {
+                SyncError::Fatal("OneDrive delta response missing @odata.deltaLink".into())
+            });
         }
 
-        let page: OneDriveDeltaResponse = resp.json().await
-            .map_err(|e| SyncError::Fatal(format!("parse OneDrive delta response: {e}")))?;
-
-        // The deltaLink is our token for future polls
-        page.delta_link.ok_or_else(|| {
-            SyncError::Fatal("OneDrive delta response missing @odata.deltaLink".into())
-        })
+        Err(SyncError::Fatal("start_token failed after retry".into()))
     }
 
     async fn changes_since(
         &self,
         delta_link: &str,
     ) -> Result<(Vec<RemoteChange>, String), SyncError> {
-        let access_token = self.ensure_valid_token().await?;
+        let mut access_token = self.ensure_valid_token().await?;
         let mut changes = Vec::new();
         let mut current_url = delta_link.to_string();
+        let mut retried_auth = false;
 
         // Paginate through all delta pages
         let next_delta_link = loop {
@@ -631,6 +674,14 @@ impl DeltaProvider for OneDriveDelta {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
+
+                if status == reqwest::StatusCode::UNAUTHORIZED && !retried_auth {
+                    warn!("OneDrive API returned 401; force-refreshing token and retrying");
+                    access_token = self.force_refresh_token().await?;
+                    retried_auth = true;
+                    continue;
+                }
+
                 return Err(Self::map_http_error(status, &body));
             }
 

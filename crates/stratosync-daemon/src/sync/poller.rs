@@ -227,10 +227,22 @@ impl RemotePoller {
         let token = match token {
             Some(t) => t,
             None => {
-                // First run: do a full listing to populate the index,
-                // then get a start token for future delta polls.
-                info!(mount_id = self.mount_id, "no change token; running initial full listing");
-                self.poll_once().await?;
+                // No token yet — need initial full listing + start token.
+                // Check if the DB already has entries (from a prior listing
+                // that succeeded before get_start_token failed). If so,
+                // skip the expensive listing and just get the token.
+                let snap = self.db.snapshot_remote_index(self.mount_id).await?;
+                if snap.len() <= 1 {
+                    // Empty or root-only — need a full listing first
+                    info!(mount_id = self.mount_id, "no change token; running initial full listing");
+                    self.poll_once().await?;
+                } else {
+                    debug!(
+                        mount_id = self.mount_id,
+                        entries = snap.len(),
+                        "DB already populated; skipping full listing"
+                    );
+                }
                 let start = self.backend.get_start_token().await
                     .map_err(|e| anyhow::anyhow!("get_start_token: {e}"))?;
                 self.db.set_change_token(self.mount_id, &start).await?;
