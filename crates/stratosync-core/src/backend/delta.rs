@@ -126,7 +126,17 @@ impl GoogleDriveDelta {
     }
 
     /// Map an HTTP response status to a SyncError, if it's an error.
+    ///
+    /// Google Drive returns rate limits as HTTP 403 with "rateLimitExceeded"
+    /// or "RATE_LIMIT_EXCEEDED" in the body, not always as 429.
     fn map_http_error(status: reqwest::StatusCode, body: &str) -> SyncError {
+        // Check for rate limiting first — GDrive uses 403 for quota errors
+        if body.contains("rateLimitExceeded") || body.contains("RATE_LIMIT_EXCEEDED")
+            || body.contains("userRateLimitExceeded")
+        {
+            return SyncError::Transient(format!("rate limited: {body}"));
+        }
+
         match status.as_u16() {
             410 => SyncError::TokenExpired,
             401 | 403 => SyncError::PermissionDenied(format!("HTTP {status}: {body}")),
@@ -1083,6 +1093,34 @@ mod tests {
             reqwest::StatusCode::INTERNAL_SERVER_ERROR, "oops",
         );
         assert!(matches!(err, SyncError::Transient(_)));
+    }
+
+    #[test]
+    fn test_map_403_rate_limit_to_transient() {
+        // Google Drive returns quota errors as 403 with rateLimitExceeded in body
+        let body = r#"{"error":{"code":403,"message":"Quota exceeded","errors":[{"reason":"rateLimitExceeded"}],"details":[{"reason":"RATE_LIMIT_EXCEEDED"}]}}"#;
+        let err = GoogleDriveDelta::map_http_error(
+            reqwest::StatusCode::FORBIDDEN, body,
+        );
+        assert!(matches!(err, SyncError::Transient(_)), "403 rate limit should be Transient, got: {err:?}");
+    }
+
+    #[test]
+    fn test_map_403_user_rate_limit_to_transient() {
+        let body = r#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#;
+        let err = GoogleDriveDelta::map_http_error(
+            reqwest::StatusCode::FORBIDDEN, body,
+        );
+        assert!(matches!(err, SyncError::Transient(_)));
+    }
+
+    #[test]
+    fn test_map_403_real_permission_denied() {
+        // A genuine 403 without rate limit keywords should still be PermissionDenied
+        let err = GoogleDriveDelta::map_http_error(
+            reqwest::StatusCode::FORBIDDEN, "insufficient permissions",
+        );
+        assert!(matches!(err, SyncError::PermissionDenied(_)));
     }
 
     // ── OneDrive JSON parsing tests ─────────────────────────────────────
