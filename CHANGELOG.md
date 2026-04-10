@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-04-09
+
+### Fixed
+- **mkdir + immediate file create**: Creating a file inside a newly-made
+  directory failed with EIO because `populate_directory` tried to list the
+  directory on the remote before the async `mkdir` had completed. Now, if
+  the backend listing fails for a locally-created directory (status is not
+  `Remote`/`Stale`), the directory is treated as empty and marked listed so
+  that `create`/`lookup` inside it can proceed immediately.
+
 ## [0.6.0] - 2026-04-09
 
 ### Fixed

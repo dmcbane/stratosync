@@ -177,8 +177,19 @@ async fn populate_directory(
     db: &Arc<StateDb>, backend: &Arc<dyn Backend>, mid: u32, dir: &FileEntry,
 ) -> Result<(), anyhow::Error> {
     debug!(inode = dir.inode, path = %dir.remote_path, "populating directory");
-    let children = backend.list(&dir.remote_path).await
-        .map_err(|e| anyhow::anyhow!("list {:?}: {e}", dir.remote_path))?;
+    let children = match backend.list(&dir.remote_path).await {
+        Ok(c) => c,
+        Err(e) if !dir.status.needs_hydration() => {
+            // Directory exists locally (e.g. just created via mkdir) but the
+            // remote listing failed — the async mkdir may not have completed
+            // yet.  Treat as empty and mark listed so that create/lookup
+            // inside it can proceed immediately.
+            debug!(inode = dir.inode, error = %e, "locally-created dir not listable on remote — treating as empty");
+            db.mark_dir_listed(dir.inode).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("list {:?}: {e}", dir.remote_path)),
+    };
     debug!(inode = dir.inode, count = children.len(), "listed children");
 
     // Load tombstones to skip recently-deleted entries
