@@ -473,4 +473,278 @@ mod tests {
     fn sibling_path_no_parent() {
         assert_eq!(sibling_path("report.pdf", "report.conflict.pdf"), "report.conflict.pdf");
     }
+
+    // ── End-to-end resolve() tests with MockBackend ─────────────────────
+
+    use stratosync_core::{
+        backend::mock::MockBackend,
+        state::NewFileEntry,
+        types::{FileKind, Inode, SyncStatus, FUSE_ROOT_INODE},
+    };
+    use std::time::SystemTime;
+
+    async fn setup_e2e() -> (
+        Arc<StateDb>, Arc<dyn Backend>, Arc<BaseStore>, Arc<SyncConfig>,
+        tempfile::TempDir, u32, /* mount_id */
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(StateDb::in_memory().unwrap());
+        db.migrate().await.unwrap();
+        let mount_id = db.upsert_mount(
+            "test", "mock:/", "/mnt/test",
+            dir.path().to_str().unwrap(), 5 << 30, 60,
+        ).await.unwrap();
+        db.insert_root(&NewFileEntry {
+            mount_id, parent: 0,
+            name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::default());
+        let base_store = Arc::new(
+            BaseStore::new(dir.path().join(".bases")).unwrap()
+        );
+        let sync_config = Arc::new(SyncConfig {
+            text_conflict_strategy: ConflictStrategy::Merge,
+            ..Default::default()
+        });
+
+        (db, backend, base_store, sync_config, dir, mount_id)
+    }
+
+    async fn insert_file_entry(
+        db: &Arc<StateDb>, mount_id: u32, name: &str, cache_path: &Path,
+        content: &[u8],
+    ) -> FileEntry {
+        std::fs::write(cache_path, content).unwrap();
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id, parent: FUSE_ROOT_INODE,
+            name: name.into(), remote_path: name.into(),
+            kind: FileKind::File, size: content.len() as u64,
+            mtime: SystemTime::now(), etag: Some("etag-old".into()),
+            status: SyncStatus::Dirty,
+            cache_path: Some(cache_path.to_path_buf()),
+            cache_size: Some(content.len() as u64),
+        }).await.unwrap();
+        db.get_by_inode(inode).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn e2e_clean_merge_non_overlapping() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let (db, backend, base_store, sync_config, dir, mount_id) = setup_e2e().await;
+
+        // Base version: shared starting point
+        let base_content = b"line1\nline2\nline3\nline4\nline5\nline6\nline7\n";
+        // Local: changed line1
+        let local_content = b"line1 LOCAL\nline2\nline3\nline4\nline5\nline6\nline7\n";
+        // Remote: changed line7
+        let remote_content = b"line1\nline2\nline3\nline4\nline5\nline6\nline7 REMOTE\n";
+
+        let cache_path = dir.path().join("notes.txt");
+        let entry = insert_file_entry(&db, mount_id, "notes.txt", &cache_path, local_content).await;
+
+        // Store base version
+        let base_file = dir.path().join("base-tmp.txt");
+        std::fs::write(&base_file, base_content).unwrap();
+        let hash = base_store.store_base(&base_file).unwrap();
+        db.set_base_hash(entry.inode, mount_id, &hash, base_content.len() as u64).await.unwrap();
+
+        // Seed remote with conflicting version
+        backend.upload(&cache_path, "notes.txt", None).await.unwrap(); // establish remote
+        let remote_file = dir.path().join("remote-seed.txt");
+        std::fs::write(&remote_file, remote_content).unwrap();
+        backend.upload(&remote_file, "notes.txt", None).await.unwrap(); // overwrite
+
+        // Resolve the conflict
+        resolve(&entry, &db, &backend, &base_store, &sync_config, true).await.unwrap();
+
+        // Check: merged file should have BOTH changes
+        let merged = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(merged.contains("line1 LOCAL"), "should have local change: {merged}");
+        assert!(merged.contains("line7 REMOTE"), "should have remote change: {merged}");
+        assert!(!merged.contains("<<<<<<<"), "should NOT have conflict markers: {merged}");
+
+        // Status should be cached (upload succeeded)
+        let updated = db.get_by_inode(entry.inode).await.unwrap().unwrap();
+        assert_eq!(updated.status, SyncStatus::Cached);
+    }
+
+    #[tokio::test]
+    async fn e2e_conflict_markers_overlapping() {
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let (db, backend, base_store, sync_config, dir, mount_id) = setup_e2e().await;
+
+        let base_content = b"line1\nline2\nline3\n";
+        let local_content = b"line1\nline2 LOCAL\nline3\n";
+        let remote_content = b"line1\nline2 REMOTE\nline3\n";
+
+        let cache_path = dir.path().join("config.txt");
+        let entry = insert_file_entry(&db, mount_id, "config.txt", &cache_path, local_content).await;
+
+        let base_file = dir.path().join("base-tmp.txt");
+        std::fs::write(&base_file, base_content).unwrap();
+        let hash = base_store.store_base(&base_file).unwrap();
+        db.set_base_hash(entry.inode, mount_id, &hash, base_content.len() as u64).await.unwrap();
+
+        backend.upload(&cache_path, "config.txt", None).await.unwrap();
+        let remote_file = dir.path().join("remote-seed.txt");
+        std::fs::write(&remote_file, remote_content).unwrap();
+        backend.upload(&remote_file, "config.txt", None).await.unwrap();
+
+        resolve(&entry, &db, &backend, &base_store, &sync_config, true).await.unwrap();
+
+        // The canonical file should have the remote version (remote wins in keep-both)
+        let canonical = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(canonical.contains("line2 REMOTE"), "canonical should be remote: {canonical}");
+
+        // A conflict sibling should exist (the markers version was uploaded as sibling)
+        let children = db.list_children(mount_id, FUSE_ROOT_INODE).await.unwrap();
+        let conflict_entries: Vec<_> = children.iter()
+            .filter(|e| e.name.contains("conflict"))
+            .collect();
+        assert_eq!(conflict_entries.len(), 1, "should have one conflict sibling");
+        assert!(conflict_entries[0].name.starts_with("config.conflict."));
+    }
+
+    #[tokio::test]
+    async fn e2e_no_base_falls_back_to_keep_both() {
+        let (db, backend, base_store, sync_config, dir, mount_id) = setup_e2e().await;
+
+        let local_content = b"local version";
+        let remote_content = b"remote version";
+
+        let cache_path = dir.path().join("doc.txt");
+        let entry = insert_file_entry(&db, mount_id, "doc.txt", &cache_path, local_content).await;
+
+        // No base version stored — should fall through to keep-both
+        backend.upload(&cache_path, "doc.txt", None).await.unwrap();
+        let remote_file = dir.path().join("remote-seed.txt");
+        std::fs::write(&remote_file, remote_content).unwrap();
+        backend.upload(&remote_file, "doc.txt", None).await.unwrap();
+
+        resolve(&entry, &db, &backend, &base_store, &sync_config, true).await.unwrap();
+
+        // Canonical file should have the remote version (remote wins)
+        let canonical = std::fs::read_to_string(&cache_path).unwrap();
+        assert_eq!(canonical, "remote version");
+
+        // A conflict sibling should exist in the DB
+        let children = db.list_children(mount_id, FUSE_ROOT_INODE).await.unwrap();
+        let conflict_entries: Vec<_> = children.iter()
+            .filter(|e| e.name.contains("conflict"))
+            .collect();
+        assert_eq!(conflict_entries.len(), 1, "should have one conflict file");
+        assert!(conflict_entries[0].name.starts_with("doc.conflict."));
+    }
+
+    #[tokio::test]
+    async fn e2e_binary_file_skips_merge() {
+        let (db, backend, base_store, sync_config, dir, mount_id) = setup_e2e().await;
+
+        // Binary content (contains NUL bytes)
+        let local_content = b"local\x00binary";
+        let remote_content = b"remote\x00binary";
+
+        let cache_path = dir.path().join("image.bin");
+        let entry = insert_file_entry(&db, mount_id, "image.bin", &cache_path, local_content).await;
+
+        // Even with a base, binary files should skip merge
+        let base_file = dir.path().join("base-tmp.bin");
+        std::fs::write(&base_file, b"base\x00binary").unwrap();
+        let hash = base_store.store_base(&base_file).unwrap();
+        db.set_base_hash(entry.inode, mount_id, &hash, 12).await.unwrap();
+
+        backend.upload(&cache_path, "image.bin", None).await.unwrap();
+        let remote_file = dir.path().join("remote-seed.bin");
+        std::fs::write(&remote_file, remote_content).unwrap();
+        backend.upload(&remote_file, "image.bin", None).await.unwrap();
+
+        resolve(&entry, &db, &backend, &base_store, &sync_config, true).await.unwrap();
+
+        // Should fall through to keep-both (remote wins canonical)
+        let canonical = std::fs::read(&cache_path).unwrap();
+        assert_eq!(canonical, remote_content);
+    }
+
+    #[tokio::test]
+    async fn e2e_merge_disabled_uses_keep_both() {
+        let (db, backend, base_store, _, dir, mount_id) = setup_e2e().await;
+
+        // Override config to KeepBoth
+        let sync_config = Arc::new(SyncConfig {
+            text_conflict_strategy: ConflictStrategy::KeepBoth,
+            ..Default::default()
+        });
+
+        let base_content = b"line1\nline2\nline3\nline4\nline5\nline6\nline7\n";
+        let local_content = b"line1 LOCAL\nline2\nline3\nline4\nline5\nline6\nline7\n";
+        let remote_content = b"line1\nline2\nline3\nline4\nline5\nline6\nline7 REMOTE\n";
+
+        let cache_path = dir.path().join("notes.txt");
+        let entry = insert_file_entry(&db, mount_id, "notes.txt", &cache_path, local_content).await;
+
+        // Store base (it exists but merge is disabled)
+        let base_file = dir.path().join("base-tmp.txt");
+        std::fs::write(&base_file, base_content).unwrap();
+        let hash = base_store.store_base(&base_file).unwrap();
+        db.set_base_hash(entry.inode, mount_id, &hash, base_content.len() as u64).await.unwrap();
+
+        backend.upload(&cache_path, "notes.txt", None).await.unwrap();
+        let remote_file = dir.path().join("remote-seed.txt");
+        std::fs::write(&remote_file, remote_content).unwrap();
+        backend.upload(&remote_file, "notes.txt", None).await.unwrap();
+
+        resolve(&entry, &db, &backend, &base_store, &sync_config, true).await.unwrap();
+
+        // Should be keep-both despite base version existing
+        let canonical = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(canonical.contains("line7 REMOTE"), "canonical should be remote version");
+        assert!(!canonical.contains("line1 LOCAL"), "canonical should NOT have local edit");
+
+        let children = db.list_children(mount_id, FUSE_ROOT_INODE).await.unwrap();
+        assert!(children.iter().any(|e| e.name.contains("conflict")));
+    }
+
+    #[tokio::test]
+    async fn e2e_no_git_falls_back_to_keep_both() {
+        let (db, backend, base_store, sync_config, dir, mount_id) = setup_e2e().await;
+
+        let base_content = b"line1\nline2\nline3\nline4\nline5\nline6\nline7\n";
+        let local_content = b"line1 LOCAL\nline2\nline3\nline4\nline5\nline6\nline7\n";
+        let remote_content = b"line1\nline2\nline3\nline4\nline5\nline6\nline7 REMOTE\n";
+
+        let cache_path = dir.path().join("readme.md");
+        let entry = insert_file_entry(&db, mount_id, "readme.md", &cache_path, local_content).await;
+
+        let base_file = dir.path().join("base-tmp.txt");
+        std::fs::write(&base_file, base_content).unwrap();
+        let hash = base_store.store_base(&base_file).unwrap();
+        db.set_base_hash(entry.inode, mount_id, &hash, base_content.len() as u64).await.unwrap();
+
+        backend.upload(&cache_path, "readme.md", None).await.unwrap();
+        let remote_file = dir.path().join("remote-seed.txt");
+        std::fs::write(&remote_file, remote_content).unwrap();
+        backend.upload(&remote_file, "readme.md", None).await.unwrap();
+
+        // Pass has_git=false to simulate no git installed
+        resolve(&entry, &db, &backend, &base_store, &sync_config, false).await.unwrap();
+
+        // Should fall through to keep-both
+        let canonical = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(canonical.contains("line7 REMOTE"), "canonical should be remote version");
+        let children = db.list_children(mount_id, FUSE_ROOT_INODE).await.unwrap();
+        assert!(children.iter().any(|e| e.name.contains("conflict")));
+    }
 }
