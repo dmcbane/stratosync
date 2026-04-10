@@ -50,10 +50,10 @@ async fn main() -> Result<()> {
         let reset = db.reset_hydrating().await?;
         if reset > 0 { info!(count = reset, mount = %mount_cfg.name, "reset stale hydrations"); }
 
-        let backend: Arc<dyn Backend> = Arc::new(
-            RcloneBackend::new(&mount_cfg.remote)
-                .with_context(|| format!("backend for {:?}", mount_cfg.name))?,
-        );
+        let mut rclone_backend = RcloneBackend::new(&mount_cfg.remote)
+            .with_context(|| format!("backend for {:?}", mount_cfg.name))?;
+        rclone_backend.init_delta().await;
+        let backend: Arc<dyn Backend> = Arc::new(rclone_backend);
 
         let mount_id = db.upsert_mount(
             &mount_cfg.name, &mount_cfg.remote,

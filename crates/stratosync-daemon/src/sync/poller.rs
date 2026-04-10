@@ -1,8 +1,10 @@
 /// RemotePoller — detects remote changes and updates the local file index.
 ///
-/// Uses ETag-based diffing: fetches the full remote listing, compares against
-/// the DB snapshot in memory, and only upserts entries that actually changed.
-/// A poll generation counter detects remote deletions.
+/// Supports two modes:
+/// - **Full listing** (default): fetches the full remote listing via rclone,
+///   diffs against the DB snapshot using ETags and a generation counter.
+/// - **Delta (change token)**: uses provider-specific APIs (e.g. Google Drive
+///   Changes) to fetch only what changed since the last poll.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,14 +35,22 @@ impl RemotePoller {
 
     /// Run the poll loop forever. Call from a dedicated tokio task.
     pub async fn run(self) {
-        info!(mount_id = self.mount_id, interval = ?self.poll_interval, "remote poller started");
+        let use_delta = self.backend.supports_delta();
+        let mode = if use_delta { "delta" } else { "full-listing" };
+        info!(mount_id = self.mount_id, interval = ?self.poll_interval, mode, "remote poller started");
+
         let base_interval = self.poll_interval;
         let mut current_interval = base_interval;
         let mut consecutive_failures: u32 = 0;
 
         loop {
             tokio::time::sleep(current_interval).await;
-            match self.poll_once().await {
+            let result = if use_delta {
+                self.poll_once_delta().await
+            } else {
+                self.poll_once().await
+            };
+            match result {
                 Ok(()) => {
                     if consecutive_failures > 0 {
                         info!(mount_id = self.mount_id, "poll recovered after {} failures", consecutive_failures);
@@ -203,6 +213,136 @@ impl RemotePoller {
             deleted     = deleted.len(),
             tombstoned  = skipped_tombstoned,
             "poll complete"
+        );
+        Ok(())
+    }
+
+    /// Delta poll: fetch only changes since the last token.
+    /// Falls back to full listing on first run or when the token expires.
+    async fn poll_once_delta(&self) -> Result<()> {
+        debug!(mount_id = self.mount_id, "polling remote (delta mode)");
+
+        let token = self.db.get_change_token(self.mount_id).await?;
+
+        let token = match token {
+            Some(t) => t,
+            None => {
+                // First run: do a full listing to populate the index,
+                // then get a start token for future delta polls.
+                info!(mount_id = self.mount_id, "no change token; running initial full listing");
+                self.poll_once().await?;
+                let start = self.backend.get_start_token().await
+                    .map_err(|e| anyhow::anyhow!("get_start_token: {e}"))?;
+                self.db.set_change_token(self.mount_id, &start).await?;
+                info!(mount_id = self.mount_id, "stored initial change token");
+                return Ok(());
+            }
+        };
+
+        // Fetch changes since the stored token
+        let (changes, next_token) = match self.backend.changes_since(&token).await {
+            Ok(result) => result,
+            Err(SyncError::TokenExpired) => {
+                warn!(mount_id = self.mount_id, "change token expired; falling back to full listing");
+                self.db.clear_change_token(self.mount_id).await?;
+                self.poll_once().await?;
+                let start = self.backend.get_start_token().await
+                    .map_err(|e| anyhow::anyhow!("get_start_token after fallback: {e}"))?;
+                self.db.set_change_token(self.mount_id, &start).await?;
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!("changes_since: {e}")),
+        };
+
+        if changes.is_empty() {
+            debug!(mount_id = self.mount_id, "delta poll: no changes");
+            self.db.set_change_token(self.mount_id, &next_token).await?;
+            return Ok(());
+        }
+
+        // Load tombstones for filtering
+        let tombstones = self.db.active_tombstones(self.mount_id).await
+            .unwrap_or_default();
+
+        // Load current DB state for parent resolution
+        let db_snapshot = self.db.snapshot_remote_index(self.mount_id).await?;
+        let mut path_to_inode: HashMap<String, Inode> = db_snapshot.iter()
+            .map(|(path, snap)| (path.clone(), snap.inode))
+            .collect();
+
+        let mut added = 0usize;
+        let mut deleted = 0usize;
+
+        for change in &changes {
+            match change {
+                RemoteChange::Added { meta } | RemoteChange::Modified { meta, .. } => {
+                    // Skip tombstoned paths
+                    if tombstones.iter().any(|t| {
+                        meta.path == *t || meta.path.starts_with(&format!("{t}/"))
+                    }) {
+                        continue;
+                    }
+
+                    // Safety: skip path traversal and null bytes
+                    if meta.path.contains("..") || meta.path.contains('\0')
+                        || meta.name.contains('/')
+                    {
+                        continue;
+                    }
+
+                    let kind = if meta.is_dir {
+                        FileKind::Directory
+                    } else {
+                        FileKind::File
+                    };
+
+                    let parent = match meta.path.rfind('/') {
+                        Some(idx) => {
+                            let parent_path = &meta.path[..idx];
+                            *path_to_inode.get(parent_path).unwrap_or(&FUSE_ROOT_INODE)
+                        }
+                        None => FUSE_ROOT_INODE,
+                    };
+
+                    let inode = self.db.upsert_remote_file_gen(
+                        self.mount_id, parent, &meta.name, &meta.path,
+                        kind, meta.size, meta.mtime, meta.etag.as_deref(),
+                        0, // generation is not used in delta mode
+                    ).await?;
+
+                    path_to_inode.insert(meta.path.clone(), inode);
+                    added += 1;
+                }
+                RemoteChange::Deleted { path } => {
+                    if let Some((inode, cache_path)) = self.db
+                        .delete_remote_entry_by_path(self.mount_id, path).await?
+                    {
+                        info!(inode, path = %path, "remote deletion detected (delta)");
+                        if let Some(cp) = cache_path {
+                            let _ = tokio::fs::remove_file(cp).await;
+                        }
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+
+        // Store next token
+        self.db.set_change_token(self.mount_id, &next_token).await?;
+
+        // Clean up expired tombstones
+        if let Ok(cleaned) = self.db.cleanup_expired_tombstones().await {
+            if cleaned > 0 {
+                debug!(cleaned, "expired tombstones removed");
+            }
+        }
+
+        debug!(
+            mount_id = self.mount_id,
+            total_changes = changes.len(),
+            added,
+            deleted,
+            "delta poll complete"
         );
         Ok(())
     }

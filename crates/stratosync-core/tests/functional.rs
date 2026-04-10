@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use stratosync_core::{
     backend::mock::MockBackend,
     state::{NewFileEntry, RemoteSnapshot, StateDb},
-    types::{FileKind, Inode, SyncStatus, FUSE_ROOT_INODE},
+    types::{FileKind, Inode, RemoteChange, RemoteMetadata, SyncError, SyncStatus, FUSE_ROOT_INODE},
     Backend,
 };
 
@@ -1084,4 +1084,262 @@ async fn diff_poll_detects_deleted_file() {
     let deleted_paths: Vec<&str> = deleted.iter().map(|(_, p, _)| p.as_str()).collect();
     assert!(deleted_paths.contains(&"gone.txt"), "should detect deletion of gone.txt");
     assert!(!deleted_paths.contains(&"keep.txt"), "keep.txt should survive");
+}
+
+// ── Delta (change token) polling ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn delta_mock_supports_delta_flag() {
+    let backend = MockBackend::default();
+    assert!(!backend.supports_delta());
+    backend.enable_delta();
+    assert!(backend.supports_delta());
+}
+
+#[tokio::test]
+async fn delta_mock_get_start_token() {
+    let backend = MockBackend::default();
+    backend.enable_delta();
+    let token = backend.get_start_token().await.unwrap();
+    assert_eq!(token, "mock-start-0");
+}
+
+#[tokio::test]
+async fn delta_change_token_round_trip() {
+    let (db, mid, _root) = setup().await;
+
+    // Initially no token
+    assert!(db.get_change_token(mid).await.unwrap().is_none());
+
+    // Store and retrieve
+    db.set_change_token(mid, "page-token-42").await.unwrap();
+    assert_eq!(db.get_change_token(mid).await.unwrap().unwrap(), "page-token-42");
+
+    // Overwrite
+    db.set_change_token(mid, "page-token-99").await.unwrap();
+    assert_eq!(db.get_change_token(mid).await.unwrap().unwrap(), "page-token-99");
+
+    // Clear
+    db.clear_change_token(mid).await.unwrap();
+    assert!(db.get_change_token(mid).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delta_mock_changes_since_drains_pending() {
+    let backend = MockBackend::default();
+    backend.enable_delta();
+
+    // Push some changes
+    backend.push_change(RemoteChange::Added {
+        meta: RemoteMetadata {
+            path: "doc.txt".into(),
+            name: "doc.txt".into(),
+            size: 1024,
+            mtime: SystemTime::UNIX_EPOCH,
+            is_dir: false,
+            etag: Some("etag-1".into()),
+            checksum: None,
+            mime_type: None,
+        },
+    });
+    backend.push_change(RemoteChange::Deleted {
+        path: "old.txt".into(),
+    });
+
+    let (changes, token) = backend.changes_since("mock-start-0").await.unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(token, "mock-token-1");
+
+    // Second call should be empty (drained)
+    let (changes2, token2) = backend.changes_since(&token).await.unwrap();
+    assert!(changes2.is_empty());
+    assert_eq!(token2, "mock-token-2");
+}
+
+#[tokio::test]
+async fn delta_mock_error_injection() {
+    let backend = MockBackend::default();
+    backend.enable_delta();
+
+    backend.set_delta_error(SyncError::TokenExpired);
+    let result = backend.changes_since("some-token").await;
+    assert!(matches!(result, Err(SyncError::TokenExpired)));
+
+    // After the error, normal operation resumes
+    let (changes, _) = backend.changes_since("some-token").await.unwrap();
+    assert!(changes.is_empty());
+}
+
+#[tokio::test]
+async fn delta_apply_additions_to_db() {
+    let (db, mid, root) = setup().await;
+    let backend = MockBackend::default();
+    backend.enable_delta();
+
+    // Seed existing file in DB
+    insert_file(&db, mid, root, "existing.txt", "existing.txt", SyncStatus::Cached, None).await;
+
+    // Simulate delta: a new file appeared
+    backend.push_change(RemoteChange::Added {
+        meta: RemoteMetadata {
+            path: "new-file.txt".into(),
+            name: "new-file.txt".into(),
+            size: 2048,
+            mtime: SystemTime::UNIX_EPOCH,
+            is_dir: false,
+            etag: Some("etag-new".into()),
+            checksum: None,
+            mime_type: None,
+        },
+    });
+
+    let (changes, next_token) = backend.changes_since("mock-start-0").await.unwrap();
+    assert_eq!(changes.len(), 1);
+
+    // Apply the change (simulating what poll_once_delta does)
+    for change in &changes {
+        if let RemoteChange::Added { meta } = change {
+            db.upsert_remote_file_gen(
+                mid, root, &meta.name, &meta.path,
+                FileKind::File, meta.size, meta.mtime, meta.etag.as_deref(), 0,
+            ).await.unwrap();
+        }
+    }
+
+    // Verify the new file is in the DB
+    let entry = db.get_by_parent_name(mid, root, "new-file.txt").await.unwrap().unwrap();
+    assert_eq!(entry.size, 2048);
+    assert_eq!(entry.etag.as_deref(), Some("etag-new"));
+
+    // Existing file should still be there
+    let existing = db.get_by_parent_name(mid, root, "existing.txt").await.unwrap();
+    assert!(existing.is_some());
+
+    // Store token
+    db.set_change_token(mid, &next_token).await.unwrap();
+    assert_eq!(db.get_change_token(mid).await.unwrap().unwrap(), next_token);
+}
+
+#[tokio::test]
+async fn delta_apply_deletions_to_db() {
+    let (db, mid, root) = setup().await;
+
+    // Seed two files
+    let to_delete = insert_file(&db, mid, root, "delete-me.txt", "delete-me.txt", SyncStatus::Remote, None).await;
+    let to_keep = insert_file(&db, mid, root, "keep.txt", "keep.txt", SyncStatus::Remote, None).await;
+
+    // Delete via path (simulating delta deletion)
+    let result = db.delete_remote_entry_by_path(mid, "delete-me.txt").await.unwrap();
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().0, to_delete);
+
+    // Deleted file should be gone
+    assert!(db.get_by_inode(to_delete).await.unwrap().is_none());
+    // Other file should remain
+    assert!(db.get_by_inode(to_keep).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn delta_deletion_protects_dirty_files() {
+    let (db, mid, root) = setup().await;
+
+    // File with local changes (dirty) should not be deleted by delta
+    let dirty_inode = insert_file(&db, mid, root, "local-edit.txt", "local-edit.txt", SyncStatus::Dirty, None).await;
+
+    let result = db.delete_remote_entry_by_path(mid, "local-edit.txt").await.unwrap();
+    assert!(result.is_none(), "dirty file should be protected from delta deletion");
+    assert!(db.get_by_inode(dirty_inode).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn delta_token_expired_detected() {
+    let backend = MockBackend::default();
+    backend.enable_delta();
+
+    backend.set_delta_error(SyncError::TokenExpired);
+    let result = backend.changes_since("old-token").await;
+    assert!(
+        matches!(result, Err(SyncError::TokenExpired)),
+        "should detect token expiry"
+    );
+}
+
+#[tokio::test]
+async fn delta_full_workflow() {
+    // Simulates the full delta polling workflow:
+    // 1. Initial full listing + get start token
+    // 2. Delta poll applies additions
+    // 3. Delta poll applies deletions
+    let (db, mid, root) = setup().await;
+    let backend = MockBackend::default();
+    backend.enable_delta();
+
+    // Step 1: Simulate initial full listing
+    backend.seed_file("/a.txt", b"aaa");
+    backend.seed_file("/b.txt", b"bbb");
+
+    let remote = backend.list("/").await.unwrap();
+    for m in &remote {
+        db.upsert_remote_file_gen(
+            mid, root, &m.name, &m.path,
+            FileKind::File, m.size, m.mtime, m.etag.as_deref(), 1,
+        ).await.unwrap();
+    }
+
+    let start_token = backend.get_start_token().await.unwrap();
+    db.set_change_token(mid, &start_token).await.unwrap();
+
+    // Step 2: Delta poll — new file added
+    backend.push_change(RemoteChange::Added {
+        meta: RemoteMetadata {
+            path: "c.txt".into(),
+            name: "c.txt".into(),
+            size: 512,
+            mtime: SystemTime::UNIX_EPOCH,
+            is_dir: false,
+            etag: Some("etag-c".into()),
+            checksum: None,
+            mime_type: None,
+        },
+    });
+
+    let token = db.get_change_token(mid).await.unwrap().unwrap();
+    let (changes, next_token) = backend.changes_since(&token).await.unwrap();
+
+    for change in &changes {
+        if let RemoteChange::Added { meta } = change {
+            db.upsert_remote_file_gen(
+                mid, root, &meta.name, &meta.path,
+                FileKind::File, meta.size, meta.mtime, meta.etag.as_deref(), 0,
+            ).await.unwrap();
+        }
+    }
+    db.set_change_token(mid, &next_token).await.unwrap();
+
+    // Verify c.txt was added
+    let c = db.get_by_parent_name(mid, root, "c.txt").await.unwrap();
+    assert!(c.is_some(), "c.txt should exist after delta addition");
+
+    // Step 3: Delta poll — a.txt deleted
+    backend.push_change(RemoteChange::Deleted {
+        path: "/a.txt".into(),
+    });
+
+    let token = db.get_change_token(mid).await.unwrap().unwrap();
+    let (changes, next_token) = backend.changes_since(&token).await.unwrap();
+
+    for change in &changes {
+        if let RemoteChange::Deleted { path } = change {
+            db.delete_remote_entry_by_path(mid, path).await.unwrap();
+        }
+    }
+    db.set_change_token(mid, &next_token).await.unwrap();
+
+    // Verify a.txt is gone but b.txt and c.txt remain
+    let a = db.get_by_parent_name(mid, root, "a.txt").await.unwrap();
+    assert!(a.is_none(), "a.txt should be deleted");
+    let b = db.get_by_parent_name(mid, root, "b.txt").await.unwrap();
+    assert!(b.is_some(), "b.txt should remain");
+    let c = db.get_by_parent_name(mid, root, "c.txt").await.unwrap();
+    assert!(c.is_some(), "c.txt should remain");
 }

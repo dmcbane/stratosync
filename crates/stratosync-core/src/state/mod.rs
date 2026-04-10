@@ -763,6 +763,151 @@ mod tests {
         let entry = db.get_by_inode(inode).await.unwrap().unwrap();
         assert_eq!(entry.status, SyncStatus::Dirty);
     }
+
+    // ── Change token tests ───────────────────────────────────────────────
+
+    async fn setup_db_with_mount() -> (StateDb, u32, Inode) {
+        let db = StateDb::in_memory().unwrap();
+        db.migrate().await.unwrap();
+        let mount_id = db.upsert_mount(
+            "test", "gdrive:/", "/mnt/test",
+            "/tmp/cache", 5 * 1024 * 1024 * 1024, 60,
+        ).await.unwrap();
+        let root = db.insert_root(&NewFileEntry {
+            mount_id,
+            parent: 0,
+            name: "/".into(),
+            remote_path: "/".into(),
+            kind: FileKind::Directory,
+            size: 0,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+        (db, mount_id, root)
+    }
+
+    #[tokio::test]
+    async fn change_token_round_trip() {
+        let (db, mount_id, _) = setup_db_with_mount().await;
+
+        // Initially no token
+        assert!(db.get_change_token(mount_id).await.unwrap().is_none());
+
+        // Store a token
+        db.set_change_token(mount_id, "page-token-123").await.unwrap();
+        assert_eq!(
+            db.get_change_token(mount_id).await.unwrap().unwrap(),
+            "page-token-123"
+        );
+
+        // Overwrite the token
+        db.set_change_token(mount_id, "page-token-456").await.unwrap();
+        assert_eq!(
+            db.get_change_token(mount_id).await.unwrap().unwrap(),
+            "page-token-456"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_token_clear() {
+        let (db, mount_id, _) = setup_db_with_mount().await;
+
+        db.set_change_token(mount_id, "page-token-123").await.unwrap();
+        db.clear_change_token(mount_id).await.unwrap();
+        assert!(db.get_change_token(mount_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn change_token_clear_nonexistent() {
+        let (db, mount_id, _) = setup_db_with_mount().await;
+        // Clearing a nonexistent token should not error
+        db.clear_change_token(mount_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_remote_entry_by_path_existing() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "doc.txt".into(),
+            remote_path: "doc.txt".into(),
+            kind: FileKind::File,
+            size: 100,
+            mtime: SystemTime::now(),
+            etag: Some("etag1".into()),
+            status: SyncStatus::Remote,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        let result = db.delete_remote_entry_by_path(mount_id, "doc.txt").await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, inode);
+
+        // Entry should be gone
+        assert!(db.get_by_inode(inode).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_remote_entry_by_path_nonexistent() {
+        let (db, mount_id, _) = setup_db_with_mount().await;
+        let result = db.delete_remote_entry_by_path(mount_id, "no-such-file.txt").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_remote_entry_by_path_protects_dirty() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "dirty.txt".into(),
+            remote_path: "dirty.txt".into(),
+            kind: FileKind::File,
+            size: 100,
+            mtime: SystemTime::now(),
+            etag: Some("etag1".into()),
+            status: SyncStatus::Dirty,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        // Should NOT delete dirty entries
+        let result = db.delete_remote_entry_by_path(mount_id, "dirty.txt").await.unwrap();
+        assert!(result.is_none());
+
+        // Entry should still exist
+        assert!(db.get_by_inode(inode).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_remote_entry_by_path_protects_uploading() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: "uploading.txt".into(),
+            remote_path: "uploading.txt".into(),
+            kind: FileKind::File,
+            size: 100,
+            mtime: SystemTime::now(),
+            etag: Some("etag1".into()),
+            status: SyncStatus::Uploading,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        let result = db.delete_remote_entry_by_path(mount_id, "uploading.txt").await.unwrap();
+        assert!(result.is_none());
+        assert!(db.get_by_inode(inode).await.unwrap().is_some());
+    }
 }
 
 impl StateDb {
@@ -1033,6 +1178,73 @@ impl StateDb {
             params![mount_id, generation.to_string()],
         )?;
         Ok(())
+    }
+
+    // ── Change token methods (for delta polling) ────────────────────────────
+
+    /// Get the raw change token string for a mount (e.g. Google Drive pageToken).
+    /// Returns `None` if no token has been stored yet.
+    pub async fn get_change_token(&self, mount_id: u32) -> Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let token: Option<String> = conn.query_row(
+            "SELECT token FROM change_tokens WHERE mount_id = ?1",
+            params![mount_id],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(token)
+    }
+
+    /// Store a change token for a mount (upserts).
+    pub async fn set_change_token(&self, mount_id: u32, token: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO change_tokens (mount_id, token, updated_at)
+             VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(mount_id) DO UPDATE SET token=excluded.token, updated_at=excluded.updated_at",
+            params![mount_id, token],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the stored change token for a mount (used on token invalidation).
+    pub async fn clear_change_token(&self, mount_id: u32) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM change_tokens WHERE mount_id = ?1",
+            params![mount_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a single file_index entry by remote path.
+    /// Preserves dirty/uploading entries (local changes not yet synced).
+    /// Returns the (inode, cache_path) of the deleted entry for cache cleanup,
+    /// or `None` if the entry didn't exist or was protected.
+    pub async fn delete_remote_entry_by_path(
+        &self,
+        mount_id: u32,
+        remote_path: &str,
+    ) -> Result<Option<(Inode, Option<PathBuf>)>> {
+        let conn = self.conn.lock().await;
+        let row: Option<(Inode, Option<PathBuf>)> = conn.query_row(
+            "SELECT inode, cache_path FROM file_index
+             WHERE mount_id = ?1 AND remote_path = ?2
+               AND status NOT IN ('dirty', 'uploading')",
+            params![mount_id, remote_path],
+            |r| Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, Option<String>>(1)?.map(PathBuf::from),
+            )),
+        ).optional()?;
+
+        if let Some((inode, _)) = &row {
+            conn.execute(
+                "DELETE FROM file_index WHERE inode = ?1",
+                params![*inode as i64],
+            )?;
+        }
+
+        Ok(row)
     }
 
     /// Delete all file_index and related entries for a mount.

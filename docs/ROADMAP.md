@@ -45,12 +45,12 @@ Acceptance criteria:
 **Goal**: True conflicts are handled gracefully; no data loss under any scenario.
 
 Deliverables:
-- ConflictResolver with `.conflict.{ts}.{hash}` naming
-- Optimistic-lock upload (ETag check before and after)
-- `stratosync conflicts list` / `resolve` CLI
+- ~~ConflictResolver with `.conflict.{ts}.{hash}` naming~~ ✓ (v0.1.0)
+- ~~Optimistic-lock upload (ETag check before and after)~~ ✓ (v0.1.0)
+- ~~`stratosync conflicts list`~~ ✓ (v0.1.0) / `resolve` CLI
 - Desktop notification on conflict (libnotify)
 - xattr exposure of sync status
-- Change token support for GDrive (pageToken) and OneDrive (deltaLink)
+- ~~Change token support for GDrive (pageToken)~~ ✓ (v0.7.0) and OneDrive (deltaLink) — stubbed
 
 Acceptance criteria:
 - Simulate concurrent edit from two machines; conflict file appears within one poll cycle

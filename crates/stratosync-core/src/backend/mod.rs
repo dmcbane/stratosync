@@ -1,6 +1,9 @@
 /// Backend abstraction: the `Backend` trait and `RcloneBackend` implementation.
 ///
 /// See docs/architecture/05-backend.md for design rationale.
+pub(crate) mod delta;
+pub(crate) mod rclone_config;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -85,6 +88,12 @@ pub trait Backend: Send + Sync + 'static {
         &self,
         token: &str,
     ) -> Result<(Vec<crate::types::RemoteChange>, String), SyncError>;
+
+    /// Get the initial change token for delta polling.
+    /// Only valid when `supports_delta()` returns true.
+    async fn get_start_token(&self) -> Result<String, SyncError> {
+        Err(SyncError::Fatal("delta not supported for this backend".into()))
+    }
 }
 
 // ── Rclone error parsing ─────────────────────────────────────────────────────
@@ -119,7 +128,6 @@ fn parse_rclone_error(stderr: &str) -> String {
 
 /// Drives rclone as an external subprocess.
 /// One instance per configured mount.
-#[derive(Debug, Clone)]
 pub struct RcloneBackend {
     /// The rclone remote+path prefix, e.g. "gdrive:/" or "onedrive:/Documents"
     pub remote_root: String,
@@ -129,13 +137,17 @@ pub struct RcloneBackend {
     pub extra_flags: Vec<String>,
     /// Per-operation timeout.
     pub timeout:     Duration,
+    /// Optional delta provider for efficient change detection.
+    delta: Option<Box<dyn delta::DeltaProvider>>,
 }
 
 impl RcloneBackend {
     pub fn new(remote_root: impl Into<String>) -> Result<Self> {
+        let remote_root = remote_root.into();
         let rclone_bin = which_rclone()?;
         Ok(Self {
-            remote_root: remote_root.into(),
+            delta: None, // initialized asynchronously via init_delta()
+            remote_root,
             rclone_bin,
             extra_flags: vec![
                 "--log-level".into(), "ERROR".into(),
@@ -143,6 +155,77 @@ impl RcloneBackend {
             ],
             timeout: Duration::from_secs(120),
         })
+    }
+
+    /// Attempt to initialize delta (change token) support by reading the
+    /// rclone config for this remote. Called once during daemon startup.
+    /// On failure, logs a warning and leaves delta as None (falls back to
+    /// full listing).
+    pub async fn init_delta(&mut self) {
+        let remote_name = rclone_config::extract_remote_name(&self.remote_root);
+
+        let config = match rclone_config::rclone_config_show(&self.rclone_bin, remote_name).await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("delta init: could not read rclone config for {remote_name}: {e}");
+                return;
+            }
+        };
+
+        let rclone_type = match config.get("type") {
+            Some(t) => t.as_str(),
+            None => {
+                debug!("delta init: no 'type' field in rclone config for {remote_name}");
+                return;
+            }
+        };
+
+        let provider_type = match delta::detect_provider(rclone_type) {
+            Some(p) => p,
+            None => {
+                debug!("delta init: provider {rclone_type} does not support delta");
+                return;
+            }
+        };
+
+        match provider_type {
+            delta::ProviderType::GoogleDrive => {
+                let token_json = match config.get("token") {
+                    Some(t) => t,
+                    None => {
+                        warn!("delta init: no 'token' field in rclone config for {remote_name} — delta disabled");
+                        return;
+                    }
+                };
+                let oauth = match rclone_config::parse_oauth_token(token_json) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("delta init: failed to parse OAuth token for {remote_name}: {e}");
+                        return;
+                    }
+                };
+                let client_id = config.get("client_id").cloned().unwrap_or_default();
+                let client_secret = config.get("client_secret").cloned().unwrap_or_default();
+
+                // Determine root folder ID. If the remote root has a sub-path,
+                // we'd need to resolve it to a folder ID. For now, use "root"
+                // for the drive root.
+                let root_folder_id = config.get("root_folder_id")
+                    .cloned()
+                    .unwrap_or_else(|| "root".to_string());
+
+                self.delta = Some(Box::new(delta::GoogleDriveDelta::new(
+                    client_id,
+                    client_secret,
+                    oauth,
+                    root_folder_id,
+                )));
+                debug!("delta init: Google Drive delta enabled for {remote_name}");
+            }
+            delta::ProviderType::OneDrive => {
+                warn!("delta init: OneDrive delta is not yet implemented — falling back to full listing");
+            }
+        }
     }
 
     /// Build a fully-qualified rclone path: `{remote_root}{rel_path}`
@@ -374,17 +457,24 @@ impl Backend for RcloneBackend {
     }
 
     fn supports_delta(&self) -> bool {
-        // Phase 3: detect provider type from remote_root prefix
-        // e.g. "gdrive:" or "onedrive:" → true
-        // For now, no backends report delta support
-        false
+        self.delta.is_some()
     }
 
     async fn changes_since(
         &self,
-        _token: &str,
+        token: &str,
     ) -> Result<(Vec<crate::types::RemoteChange>, String), SyncError> {
-        Err(SyncError::Fatal("delta not supported for this backend".into()))
+        match &self.delta {
+            Some(provider) => provider.changes_since(token).await,
+            None => Err(SyncError::Fatal("delta not supported for this backend".into())),
+        }
+    }
+
+    async fn get_start_token(&self) -> Result<String, SyncError> {
+        match &self.delta {
+            Some(provider) => provider.start_token().await,
+            None => Err(SyncError::Fatal("delta not supported for this backend".into())),
+        }
     }
 }
 
@@ -431,9 +521,14 @@ pub mod mock {
 
     #[derive(Default)]
     struct MockInner {
-        files:       HashMap<String, (RemoteMetadata, Vec<u8>)>,
-        fail_paths:  std::collections::HashSet<String>,
-        call_log:    Vec<String>,
+        files:           HashMap<String, (RemoteMetadata, Vec<u8>)>,
+        fail_paths:      std::collections::HashSet<String>,
+        call_log:        Vec<String>,
+        delta_enabled:   bool,
+        pending_changes: Vec<RemoteChange>,
+        change_token:    u64,
+        /// If set, `changes_since` returns this error instead of draining.
+        delta_error:     Option<SyncError>,
     }
 
     impl MockBackend {
@@ -478,6 +573,21 @@ pub mod mock {
 
         pub fn call_log(&self) -> Vec<String> {
             self.inner.lock().unwrap().call_log.clone()
+        }
+
+        /// Enable delta (change token) support on this mock.
+        pub fn enable_delta(&self) {
+            self.inner.lock().unwrap().delta_enabled = true;
+        }
+
+        /// Push a change that will be returned by the next `changes_since` call.
+        pub fn push_change(&self, change: RemoteChange) {
+            self.inner.lock().unwrap().pending_changes.push(change);
+        }
+
+        /// Make the next `changes_since` call return this error.
+        pub fn set_delta_error(&self, err: SyncError) {
+            self.inner.lock().unwrap().delta_error = Some(err);
         }
     }
 
@@ -553,11 +663,24 @@ pub mod mock {
         async fn about(&self) -> Result<RemoteAbout, SyncError> {
             Ok(RemoteAbout { total: Some(100 << 30), used: Some(1 << 30), free: Some(99 << 30) })
         }
-        fn supports_delta(&self) -> bool { false }
+        fn supports_delta(&self) -> bool {
+            self.inner.lock().unwrap().delta_enabled
+        }
+
         async fn changes_since(
-            &self, _token: &str
+            &self, _token: &str,
         ) -> Result<(Vec<RemoteChange>, String), SyncError> {
-            Ok((vec![], "mock-token".into()))
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(err) = inner.delta_error.take() {
+                return Err(err);
+            }
+            let changes: Vec<RemoteChange> = inner.pending_changes.drain(..).collect();
+            inner.change_token += 1;
+            Ok((changes, format!("mock-token-{}", inner.change_token)))
+        }
+
+        async fn get_start_token(&self) -> Result<String, SyncError> {
+            Ok("mock-start-0".to_string())
         }
     }
 }

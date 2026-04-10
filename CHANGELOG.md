@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-04-10
+
+### Added
+- **Google Drive delta polling**: The remote poller can now use Google Drive's
+  Changes API (`pageToken`) for incremental change detection instead of full
+  recursive listings every poll cycle. This dramatically reduces API calls and
+  latency for large mounts. Enabled automatically when the rclone remote type
+  is `drive`.
+- **`DeltaProvider` trait**: New extensible trait in `stratosync-core` for
+  provider-specific delta APIs. `GoogleDriveDelta` is fully implemented;
+  `OneDriveDelta` is stubbed for future implementation.
+- **`SyncError::TokenExpired`** variant for change token invalidation (HTTP 410).
+  The poller automatically falls back to a full listing and obtains a fresh
+  token when this occurs.
+- **rclone config parser**: Reads OAuth credentials from `rclone config show`
+  output, handling encrypted configs and rclone's built-in credentials.
+- **`StateDb` change token methods**: `get/set/clear_change_token()` for opaque
+  delta token storage, and `delete_remote_entry_by_path()` for individual
+  entry deletion (used by delta polling).
+- 10 new delta integration tests, 18 unit tests for the delta module, 11 for
+  the rclone config parser, 7 for the StateDb additions.
+- **OneDrive delta stub**: Provider detection for `onedrive:` remotes is in
+  place; implementation will follow in a future release.
+
+### Changed
+- **`Backend` trait**: Added `get_start_token()` method (with default impl)
+  for obtaining initial change tokens.
+- **`RcloneBackend`**: Now holds an optional `DeltaProvider` initialized at
+  startup via `init_delta()`. `supports_delta()` and `changes_since()` delegate
+  to the provider when available.
+- **`MockBackend`**: Extended with `enable_delta()`, `push_change()`, and
+  `set_delta_error()` for testing delta workflows.
+
+### Known Limitations
+- Google Drive shared drives are not supported (requires `driveId` parameter).
+- OneDrive delta is detected but not yet implemented (falls back to full listing).
+- Path resolution for deeply nested files may require additional API calls for
+  parent chain resolution (mitigated by in-memory cache per poll cycle).
+
 ## [0.6.1] - 2026-04-09
 
 ### Fixed

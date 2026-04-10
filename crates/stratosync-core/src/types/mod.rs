@@ -237,6 +237,9 @@ pub enum SyncError {
     #[error("transient error (will retry): {0}")]
     Transient(String),
 
+    #[error("change token expired or invalidated")]
+    TokenExpired,
+
     #[error("backend fatal: {0}")]
     Fatal(String),
 

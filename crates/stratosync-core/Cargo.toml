@@ -18,6 +18,7 @@ tracing.workspace     = true
 dirs.workspace        = true
 bytesize.workspace    = true
 libc.workspace        = true
+reqwest.workspace     = true
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
