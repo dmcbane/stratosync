@@ -97,6 +97,52 @@ pub(crate) fn parse_ini_section(text: &str) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Force rclone to refresh its OAuth token by running a lightweight command.
+///
+/// `rclone config show` just reads the config file — it does NOT trigger a
+/// token refresh. To get a fresh token we must run an actual rclone operation
+/// against the remote so rclone authenticates (and auto-refreshes if expired).
+///
+/// Uses `rclone about <remote>: --json` which is a cheap metadata-only call
+/// (no file listing, no data transfer).
+pub(crate) async fn rclone_touch_auth(
+    rclone_bin: &std::path::Path,
+    remote_name: &str,
+) -> Result<()> {
+    let remote_spec = format!("{remote_name}:");
+    let output = tokio::process::Command::new(rclone_bin)
+        .args(["about", &remote_spec, "--json"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("failed to run rclone about for token refresh")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("rclone about failed (token refresh trigger): {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Get a fresh OAuth token by triggering an rclone refresh, then reading config.
+///
+/// Two-step process:
+/// 1. `rclone about <remote>:` — forces rclone to authenticate, refreshing
+///    the token if expired and writing it back to config.
+/// 2. `rclone config show <remote>` — reads the now-fresh token.
+pub(crate) async fn get_fresh_oauth_token(
+    rclone_bin: &std::path::Path,
+    remote_name: &str,
+) -> Result<OAuthToken> {
+    rclone_touch_auth(rclone_bin, remote_name).await?;
+    let config = rclone_config_show(rclone_bin, remote_name).await?;
+    let token_json = config.get("token")
+        .ok_or_else(|| anyhow::anyhow!("no token in rclone config after refresh"))?;
+    parse_oauth_token(token_json)
+}
+
 /// Parse the OAuth token from rclone's `token` JSON field value.
 pub(crate) fn parse_oauth_token(json_str: &str) -> Result<OAuthToken> {
     let raw: RcloneTokenJson = serde_json::from_str(json_str)

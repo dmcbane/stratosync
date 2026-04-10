@@ -89,18 +89,14 @@ impl GoogleDriveDelta {
 
         // Refresh if within 60 seconds of expiry
         if auth.expiry <= now + chrono::Duration::seconds(60) {
-            debug!("re-reading Google OAuth token from rclone config");
-            let config = rclone_config::rclone_config_show(&self.rclone_bin, &self.remote_name)
-                .await
-                .map_err(|e| SyncError::Transient(format!("rclone config re-read: {e}")))?;
-            let token_json = config.get("token")
-                .ok_or_else(|| SyncError::Fatal("no token in rclone config after re-read".into()))?;
-            let oauth = rclone_config::parse_oauth_token(token_json)
-                .map_err(|e| SyncError::Fatal(format!("parse refreshed token: {e}")))?;
+            debug!("refreshing Google OAuth token via rclone");
+            let oauth = rclone_config::get_fresh_oauth_token(
+                &self.rclone_bin, &self.remote_name,
+            ).await.map_err(|e| SyncError::Transient(format!("token refresh: {e}")))?;
 
             auth.access_token = oauth.access_token;
             auth.expiry = oauth.expiry;
-            debug!("Google OAuth token refreshed via rclone config");
+            debug!("Google OAuth token refreshed");
         }
 
         Ok(auth.access_token.clone())
@@ -490,18 +486,14 @@ impl OneDriveDelta {
         let now = Utc::now();
 
         if auth.expiry <= now + chrono::Duration::seconds(60) {
-            debug!("re-reading OneDrive OAuth token from rclone config");
-            let config = rclone_config::rclone_config_show(&self.rclone_bin, &self.remote_name)
-                .await
-                .map_err(|e| SyncError::Transient(format!("rclone config re-read: {e}")))?;
-            let token_json = config.get("token")
-                .ok_or_else(|| SyncError::Fatal("no token in rclone config after re-read".into()))?;
-            let oauth = rclone_config::parse_oauth_token(token_json)
-                .map_err(|e| SyncError::Fatal(format!("parse refreshed token: {e}")))?;
+            debug!("refreshing OneDrive OAuth token via rclone");
+            let oauth = rclone_config::get_fresh_oauth_token(
+                &self.rclone_bin, &self.remote_name,
+            ).await.map_err(|e| SyncError::Transient(format!("token refresh: {e}")))?;
 
             auth.access_token = oauth.access_token;
             auth.expiry = oauth.expiry;
-            debug!("OneDrive OAuth token refreshed via rclone config");
+            debug!("OneDrive OAuth token refreshed");
         }
 
         Ok(auth.access_token.clone())
