@@ -13,6 +13,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone)]
 pub(crate) struct OAuthToken {
     pub access_token: String,
+    #[allow(dead_code)]
     pub refresh_token: String,
     pub expiry: DateTime<Utc>,
     #[allow(dead_code)]

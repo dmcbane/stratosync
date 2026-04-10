@@ -204,8 +204,6 @@ impl RcloneBackend {
                         return;
                     }
                 };
-                let client_id = config.get("client_id").cloned().unwrap_or_default();
-                let client_secret = config.get("client_secret").cloned().unwrap_or_default();
 
                 // Determine root folder ID. If the remote root has a sub-path,
                 // we'd need to resolve it to a folder ID. For now, use "root"
@@ -215,8 +213,6 @@ impl RcloneBackend {
                     .unwrap_or_else(|| "root".to_string());
 
                 self.delta = Some(Box::new(delta::GoogleDriveDelta::new(
-                    client_id,
-                    client_secret,
                     oauth,
                     root_folder_id,
                     self.rclone_bin.clone(),
@@ -239,8 +235,6 @@ impl RcloneBackend {
                         return;
                     }
                 };
-                let client_id = config.get("client_id").cloned().unwrap_or_default();
-                let client_secret = config.get("client_secret").cloned().unwrap_or_default();
 
                 // Determine the remote sub-path. For "onedrive:/Documents",
                 // extract "/Documents" as the root_path.
@@ -256,8 +250,6 @@ impl RcloneBackend {
                     .unwrap_or_else(|| "https://graph.microsoft.com/v1.0/me/drive".to_string());
 
                 self.delta = Some(Box::new(delta::OneDriveDelta::new(
-                    client_id,
-                    client_secret,
                     oauth,
                     root_path,
                     drive_url,
