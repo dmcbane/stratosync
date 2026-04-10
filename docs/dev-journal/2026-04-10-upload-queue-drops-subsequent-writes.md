@@ -65,41 +65,33 @@ The first batch of files uploads correctly because they are triggered at differe
 
 **File**: `crates/stratosync-daemon/src/sync/upload_queue.rs`
 
-Added a `bool` flag to the `JoinSet` return type: `(Inode, Result<(), SyncError>, bool)` where `true` = aborted.
+Complete redesign from abort-and-respawn to deadline-based debounce:
 
-- Aborted tasks return `(inode, Err(...), true)` 
-- The completion handler skips `pending.remove()` for aborted tasks
-- Real completions (upload success, conflict, error) still remove from pending as before
+**Before (broken)**: Each trigger spawned a timer task in `JoinSet` with a `oneshot::Sender` for abort. Multiple interacting race conditions:
+1. Abort completion removed the wrong pending entry (dropping the replacement's sender)
+2. Replacement triggers inflated `in_flight` count beyond `max_concurrent`
+3. Past deadlines busy-looped the deadline arm, starving `rx.recv()`
+4. `try_send` silently dropped triggers when the channel was full
 
-```rust
-// Before (broken):
-in_flight.spawn(async move {
-    tokio::select! {
-        _ = sleep(window) => {}
-        _ = abort_rx      => { return (inode, Ok(())); }
-    }
-    ...
-});
-// Completion: pending.remove(&inode) — removes WRONG entry
+**After (fixed)**: `pending` HashMap stores `inode → due_at (Instant)` — no spawned timer tasks, no oneshot channels, no abort mechanism:
+- Write trigger resets deadline to `now + debounce`
+- Close/Fsync shortens deadline to `min(current, now + window)`
+- Deadline arm only fires when `in_flight < max_concurrent`; at capacity it waits for `join_next` to free a slot
+- Retry on transient error re-adds to pending with debounce delay
 
-// After (fixed):
-in_flight.spawn(async move {
-    tokio::select! {
-        _ = sleep(window) => {}
-        _ = abort_rx      => { return (inode, Err(...), true); }
-    }
-    ...
-    (inode, result, false)
-});
-// Completion: skip pending.remove for aborted tasks
-```
+This fixed uploads from 0/4 to 3-4/4 in live testing.
+
+### Remaining Issue: Inode Mismatch After Poller Upsert
+
+A separate bug prevents the remaining 1/4: the inotify watcher resolves inodes from cache file paths, but the delta poller can replace inodes for the same `remote_path` (e.g., when a `rclone rcat` from outside changes the file). The watcher then enqueues triggers for a stale inode that no longer exists in the DB. This is an inode lifecycle issue, not an upload queue issue.
 
 ## Key Learnings
 
 - `tokio::sync::oneshot::Receiver` resolves when the sender is **dropped**, not just when `send()` is called. This makes it unsuitable as a "cancel token" if the sender's lifetime isn't carefully managed.
-- When using a HashMap to track in-flight operations by key, completion handlers must verify they're removing the correct entry — not a replacement that was inserted between spawn and completion.
-- `tokio::select!` makes timing-dependent bugs easy to introduce: the two arms can interleave in unexpected ways, especially when one arm's completion modifies state that the other arm depends on.
+- Abort-and-respawn debounce in `tokio::select!` creates cascading race conditions. Deadline-based debounce (adjusting a timestamp) is simpler and avoids all of them.
+- `tokio::select!` with a future that resolves immediately (past deadline) can busy-loop and starve other arms. Guard immediate-resolution futures with a capacity check.
+- `try_send` on a bounded channel silently drops messages. Use `send().await` (or spawn a task with it) to apply backpressure instead.
 
 ## Tags
 
-`#upload-queue` `#tokio` `#race-condition` `#oneshot` `#select`
+`#upload-queue` `#tokio` `#race-condition` `#oneshot` `#select` `#debounce`
