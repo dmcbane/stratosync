@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.2] - 2026-04-10
+
+### Fixed
+- **Google Drive 403 rate limits**: Google returns quota errors as HTTP 403
+  with `rateLimitExceeded` in the body, not 429. The error mapper now checks
+  the body for rate-limit keywords before falling through to PermissionDenied,
+  so the poller correctly backs off instead of halting.
+- **OAuth token refresh via rclone**: Token refresh now always delegates to
+  rclone (`rclone about` to trigger refresh, then `rclone config show` to
+  read the fresh token). The previous direct-API refresh failed when rclone
+  used its built-in shared credentials (client_id not in config).
+- **Stale token after expiry**: `rclone config show` only reads the config
+  file — it does not trigger an OAuth refresh. Added a two-step process:
+  `rclone about <remote>:` forces authentication (refreshing the token),
+  then `rclone config show` reads the now-fresh token.
+- **Redundant full listings on rate limit**: When the initial `get_start_token`
+  failed after a successful full listing, the token was never stored, causing
+  every retry to redo the full listing. Now the poller detects existing DB
+  entries and skips the listing, only retrying the token acquisition.
+- **401 retry with force-refresh**: `changes_since` and `start_token` now
+  catch HTTP 401, force-refresh the OAuth token via rclone, and retry once
+  before failing. Handles the race where the token expires between the
+  expiry check and the actual API call.
+
 ## [0.7.1] - 2026-04-10
 
 ### Added
