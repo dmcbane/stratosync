@@ -1117,6 +1117,22 @@ impl StateDb {
         ).optional().map_err(Into::into)
     }
 
+    /// Look up a file_index entry by its remote path.
+    pub async fn get_by_remote_path(
+        &self,
+        mount_id:    u32,
+        remote_path: &str,
+    ) -> Result<Option<FileEntry>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT inode, mount_id, parent_inode, name, remote_path, kind,
+                    size, mtime, etag, status, cache_path, cache_size, dir_listed
+             FROM file_index WHERE mount_id=?1 AND remote_path=?2",
+            params![mount_id, remote_path],
+            row_to_entry,
+        ).optional().map_err(Into::into)
+    }
+
     pub async fn fail_queue_job_by_inode(
         &self,
         inode:     Inode,

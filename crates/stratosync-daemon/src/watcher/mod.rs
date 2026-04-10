@@ -47,10 +47,11 @@ impl FsWatcher {
         watcher.watch(&cache_dir, RecursiveMode::Recursive)?;
         watcher.configure(Config::default().with_poll_interval(Duration::from_secs(2)))?;
 
+        let cache_dir_owned = cache_dir;
         tokio::spawn(async move {
             while let Some(res) = rx.recv().await {
                 match res {
-                    Ok(event) => handle_event(event, mount_id, &db, &upload_queue).await,
+                    Ok(event) => handle_event(event, mount_id, &cache_dir_owned, &db, &upload_queue).await,
                     Err(e)    => warn!("inotify error: {e}"),
                 }
             }
@@ -66,6 +67,7 @@ impl FsWatcher {
 async fn handle_event(
     event:        Event,
     mount_id:     u32,
+    cache_dir:    &std::path::Path,
     db:           &Arc<StateDb>,
     upload_queue: &Arc<UploadQueue>,
 ) {
@@ -82,8 +84,20 @@ async fn handle_event(
             continue;
         }
 
-        // Look up the inode by cache_path
-        match db.get_by_cache_path(mount_id, path).await {
+        // Derive remote_path from cache file path: strip cache_dir prefix.
+        // This is more robust than looking up by cache_path column, because
+        // the poller may replace inodes (changing the DB entry) while the
+        // cache file stays at the same filesystem path.
+        let remote_path = match path.strip_prefix(cache_dir) {
+            Ok(rel) => match rel.to_str() {
+                Some(s) => s.to_owned(),
+                None    => continue,
+            },
+            Err(_) => continue,
+        };
+
+        // Look up the current inode by remote_path (stable across poller upserts)
+        match db.get_by_remote_path(mount_id, &remote_path).await {
             Ok(Some(entry)) => {
                 if matches!(entry.status, SyncStatus::Cached | SyncStatus::Dirty) {
                     debug!(inode = entry.inode, path = ?path, event = ?event.kind, "fs event");
@@ -91,8 +105,6 @@ async fn handle_event(
                 }
             }
             Ok(None) => {
-                // File in cache dir not tracked yet — could be a new file
-                // created externally; ignore for now (Phase 2: handle auto-import)
                 debug!(path = ?path, "untracked cache file modified");
             }
             Err(e) => warn!(path = ?path, "db lookup error: {e}"),
