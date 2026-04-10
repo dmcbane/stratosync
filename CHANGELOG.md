@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-04-10
+
+### Added
+- **OneDrive delta polling**: The remote poller now supports OneDrive's delta
+  API (`deltaLink`) for incremental change detection, using Microsoft Graph.
+  Enabled automatically when the rclone remote type is `onedrive`. OneDrive's
+  delta API returns full paths (via `parentReference.path`), making path
+  resolution simpler than Google Drive's ID-based approach.
+- **`OneDriveDelta` implementation**: Full `DeltaProvider` implementation with
+  OAuth token refresh via Microsoft's token endpoint, pagination support,
+  `token=latest` for start tokens, and `resyncRequired` error handling.
+- 17 new OneDrive-specific unit tests (JSON parsing, path resolution, error
+  mapping).
+
+### Changed
+- **`RcloneBackend::init_delta`**: Now constructs `OneDriveDelta` for
+  `type = onedrive` remotes (previously logged a warning and fell back to
+  full listing). Supports `drive_id` config for business/shared drives.
+
 ## [0.7.0] - 2026-04-10
 
 ### Added
@@ -37,7 +56,6 @@ All notable changes to this project will be documented in this file.
 
 ### Known Limitations
 - Google Drive shared drives are not supported (requires `driveId` parameter).
-- OneDrive delta is detected but not yet implemented (falls back to full listing).
 - Path resolution for deeply nested files may require additional API calls for
   parent chain resolution (mitigated by in-memory cache per poll cycle).
 

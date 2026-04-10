@@ -447,31 +447,363 @@ struct GDriveFileMetadata {
     parents: Option<Vec<String>>,
 }
 
-// ── OneDrive delta provider (stub) ───────────────────────────────────────────
+// ── OneDrive delta provider ──────────────────────────────────────────────────
 
+const MICROSOFT_TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+
+/// The OneDrive delta API uses a "deltaLink" URL pattern.
+/// Initial request: GET /me/drive/root/delta
+/// Subsequent requests: GET {deltaLink}
+/// The response includes items with their full paths (via parentReference.path),
+/// so no ID-based parent resolution is needed (unlike Google Drive).
 pub(crate) struct OneDriveDelta {
-    _private: (), // prevent construction outside this module
+    client: reqwest::Client,
+    /// The drive path prefix corresponding to the rclone remote root.
+    /// e.g., "" for the root, or "/Documents" for a sub-path.
+    root_path: String,
+    /// The Graph API base URL for this drive.
+    /// Personal: "https://graph.microsoft.com/v1.0/me/drive"
+    /// Business: may use a different drive_id
+    drive_url: String,
+    /// OAuth state, refreshed as needed.
+    auth: Mutex<OneDriveAuth>,
+}
+
+struct OneDriveAuth {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+    access_token: String,
+    expiry: DateTime<Utc>,
 }
 
 impl OneDriveDelta {
-    #[allow(dead_code)]
-    pub(crate) fn new() -> Self {
-        Self { _private: () }
+    pub(crate) fn new(
+        client_id: String,
+        client_secret: String,
+        oauth_token: OAuthToken,
+        root_path: String,
+        drive_url: String,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            root_path,
+            drive_url,
+            auth: Mutex::new(OneDriveAuth {
+                client_id,
+                client_secret,
+                refresh_token: oauth_token.refresh_token,
+                access_token: oauth_token.access_token,
+                expiry: oauth_token.expiry,
+            }),
+        }
+    }
+
+    /// Ensure we have a valid access token, refreshing if needed.
+    async fn ensure_valid_token(&self) -> Result<String, SyncError> {
+        let mut auth = self.auth.lock().await;
+        let now = Utc::now();
+
+        if auth.expiry <= now + chrono::Duration::seconds(60) {
+            debug!("refreshing OneDrive OAuth token");
+            let resp = self.client
+                .post(MICROSOFT_TOKEN_URL)
+                .form(&[
+                    ("client_id", auth.client_id.as_str()),
+                    ("client_secret", auth.client_secret.as_str()),
+                    ("refresh_token", auth.refresh_token.as_str()),
+                    ("grant_type", "refresh_token"),
+                ])
+                .send()
+                .await
+                .map_err(|e| SyncError::Network(format!("OneDrive token refresh failed: {e}")))?;
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(SyncError::PermissionDenied(
+                    "OneDrive OAuth token refresh failed — credentials revoked or expired".into(),
+                ));
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(SyncError::Transient(
+                    format!("OneDrive token refresh HTTP {status}: {body}"),
+                ));
+            }
+
+            let token_resp: MicrosoftTokenResponse = resp.json().await
+                .map_err(|e| SyncError::Fatal(format!("parse OneDrive token response: {e}")))?;
+
+            auth.access_token = token_resp.access_token;
+            auth.expiry = now + chrono::Duration::seconds(token_resp.expires_in);
+            debug!("OneDrive OAuth token refreshed, expires in {}s", token_resp.expires_in);
+        }
+
+        Ok(auth.access_token.clone())
+    }
+
+    /// Map an HTTP response status to a SyncError.
+    fn map_http_error(status: reqwest::StatusCode, body: &str) -> SyncError {
+        match status.as_u16() {
+            // OneDrive returns 410 Gone when a delta token is expired or invalid.
+            410 => SyncError::TokenExpired,
+            // OneDrive may also return a 404 with a resyncRequired error code
+            // when the delta token is invalid — treat as token expired.
+            404 if body.contains("resyncRequired") => SyncError::TokenExpired,
+            401 | 403 => SyncError::PermissionDenied(format!("HTTP {status}: {body}")),
+            429 => SyncError::Transient(format!("rate limited: {body}")),
+            500..=599 => SyncError::Transient(format!("server error HTTP {status}: {body}")),
+            _ => SyncError::Fatal(format!("HTTP {status}: {body}")),
+        }
+    }
+
+    /// Convert a OneDrive item's parentReference.path to a relative path
+    /// within our mount root.
+    ///
+    /// OneDrive paths look like: `/drive/root:/Documents/Sub`
+    /// We strip the `/drive/root:` prefix, then check if the result is
+    /// under our `root_path`. Returns `None` if outside our root.
+    fn resolve_item_path(&self, item: &OneDriveItem) -> Option<String> {
+        let name = &item.name;
+
+        // Build the full path from parentReference.path + name
+        let parent_path = match item.parent_reference.as_ref() {
+            Some(pr) => {
+                let raw = pr.path.as_deref().unwrap_or("");
+                // Strip the "/drive/root:" prefix that OneDrive always includes
+                if let Some(rest) = raw.strip_prefix("/drive/root:") {
+                    rest.to_string()
+                } else if raw == "/drive/root" {
+                    // Item is directly in the root
+                    String::new()
+                } else {
+                    // Unexpected format — try as-is
+                    raw.to_string()
+                }
+            }
+            None => return None, // root item itself
+        };
+
+        let full_path = if parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", parent_path.trim_start_matches('/'), name)
+        };
+
+        // Check if this path is under our root_path
+        if self.root_path.is_empty() || self.root_path == "/" {
+            Some(full_path)
+        } else {
+            let root = self.root_path.trim_start_matches('/');
+            if let Some(rest) = full_path.strip_prefix(root) {
+                let rest = rest.trim_start_matches('/');
+                if rest.is_empty() {
+                    None // the root folder itself
+                } else {
+                    Some(rest.to_string())
+                }
+            } else {
+                None // outside our root
+            }
+        }
     }
 }
 
 #[async_trait]
 impl DeltaProvider for OneDriveDelta {
     async fn start_token(&self) -> Result<String, SyncError> {
-        Err(SyncError::Fatal("OneDrive delta not yet implemented".into()))
+        // For OneDrive, the "start token" is actually the initial delta URL.
+        // The first call to the delta endpoint with no token returns all items
+        // and a deltaLink. We store the deltaLink as our token.
+        //
+        // However, since the poller does a full listing first and then calls
+        // start_token(), we don't need the initial items — we just need the
+        // deltaLink. We can get it by requesting delta with `token=latest`,
+        // which returns an empty change set and a fresh deltaLink.
+        let access_token = self.ensure_valid_token().await?;
+
+        let delta_url = if self.root_path.is_empty() || self.root_path == "/" {
+            format!("{}/root/delta", self.drive_url)
+        } else {
+            let path = self.root_path.trim_start_matches('/');
+            format!("{}/root:/{path}:/delta", self.drive_url)
+        };
+
+        // Request with token=latest to get a deltaLink without enumerating
+        // all items (since the poller already did a full listing).
+        let resp = self.client
+            .get(&delta_url)
+            .bearer_auth(&access_token)
+            .query(&[("token", "latest")])
+            .send()
+            .await
+            .map_err(|e| SyncError::Network(format!("OneDrive get start token: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Self::map_http_error(status, &body));
+        }
+
+        let page: OneDriveDeltaResponse = resp.json().await
+            .map_err(|e| SyncError::Fatal(format!("parse OneDrive delta response: {e}")))?;
+
+        // The deltaLink is our token for future polls
+        page.delta_link.ok_or_else(|| {
+            SyncError::Fatal("OneDrive delta response missing @odata.deltaLink".into())
+        })
     }
 
     async fn changes_since(
         &self,
-        _token: &str,
+        delta_link: &str,
     ) -> Result<(Vec<RemoteChange>, String), SyncError> {
-        Err(SyncError::Fatal("OneDrive delta not yet implemented".into()))
+        let access_token = self.ensure_valid_token().await?;
+        let mut changes = Vec::new();
+        let mut current_url = delta_link.to_string();
+
+        // Paginate through all delta pages
+        let next_delta_link = loop {
+            let resp = self.client
+                .get(&current_url)
+                .bearer_auth(&access_token)
+                .send()
+                .await
+                .map_err(|e| SyncError::Network(format!("OneDrive delta request: {e}")))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Self::map_http_error(status, &body));
+            }
+
+            let page: OneDriveDeltaResponse = resp.json().await
+                .map_err(|e| SyncError::Fatal(format!("parse OneDrive delta: {e}")))?;
+
+            // Process items in this page
+            for item in page.value {
+                // Deleted items
+                if item.deleted.is_some() {
+                    if let Some(path) = self.resolve_item_path(&item) {
+                        changes.push(RemoteChange::Deleted { path });
+                    }
+                    continue;
+                }
+
+                // Skip the root folder itself
+                if item.parent_reference.is_none() {
+                    continue;
+                }
+
+                let path = match self.resolve_item_path(&item) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let is_dir = item.folder.is_some();
+
+                let mtime = item.last_modified_date_time.as_deref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| SystemTime::from(dt))
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+
+                // OneDrive provides SHA-1 or QuickXorHash for content detection
+                let etag = item.file.as_ref()
+                    .and_then(|f| f.hashes.as_ref())
+                    .and_then(|h| h.sha1_hash.clone().or_else(|| h.quick_xor_hash.clone()));
+
+                let meta = RemoteMetadata {
+                    path,
+                    name: item.name.clone(),
+                    size: item.size.unwrap_or(0) as u64,
+                    mtime,
+                    is_dir,
+                    etag,
+                    checksum: None,
+                    mime_type: item.file.as_ref()
+                        .and_then(|f| f.mime_type.clone()),
+                };
+
+                changes.push(RemoteChange::Added { meta });
+            }
+
+            // Check for next page or final delta link
+            if let Some(dl) = page.delta_link {
+                break dl;
+            } else if let Some(next) = page.next_link {
+                current_url = next;
+            } else {
+                return Err(SyncError::Fatal(
+                    "OneDrive delta response has neither @odata.deltaLink nor @odata.nextLink".into(),
+                ));
+            }
+        };
+
+        debug!(
+            change_count = changes.len(),
+            "OneDrive delta fetch complete"
+        );
+
+        Ok((changes, next_delta_link))
     }
+}
+
+// ── OneDrive API response types ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct MicrosoftTokenResponse {
+    access_token: String,
+    expires_in: i64,
+}
+
+#[derive(Deserialize)]
+struct OneDriveDeltaResponse {
+    #[serde(default)]
+    value: Vec<OneDriveItem>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink")]
+    delta_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OneDriveItem {
+    name: String,
+    #[serde(default)]
+    size: Option<i64>,
+    #[serde(rename = "lastModifiedDateTime")]
+    last_modified_date_time: Option<String>,
+    #[serde(rename = "parentReference")]
+    parent_reference: Option<OneDriveParentRef>,
+    /// Present if this item is a folder.
+    folder: Option<serde_json::Value>,
+    /// Present if this item is a file.
+    file: Option<OneDriveFileInfo>,
+    /// Present if this item was deleted.
+    deleted: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct OneDriveParentRef {
+    /// The full path of the parent, e.g. "/drive/root:/Documents"
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OneDriveFileInfo {
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+    hashes: Option<OneDriveHashes>,
+}
+
+#[derive(Deserialize)]
+struct OneDriveHashes {
+    #[serde(rename = "sha1Hash")]
+    sha1_hash: Option<String>,
+    #[serde(rename = "quickXorHash")]
+    quick_xor_hash: Option<String>,
 }
 
 // ── Detect provider type from rclone remote name ─────────────────────────────
@@ -749,6 +1081,230 @@ mod tests {
     fn test_map_500_to_transient() {
         let err = GoogleDriveDelta::map_http_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR, "oops",
+        );
+        assert!(matches!(err, SyncError::Transient(_)));
+    }
+
+    // ── OneDrive JSON parsing tests ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_onedrive_delta_response() {
+        let json = r#"{
+            "value": [
+                {
+                    "name": "report.docx",
+                    "size": 51200,
+                    "lastModifiedDateTime": "2026-04-10T14:30:00Z",
+                    "parentReference": {
+                        "path": "/drive/root:/Documents"
+                    },
+                    "file": {
+                        "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "hashes": {
+                            "sha1Hash": "aabbccdd",
+                            "quickXorHash": "eeff0011"
+                        }
+                    }
+                }
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=abc123"
+        }"#;
+        let resp: OneDriveDeltaResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.value.len(), 1);
+        assert_eq!(resp.delta_link.unwrap(), "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=abc123");
+        assert!(resp.next_link.is_none());
+
+        let item = &resp.value[0];
+        assert_eq!(item.name, "report.docx");
+        assert_eq!(item.size.unwrap(), 51200);
+        assert!(item.folder.is_none());
+        assert!(item.deleted.is_none());
+        let hashes = item.file.as_ref().unwrap().hashes.as_ref().unwrap();
+        assert_eq!(hashes.sha1_hash.as_deref(), Some("aabbccdd"));
+    }
+
+    #[test]
+    fn test_parse_onedrive_deleted_item() {
+        let json = r#"{
+            "value": [{
+                "name": "old.txt",
+                "parentReference": {"path": "/drive/root:"},
+                "deleted": {}
+            }],
+            "@odata.deltaLink": "https://example.com/delta?token=xyz"
+        }"#;
+        let resp: OneDriveDeltaResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.value[0].deleted.is_some());
+    }
+
+    #[test]
+    fn test_parse_onedrive_folder_item() {
+        let json = r#"{
+            "name": "Photos",
+            "parentReference": {"path": "/drive/root:"},
+            "folder": {"childCount": 42}
+        }"#;
+        let item: OneDriveItem = serde_json::from_str(json).unwrap();
+        assert!(item.folder.is_some());
+        assert!(item.file.is_none());
+    }
+
+    #[test]
+    fn test_parse_onedrive_paginated_response() {
+        let json = r#"{
+            "value": [],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/drive/root/delta?$skiptoken=abc"
+        }"#;
+        let resp: OneDriveDeltaResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.delta_link.is_none());
+        assert_eq!(
+            resp.next_link.unwrap(),
+            "https://graph.microsoft.com/v1.0/me/drive/root/delta?$skiptoken=abc"
+        );
+    }
+
+    #[test]
+    fn test_parse_microsoft_token_response() {
+        let json = r#"{"access_token": "eyJ0...", "expires_in": 3599}"#;
+        let resp: MicrosoftTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token, "eyJ0...");
+        assert_eq!(resp.expires_in, 3599);
+    }
+
+    // ── OneDrive path resolution tests ──────────────────────────────────
+
+    fn make_onedrive_delta(root_path: &str) -> OneDriveDelta {
+        OneDriveDelta::new(
+            String::new(), String::new(),
+            OAuthToken {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expiry: Utc::now(),
+                token_type: "Bearer".into(),
+            },
+            root_path.into(),
+            "https://graph.microsoft.com/v1.0/me/drive".into(),
+        )
+    }
+
+    fn make_onedrive_item(name: &str, parent_path: &str) -> OneDriveItem {
+        OneDriveItem {
+            name: name.into(),
+            size: Some(100),
+            last_modified_date_time: Some("2026-04-10T12:00:00Z".into()),
+            parent_reference: Some(OneDriveParentRef {
+                path: Some(parent_path.into()),
+            }),
+            folder: None,
+            file: None,
+            deleted: None,
+        }
+    }
+
+    #[test]
+    fn test_onedrive_resolve_root_file() {
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item("readme.txt", "/drive/root:");
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.unwrap(), "readme.txt");
+    }
+
+    #[test]
+    fn test_onedrive_resolve_root_file_alt() {
+        let delta = make_onedrive_delta("/");
+        let item = make_onedrive_item("readme.txt", "/drive/root:");
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.unwrap(), "readme.txt");
+    }
+
+    #[test]
+    fn test_onedrive_resolve_nested_file() {
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item("report.pdf", "/drive/root:/Documents/Work");
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.unwrap(), "Documents/Work/report.pdf");
+    }
+
+    #[test]
+    fn test_onedrive_resolve_with_sub_root() {
+        let delta = make_onedrive_delta("/Documents");
+        let item = make_onedrive_item("report.pdf", "/drive/root:/Documents/Work");
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.unwrap(), "Work/report.pdf");
+    }
+
+    #[test]
+    fn test_onedrive_resolve_outside_root() {
+        let delta = make_onedrive_delta("/Documents");
+        let item = make_onedrive_item("photo.jpg", "/drive/root:/Photos");
+        let path = delta.resolve_item_path(&item);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_onedrive_resolve_no_parent() {
+        let delta = make_onedrive_delta("");
+        let item = OneDriveItem {
+            name: "root".into(),
+            size: None,
+            last_modified_date_time: None,
+            parent_reference: None,
+            folder: Some(serde_json::json!({})),
+            file: None,
+            deleted: None,
+        };
+        let path = delta.resolve_item_path(&item);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_onedrive_resolve_root_folder_with_sub_root() {
+        // The root folder itself should be None when using a sub-root
+        let delta = make_onedrive_delta("/Documents");
+        let item = make_onedrive_item("Documents", "/drive/root:");
+        let path = delta.resolve_item_path(&item);
+        assert!(path.is_none(), "root folder itself should be skipped");
+    }
+
+    #[test]
+    fn test_onedrive_resolve_drive_root_parent() {
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item("file.txt", "/drive/root");
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.unwrap(), "file.txt");
+    }
+
+    // ── OneDrive HTTP error mapping tests ────────────────────────────────
+
+    #[test]
+    fn test_onedrive_map_410_to_token_expired() {
+        let err = OneDriveDelta::map_http_error(
+            reqwest::StatusCode::GONE, "delta link expired",
+        );
+        assert!(matches!(err, SyncError::TokenExpired));
+    }
+
+    #[test]
+    fn test_onedrive_map_404_resync_to_token_expired() {
+        let err = OneDriveDelta::map_http_error(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":{"code":"resyncRequired","message":"..."}}"#,
+        );
+        assert!(matches!(err, SyncError::TokenExpired));
+    }
+
+    #[test]
+    fn test_onedrive_map_404_normal_is_fatal() {
+        let err = OneDriveDelta::map_http_error(
+            reqwest::StatusCode::NOT_FOUND, "not found",
+        );
+        assert!(matches!(err, SyncError::Fatal(_)));
+    }
+
+    #[test]
+    fn test_onedrive_map_429_to_transient() {
+        let err = OneDriveDelta::map_http_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS, "throttled",
         );
         assert!(matches!(err, SyncError::Transient(_)));
     }

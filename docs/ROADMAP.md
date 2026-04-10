@@ -50,7 +50,7 @@ Deliverables:
 - ~~`stratosync conflicts list`~~ ✓ (v0.1.0) / `resolve` CLI
 - Desktop notification on conflict (libnotify)
 - xattr exposure of sync status
-- ~~Change token support for GDrive (pageToken)~~ ✓ (v0.7.0) and OneDrive (deltaLink) — stubbed
+- ~~Change token support for GDrive (pageToken) and OneDrive (deltaLink)~~ ✓ (v0.7.0/v0.7.1)
 
 Acceptance criteria:
 - Simulate concurrent edit from two machines; conflict file appears within one poll cycle

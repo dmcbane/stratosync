@@ -223,7 +223,44 @@ impl RcloneBackend {
                 debug!("delta init: Google Drive delta enabled for {remote_name}");
             }
             delta::ProviderType::OneDrive => {
-                warn!("delta init: OneDrive delta is not yet implemented — falling back to full listing");
+                let token_json = match config.get("token") {
+                    Some(t) => t,
+                    None => {
+                        warn!("delta init: no 'token' field in rclone config for {remote_name} — delta disabled");
+                        return;
+                    }
+                };
+                let oauth = match rclone_config::parse_oauth_token(token_json) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("delta init: failed to parse OAuth token for {remote_name}: {e}");
+                        return;
+                    }
+                };
+                let client_id = config.get("client_id").cloned().unwrap_or_default();
+                let client_secret = config.get("client_secret").cloned().unwrap_or_default();
+
+                // Determine the remote sub-path. For "onedrive:/Documents",
+                // extract "/Documents" as the root_path.
+                let root_path = self.remote_root
+                    .find(':')
+                    .map(|i| &self.remote_root[i + 1..])
+                    .unwrap_or("/")
+                    .to_string();
+
+                // OneDrive uses Microsoft Graph API
+                let drive_url = config.get("drive_id")
+                    .map(|id| format!("https://graph.microsoft.com/v1.0/drives/{id}"))
+                    .unwrap_or_else(|| "https://graph.microsoft.com/v1.0/me/drive".to_string());
+
+                self.delta = Some(Box::new(delta::OneDriveDelta::new(
+                    client_id,
+                    client_secret,
+                    oauth,
+                    root_path,
+                    drive_url,
+                )));
+                debug!("delta init: OneDrive delta enabled for {remote_name}");
             }
         }
     }
