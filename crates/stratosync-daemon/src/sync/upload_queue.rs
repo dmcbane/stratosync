@@ -116,16 +116,21 @@ async fn upload_loop(
 
                 // Cancel any existing timer for this inode.
                 // Receiver dropped = timer already fired; that's fine.
-                if let Some(abort) = pending.remove(&inode) {
+                let had_pending = pending.remove(&inode).map(|abort| {
                     let _ = abort.send(());
-                }
+                }).is_some();
 
-                // Respect concurrency limit
-                if in_flight.len() >= max_concurrent {
-                    // Re-queue with full debounce to avoid starvation.
-                    if let Err(e) = tx_self.try_send(UploadTrigger::Write { inode }) {
-                        warn!(inode, "re-queue failed (channel full/closed): {e}");
-                    }
+                // Respect concurrency limit — but if we just aborted an
+                // existing task for this inode, allow the replacement through
+                // (it's recycling the same slot, not adding a new one).
+                if !had_pending && in_flight.len() >= max_concurrent {
+                    // At capacity with no existing task to replace. Re-queue
+                    // via the async send (not try_send) to apply backpressure
+                    // rather than silently dropping the trigger.
+                    let tx = tx_self.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(UploadTrigger::Write { inode }).await;
+                    });
                     continue;
                 }
 
