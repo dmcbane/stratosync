@@ -161,18 +161,51 @@ tbody tr:hover { background: var(--bg-card); }
   color: var(--text-dim); margin-bottom: .5rem;
 }
 
-/* ── Architecture diagram ─────────────────────────────────────────────── */
-.arch-diagram {
-  background: var(--bg-code); border: 1px solid var(--border); border-radius: 10px;
-  padding: 1.5rem; overflow-x: auto; margin: 1.5rem 0;
+/* ── Architecture diagram (HTML boxes) ────────────────────────────────── */
+.arch-boxes {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 0; margin: 1.5rem 0;
 }
-.arch-diagram pre {
-  font-size: .78rem; line-height: 1.6; color: var(--text-dim);
-  white-space: pre; min-width: 520px;
+.arch-box {
+  border: 1px solid var(--accent); border-radius: 8px;
+  padding: .75rem 1.25rem;
+  color: var(--text); font-size: .85rem;
+  width: 100%; max-width: 700px;
 }
-.arch-diagram .layer { color: var(--accent); }
-.arch-diagram .component { color: var(--heading); }
-.arch-diagram .note { color: var(--green); }
+.arch-top {
+  text-align: center; color: var(--text-dim);
+  background: var(--bg-code);
+}
+.arch-top .arch-label { color: var(--heading); font-weight: 600; }
+.arch-connector {
+  color: var(--accent); font-size: .85rem; padding: .35rem 0;
+  text-align: center;
+}
+.arch-daemon, .arch-core {
+  background: var(--bg-code);
+}
+.arch-box-header {
+  font-weight: 600; color: var(--heading); margin-bottom: .75rem;
+  font-size: .9rem;
+}
+.arch-box-header .arch-dim { font-weight: 400; color: var(--text-dim); margin-left: 1rem; }
+.arch-inner-row {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: .75rem;
+}
+.arch-inner {
+  border-color: var(--border); background: var(--bg-card);
+  padding: .6rem .8rem; font-size: .8rem;
+}
+.arch-inner strong { color: var(--heading); font-size: .82rem; display: block; margin-bottom: .25rem; }
+.arch-detail { color: var(--text-dim); font-size: .75rem; line-height: 1.5; }
+.arch-rclone {
+  background: var(--bg-code); text-align: center;
+  color: var(--text-dim); max-width: 280px;
+}
+.arch-rclone-label { color: var(--green); font-weight: 600; }
+@media (max-width: 640px) {
+  .arch-inner-row { grid-template-columns: 1fr; }
+}
 
 /* ── Roadmap ──────────────────────────────────────────────────────────── */
 .roadmap { display: grid; gap: 1rem; }

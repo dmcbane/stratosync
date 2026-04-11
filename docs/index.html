@@ -273,40 +273,58 @@
     Three-crate Rust workspace. No runtime dependencies beyond rclone and FUSE3.
   </p>
 
-  <div class="arch-diagram">
-<pre>
-<span class="layer">  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;</span>
-<span class="layer">  &boxv;</span>                      <span class="component">~/Cloud/</span> (FUSE3 mount)                          <span class="layer">&boxv;</span>
-<span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
-                                           &boxv;
-<span class="layer">  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;</span>
-<span class="layer">  &boxv;</span>   <span class="component">stratosync-daemon</span>                      stratosyncd binary               <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>                                                                             <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv; <span class="component">FUSE layer</span>        &boxv;    &boxv; <span class="component">Sync Engine</span>       &boxv;    &boxv; <span class="component">Cache Manager</span>      &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;  (fuser crate)    &boxv;    &boxv;  upload queue    &boxv;    &boxv;  LRU eviction       &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  remote poller   &boxv;    &boxv;  configurable quota &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  conflict resolve&boxv;    &boxv;  base version store &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  3-way merge     &boxv;    &boxv;                    &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>                                                                             <span class="layer">&boxv;</span>
-<span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
-                                           &boxv;
-<span class="layer">  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;</span>
-<span class="layer">  &boxv;</span>   <span class="component">stratosync-core</span>                                                        <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>                                                                             <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv; <span class="component">Backend trait</span>    &boxv;    &boxv; <span class="component">StateDb</span>           &boxv;    &boxv; <span class="component">Config</span>             &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;  RcloneBackend   &boxv;    &boxv;  SQLite + WAL    &boxv;    &boxv;  TOML parsing       &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;  DeltaProviders  &boxv;    &boxv;  per-mount DB    &boxv;    &boxv;  mount configs      &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>                            &boxv;                                                <span class="layer">&boxv;</span>
-<span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
-                                           &boxv; rclone subprocess
-                                &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;
-                                &boxv; <span class="note">rclone</span> (any provider) &boxv;
-                                &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;
-</pre>
+  <div class="arch-boxes">
+    <div class="arch-box arch-top">
+      <span class="arch-label">~/Cloud/</span> (FUSE3 mount)
+    </div>
+    <div class="arch-connector">&darr;</div>
+    <div class="arch-box arch-daemon">
+      <div class="arch-box-header">stratosync-daemon <span class="arch-dim">stratosyncd binary</span></div>
+      <div class="arch-inner-row">
+        <div class="arch-box arch-inner">
+          <strong>FUSE layer</strong>
+          <div class="arch-detail">fuser crate</div>
+        </div>
+        <div class="arch-box arch-inner">
+          <strong>Sync Engine</strong>
+          <div class="arch-detail">upload queue</div>
+          <div class="arch-detail">remote poller</div>
+          <div class="arch-detail">conflict resolve</div>
+          <div class="arch-detail">3-way merge</div>
+        </div>
+        <div class="arch-box arch-inner">
+          <strong>Cache Manager</strong>
+          <div class="arch-detail">LRU eviction</div>
+          <div class="arch-detail">configurable quota</div>
+          <div class="arch-detail">base version store</div>
+        </div>
+      </div>
+    </div>
+    <div class="arch-connector">&darr;</div>
+    <div class="arch-box arch-core">
+      <div class="arch-box-header">stratosync-core</div>
+      <div class="arch-inner-row">
+        <div class="arch-box arch-inner">
+          <strong>Backend trait</strong>
+          <div class="arch-detail">RcloneBackend</div>
+          <div class="arch-detail">DeltaProviders</div>
+        </div>
+        <div class="arch-box arch-inner">
+          <strong>StateDb</strong>
+          <div class="arch-detail">SQLite + WAL</div>
+          <div class="arch-detail">per-mount DB</div>
+        </div>
+        <div class="arch-box arch-inner">
+          <strong>Config</strong>
+          <div class="arch-detail">TOML parsing</div>
+          <div class="arch-detail">mount configs</div>
+        </div>
+      </div>
+    </div>
+    <div class="arch-connector">&darr; rclone subprocess</div>
+    <div class="arch-box arch-rclone">
+      <span class="arch-rclone-label">rclone</span> (any provider)
+    </div>
   </div>
 
   <div class="features" style="grid-template-columns: repeat(3, 1fr);">
