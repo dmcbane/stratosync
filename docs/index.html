@@ -92,7 +92,7 @@
     <div class="feature-card">
       <span class="icon">&#9878;</span>
       <h3>Conflict resolution</h3>
-      <p>Concurrent edits produce <code>.conflict</code> siblings instead of silent overwrites. Optimistic locking via ETags ensures no data loss.</p>
+      <p>Concurrent edits trigger automatic 3-way merge for text files, or produce <code>.conflict</code> siblings for binary files. Content-hash ETags ensure no silent overwrites.</p>
     </div>
     <div class="feature-card">
       <span class="icon">&#128230;</span>
@@ -217,7 +217,8 @@
 <span class="layer">  &boxv;</span>   &boxv; <span class="component">FUSE layer</span>        &boxv;    &boxv; <span class="component">Sync Engine</span>       &boxv;    &boxv; <span class="component">Cache Manager</span>      &boxv;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>   &boxv;  (fuser crate)    &boxv;    &boxv;  upload queue    &boxv;    &boxv;  LRU eviction       &boxv;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  remote poller   &boxv;    &boxv;  configurable quota &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  conflict detect &boxv;    &boxv;                    &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  conflict resolve&boxv;    &boxv;  base version store &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;                 &boxv;    &boxv;  3-way merge     &boxv;    &boxv;                    &boxv;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>   &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>                                                                             <span class="layer">&boxv;</span>
 <span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
@@ -228,7 +229,7 @@
 <span class="layer">  &boxv;</span>   &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;    &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>   &boxv; <span class="component">Backend trait</span>    &boxv;    &boxv; <span class="component">StateDb</span>           &boxv;    &boxv; <span class="component">Config</span>             &boxv;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>   &boxv;  RcloneBackend   &boxv;    &boxv;  SQLite + WAL    &boxv;    &boxv;  TOML parsing       &boxv;           <span class="layer">&boxv;</span>
-<span class="layer">  &boxv;</span>   &boxv;  MockBackend     &boxv;    &boxv;  per-mount DB    &boxv;    &boxv;  mount configs      &boxv;           <span class="layer">&boxv;</span>
+<span class="layer">  &boxv;</span>   &boxv;  DeltaProviders  &boxv;    &boxv;  per-mount DB    &boxv;    &boxv;  mount configs      &boxv;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>   &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;    &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;           <span class="layer">&boxv;</span>
 <span class="layer">  &boxv;</span>                            &boxv;                                                <span class="layer">&boxv;</span>
 <span class="layer">  &boxur;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxul;</span>
@@ -242,11 +243,11 @@
   <div class="features" style="grid-template-columns: repeat(3, 1fr);">
     <div class="feature-card">
       <h3>stratosync-core</h3>
-      <p>Pure types, Backend trait, StateDb (SQLite), config structs. No FUSE, no network. Fast to compile, easy to unit test.</p>
+      <p>Pure types, Backend trait, StateDb (SQLite), BaseStore (SHA-256 object store), delta providers, config structs. No FUSE, no network.</p>
     </div>
     <div class="feature-card">
       <h3>stratosync-daemon</h3>
-      <p>FUSE filesystem, sync engine, cache manager, inotify watcher. Tokio async runtime with FUSE bridge.</p>
+      <p>FUSE filesystem, sync engine with 3-way merge, cache manager, inotify watcher, delta poller. Tokio async runtime with FUSE bridge.</p>
     </div>
     <div class="feature-card">
       <h3>stratosync-cli</h3>
@@ -274,9 +275,11 @@
 <span class="flag">allow_other</span>     = <span class="str">false</span>
 
 [<span class="str">daemon.sync</span>]
-<span class="flag">max_hydration_concurrent</span> = <span class="str">4</span>
-<span class="flag">max_upload_concurrent</span>    = <span class="str">2</span>
-<span class="flag">upload_debounce_ms</span>       = <span class="str">2000</span></pre>
+<span class="flag">max_hydration_concurrent</span>  = <span class="str">4</span>
+<span class="flag">max_upload_concurrent</span>     = <span class="str">2</span>
+<span class="flag">upload_debounce_ms</span>        = <span class="str">2000</span>
+<span class="flag">text_conflict_strategy</span>    = <span class="str">"merge"</span>   <span class="comment"># or "keep_both"</span>
+<span class="flag">base_retention_days</span>       = <span class="str">30</span></pre>
       </div>
     </div>
     <div>
@@ -316,12 +319,12 @@
       <p>Write, create, mkdir, rename, delete. Upload queue with debounce. Remote poller. LRU cache eviction. Crash recovery.</p>
     </div>
     <div class="phase">
-      <span class="phase-badge current">Next</span>
+      <span class="phase-badge done">Done</span>
       <h3>Phase 3: Conflict Resolution & Safety</h3>
-      <p>Desktop notifications on conflict. xattr sync status. Delta API support for Google Drive and OneDrive. 3-way text merge.</p>
+      <p>3-way text merge via <code>git merge-file</code>. Content-hash ETag detection. Delta APIs for Google Drive and OneDrive. Base version store. Desktop notifications. <em>Remaining: xattr sync status, <code>conflicts resolve</code> CLI.</em></p>
     </div>
     <div class="phase">
-      <span class="phase-badge planned">Planned</span>
+      <span class="phase-badge current">Next</span>
       <h3>Phase 4: Performance & UX</h3>
       <p>Partial/range hydration. Prefetch heuristics. Pin/unpin for offline. GNOME/Nautilus status overlays. Tray indicator. Packaging.</p>
     </div>

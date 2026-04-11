@@ -47,15 +47,17 @@ Acceptance criteria:
 Deliverables:
 - ~~ConflictResolver with `.conflict.{ts}.{hash}` naming~~ ✓ (v0.1.0)
 - ~~Optimistic-lock upload (ETag check before and after)~~ ✓ (v0.1.0)
+- ~~Content-hash ETag detection (SHA-1/MD5 instead of file IDs)~~ ✓ (v0.8.0)
+- ~~3-way text merge via `git merge-file` with base version store~~ ✓ (v0.8.0)
 - ~~`stratosync conflicts list`~~ ✓ (v0.1.0) / `resolve` CLI
-- Desktop notification on conflict (libnotify)
+- ~~Desktop notification on conflict (notify-send)~~ ✓ (v0.8.0)
 - xattr exposure of sync status
 - ~~Change token support for GDrive (pageToken) and OneDrive (deltaLink)~~ ✓ (v0.7.0/v0.7.1)
 
 Acceptance criteria:
-- Simulate concurrent edit from two machines; conflict file appears within one poll cycle
+- ~~Simulate concurrent edit from two machines; conflict file appears within one poll cycle~~ ✓ (live-tested v0.8.0)
 - `getfattr -n user.stratosync.status` works on any file in the mount
-- 3-way text merge resolves clean conflicts automatically (when enabled)
+- ~~3-way text merge resolves clean conflicts automatically (when enabled)~~ ✓ (live-tested v0.8.0)
 
 ---
 

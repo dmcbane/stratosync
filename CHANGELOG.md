@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-04-10
+
+### Added
+- **3-way text merge for conflict resolution**: When `text_conflict_strategy = "merge"`
+  is set, concurrent edits to text files are resolved automatically via
+  `git merge-file`. Non-overlapping changes merge cleanly with no conflict
+  file; overlapping changes produce conflict markers. Falls back to keep-both
+  for binary files, when git is unavailable, or when no base version exists.
+- **Base version object store** (`BaseStore`): Content-addressed SHA-256 store
+  at `{cache_dir}/.bases/objects/`. Base versions are captured after each
+  successful upload and used as the common ancestor for 3-way merge. Includes
+  automatic eviction of stale bases (configurable retention, default 30 days).
+- **`SyncConfig` merge settings**: `text_conflict_strategy` (keep_both/merge),
+  `base_retention_days`, `base_max_file_size`, `text_extensions` allowlist.
+- **`base_versions` DB table** with reference counting for deduplication.
+- 6 end-to-end conflict resolution tests (clean merge, conflict markers,
+  no-base fallback, binary skip, strategy toggle, no-git fallback).
+- **Desktop notifications** on conflict via `notify-send`.
+
+### Fixed
+- **ETag conflict detection used file IDs, not content hashes**: `stat()` was
+  called without `--hash`, so rclone returned no content hashes. Google Drive
+  file IDs don't change on content update, making conflicts undetectable.
+  Now `stat()` always requests hashes.
+- **Hash key case mismatch**: rclone outputs lowercase hash names (`sha1`,
+  `md5`) but the code looked for uppercase (`SHA-1`, `MD5`). Now checks both.
+- **Upload queue race condition**: The abort-and-respawn debounce mechanism
+  had multiple race conditions causing uploads to be silently dropped.
+  Redesigned to deadline-based debounce (no oneshot channels, no abort
+  mechanism).
+- **Watcher inode mismatch after poller upsert**: The inotify watcher looked
+  up inodes via `cache_path` column, which is NULL for entries replaced by
+  the poller. Now derives `remote_path` from the cache file path and uses
+  `get_by_remote_path()`.
+- **Delta poller proceeds when initial listing fails**: Instead of blocking
+  delta mode, logs a warning and enters delta-only mode.
+
+### Changed
+- **Upload queue**: Complete rewrite of debounce mechanism from abort-and-
+  respawn (oneshot channels + JoinSet) to deadline-based (HashMap of
+  `inode -> due_at`). Eliminates all race conditions.
+- **`RcloneBackend::stat()`**: Now includes `--hash` flag for content-based
+  change detection.
+
 ## [0.7.2] - 2026-04-10
 
 ### Fixed
