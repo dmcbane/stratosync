@@ -156,14 +156,20 @@ async fn resolve_path(config_path: &Path, user_path: &Path) -> Result<ResolveCon
     let mount_id = db.get_mount_id(&mount.name).await?
         .ok_or_else(|| anyhow::anyhow!("mount '{}' not found in database", mount.name))?;
 
-    // Build the remote path from the relative path
-    let remote_path = format!("/{}", rel_path.to_string_lossy().trim_start_matches('/'));
-
-    // Try to find the entry by remote path
-    let entry = db.get_by_remote_path(mount_id, &remote_path).await?
-        .ok_or_else(|| anyhow::anyhow!(
-            "file not found in database: {remote_path}"
-        ))?;
+    // Build the remote path from the relative path — try both with and without
+    // leading slash since root-level files may be stored either way.
+    let rel_str = rel_path.to_string_lossy();
+    let rel_str = rel_str.trim_start_matches('/');
+    let entry = {
+        let with_slash = format!("/{rel_str}");
+        match db.get_by_remote_path(mount_id, &with_slash).await? {
+            Some(e) => e,
+            None => db.get_by_remote_path(mount_id, rel_str).await?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "file not found in database: {rel_str}"
+                ))?,
+        }
+    };
 
     // Find conflict sibling: look for .conflict.* files with the same stem
     let conflict_sibling = find_conflict_sibling(&db, mount_id, &entry).await?;

@@ -131,14 +131,23 @@ async fn resolve_path(config_path: &Path, user_path: &Path) -> Result<PinContext
     let mount_id = db.get_mount_id(&mount.name).await?
         .ok_or_else(|| anyhow::anyhow!("mount '{}' not found in database", mount.name))?;
 
-    let remote_path = if rel_path.as_os_str().is_empty() {
-        "/".to_owned()
-    } else {
-        format!("/{}", rel_path.to_string_lossy().trim_start_matches('/'))
-    };
+    let rel_str = rel_path.to_string_lossy();
+    let rel_str = rel_str.trim_start_matches('/');
 
-    let entry = db.get_by_remote_path(mount_id, &remote_path).await?
-        .ok_or_else(|| anyhow::anyhow!("file not found in database: {remote_path}"))?;
+    // Try both with and without leading slash — root-level files may be stored
+    // either way depending on the backend and how they were inserted.
+    let entry = if rel_str.is_empty() {
+        db.get_by_remote_path(mount_id, "/").await?
+    } else {
+        let with_slash = format!("/{rel_str}");
+        match db.get_by_remote_path(mount_id, &with_slash).await? {
+            Some(e) => Some(e),
+            None => db.get_by_remote_path(mount_id, rel_str).await?,
+        }
+    };
+    let entry = entry.ok_or_else(|| anyhow::anyhow!(
+        "file not found in database: {rel_str}"
+    ))?;
 
     let backend = RcloneBackend::new(&mount.remote)?;
 
