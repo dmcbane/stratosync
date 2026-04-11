@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 stratosync-core       = { path = "../stratosync-core" }
 clap.workspace        = true
+clap_complete.workspace = true
 tokio.workspace       = true
 anyhow.workspace      = true
 tracing.workspace     = true

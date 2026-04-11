@@ -153,6 +153,28 @@ if [[ -f "$FUSE_CONF" ]] && ! grep -q "^user_allow_other" "$FUSE_CONF"; then
     echo "to ${FUSE_CONF} (requires sudo), then set allow_other=true in config."
 fi
 
+# ── Shell completions ────────────────────────────────────────────────────────
+echo ""
+echo "Shell completions (recommended):"
+SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
+case "$SHELL_NAME" in
+    bash)
+        echo "  Add to ~/.bashrc:"
+        echo "    source <(COMPLETE=bash stratosync)"
+        ;;
+    zsh)
+        echo "  Add to ~/.zshrc:"
+        echo "    source <(COMPLETE=zsh stratosync)"
+        ;;
+    fish)
+        echo "  Add to ~/.config/fish/config.fish:"
+        echo "    COMPLETE=fish stratosync | source"
+        ;;
+    *)
+        echo "  Run 'stratosync completions' for setup instructions."
+        ;;
+esac
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Installation complete ==="

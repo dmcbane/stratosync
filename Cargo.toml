@@ -27,7 +27,8 @@ tracing             = "0.1"
 tracing-subscriber  = { version = "0.3",     features = ["env-filter", "fmt"] }
 chrono              = { version = "0.4",     features = ["serde"] }
 dashmap             = "6"
-clap                = { version = "=4.5.57", features = ["derive", "env"] }
+clap                = { version = "=4.5.57", features = ["derive", "env", "unstable-ext"] }
+clap_complete       = { version = "=4.5.59", features = ["unstable-dynamic"] }
 sha2                = "0.10"
 dirs                = "5"
 bytesize            = "1"

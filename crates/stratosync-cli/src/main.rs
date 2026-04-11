@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::ArgValueCompleter;
 use tracing_subscriber::EnvFilter;
 
 mod commands;
+mod completions;
 mod config_io;
 
 #[derive(Parser)]
@@ -41,6 +43,8 @@ enum Command {
         #[command(subcommand)]
         action: Option<ConflictAction>,
     },
+    /// Print shell completion setup instructions
+    Completions,
     /// Print version
     Version,
 }
@@ -55,17 +59,31 @@ enum ConfigAction {
 #[derive(Subcommand)]
 enum ConflictAction {
     /// Upload local version, discard remote conflict file
-    KeepLocal { path: PathBuf },
+    KeepLocal {
+        #[arg(add = ArgValueCompleter::new(completions::complete_conflict_path))]
+        path: PathBuf,
+    },
     /// Download remote version, discard local changes
-    KeepRemote { path: PathBuf },
+    KeepRemote {
+        #[arg(add = ArgValueCompleter::new(completions::complete_conflict_path))]
+        path: PathBuf,
+    },
     /// Attempt 3-way merge using base version
-    Merge { path: PathBuf },
+    Merge {
+        #[arg(add = ArgValueCompleter::new(completions::complete_conflict_path))]
+        path: PathBuf,
+    },
     /// Show unified diff between local and remote versions
-    Diff { path: PathBuf },
+    Diff {
+        #[arg(add = ArgValueCompleter::new(completions::complete_conflict_path))]
+        path: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
@@ -106,6 +124,16 @@ async fn main() -> Result<()> {
                 commands::conflicts::merge(&config_path, &path).await?,
             Some(ConflictAction::Diff { path }) =>
                 commands::conflicts::diff(&config_path, &path).await?,
+        }
+        Command::Completions => {
+            println!("Add one of the following to your shell config:\n");
+            println!("  Bash (~/.bashrc):");
+            println!("    source <(COMPLETE=bash stratosync)\n");
+            println!("  Zsh (~/.zshrc):");
+            println!("    source <(COMPLETE=zsh stratosync)\n");
+            println!("  Fish (~/.config/fish/config.fish):");
+            println!("    COMPLETE=fish stratosync | source\n");
+            println!("Then restart your shell or source the config file.");
         }
     }
     Ok(())
