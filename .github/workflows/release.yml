@@ -12,18 +12,53 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            arch_label: x86_64
+            runner: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            arch_label: aarch64
+            runner: ubuntu-latest
+            cross: true
+
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config dpkg-dev
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
+      - name: Install cross-compilation tools (arm64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
+          # Install arm64 libfuse3-dev via multiarch
+          sudo dpkg --add-architecture arm64
+          # Add arm64 package sources
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main universe" | sudo tee /etc/apt/sources.list.d/arm64.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev:arm64
+
+      - name: Install native dependencies (x86_64)
+        if: "!matrix.cross"
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config dpkg-dev
+
+      - name: Configure cross-compilation environment
+        if: matrix.cross
+        run: |
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -32,13 +67,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run tests
+      - name: Run tests (native only)
+        if: "!matrix.cross"
         run: cargo test --workspace
 
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --target ${{ matrix.target }}
 
       - name: Extract version
         id: version
@@ -47,11 +83,11 @@ jobs:
       # ── Package: tarball ──
       - name: Create tarball
         run: |
-          DIST="stratosync-${{ steps.version.outputs.version }}-linux-x86_64"
+          DIST="stratosync-${{ steps.version.outputs.version }}-linux-${{ matrix.arch_label }}"
           mkdir -p "$DIST"
-          cp target/release/stratosyncd "$DIST/"
-          cp target/release/stratosync "$DIST/"
-          cp target/release/stratosync-tray "$DIST/" 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/stratosyncd "$DIST/"
+          cp target/${{ matrix.target }}/release/stratosync "$DIST/"
+          cp target/${{ matrix.target }}/release/stratosync-tray "$DIST/" 2>/dev/null || true
           cp contrib/systemd/stratosyncd.service "$DIST/"
           cp contrib/nautilus/stratosync_nautilus.py "$DIST/"
           cp contrib/desktop/stratosync-tray.desktop "$DIST/"
@@ -67,19 +103,19 @@ jobs:
           mkdir -p deb-root/usr/share/applications
           mkdir -p deb-root/DEBIAN
 
-          cp target/release/stratosyncd deb-root/usr/bin/
-          cp target/release/stratosync deb-root/usr/bin/
-          cp target/release/stratosync-tray deb-root/usr/bin/ 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/stratosyncd deb-root/usr/bin/
+          cp target/${{ matrix.target }}/release/stratosync deb-root/usr/bin/
+          cp target/${{ matrix.target }}/release/stratosync-tray deb-root/usr/bin/ 2>/dev/null || true
           cp contrib/systemd/stratosyncd.service deb-root/usr/lib/systemd/user/
           cp contrib/nautilus/stratosync_nautilus.py deb-root/usr/share/nautilus-python/extensions/
           cp contrib/desktop/stratosync-tray.desktop deb-root/usr/share/applications/ 2>/dev/null || true
 
-          cat > deb-root/DEBIAN/control << 'CTRL'
+          cat > deb-root/DEBIAN/control << CTRL
           Package: stratosync
           Version: ${{ steps.version.outputs.version }}
           Section: utils
           Priority: optional
-          Architecture: amd64
+          Architecture: ${{ matrix.arch }}
           Depends: libfuse3-3, fuse3, rclone
           Recommends: python3-nautilus
           Maintainer: Dale McBane <noreply@example.com>
@@ -88,19 +124,34 @@ jobs:
            supporting 70+ cloud storage providers with on-demand hydration,
            automatic upload, and conflict-safe bidirectional sync.
           CTRL
-          # Remove leading whitespace from heredoc
           sed -i 's/^          //' deb-root/DEBIAN/control
 
-          dpkg-deb --build deb-root "stratosync_${{ steps.version.outputs.version }}_amd64.deb"
+          dpkg-deb --build deb-root "stratosync_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb"
 
-      # ── Package: .rpm (spec only — no rpmbuild in CI) ──
-      # RPM is built by users via the spec file or COPR
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch_label }}
+          path: |
+            stratosync-*-linux-${{ matrix.arch_label }}.tar.gz
+            stratosync_*_${{ matrix.arch }}.deb
 
-      # ── GitHub Release ──
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la stratosync*
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            stratosync-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
-            stratosync_${{ steps.version.outputs.version }}_amd64.deb
+            stratosync-*-linux-*.tar.gz
+            stratosync_*.deb
