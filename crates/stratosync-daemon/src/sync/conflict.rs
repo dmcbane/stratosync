@@ -17,72 +17,14 @@ use stratosync_core::{
     backend::Backend,
     base_store::BaseStore,
     config::{ConflictStrategy, SyncConfig},
+    merge::{MergeOutcome, try_three_way_merge},
     state::StateDb,
     types::{FileEntry, FileKind, SyncStatus},
 };
 use stratosync_core::state::NewFileEntry;
 
-// ── 3-way merge types ────────────────────────────────────────────────────────
-
-/// Result of attempting a 3-way merge via `git merge-file`.
-pub enum MergeOutcome {
-    /// All changes merged cleanly — no conflict markers.
-    Clean(Vec<u8>),
-    /// Merge produced output with conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`).
-    ConflictMarkers(Vec<u8>),
-    /// Merge could not run (git not found, I/O error, etc.).
-    Failed(String),
-}
-
-/// Check once whether `git merge-file` is available.
-/// Returns true if `git --version` succeeds.
-pub fn git_available() -> bool {
-    std::process::Command::new("git")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Attempt a 3-way merge using `git merge-file --stdout`.
-///
-/// Arguments follow git merge-file convention:
-///   `git merge-file --stdout <local> <base> <remote>`
-///
-/// Exit codes:
-///   0 = clean merge (stdout = merged content)
-///   1 = conflicts (stdout = merged content with markers)
-///   other = error
-fn try_three_way_merge(
-    base_path:   &Path,
-    local_path:  &Path,
-    remote_path: &Path,
-) -> MergeOutcome {
-    let output = match std::process::Command::new("git")
-        .args([
-            "merge-file", "--stdout",
-            &local_path.to_string_lossy(),
-            &base_path.to_string_lossy(),
-            &remote_path.to_string_lossy(),
-        ])
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => return MergeOutcome::Failed(format!("git merge-file: {e}")),
-    };
-
-    match output.status.code() {
-        Some(0) => MergeOutcome::Clean(output.stdout),
-        Some(1) => MergeOutcome::ConflictMarkers(output.stdout),
-        Some(code) => MergeOutcome::Failed(format!(
-            "git merge-file exited {code}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )),
-        None => MergeOutcome::Failed("git merge-file killed by signal".into()),
-    }
-}
+// Re-export for callers that used conflict::git_available() directly.
+pub use stratosync_core::merge::git_available;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -285,7 +227,14 @@ pub async fn resolve(
     }).await?;
 
     // ── 5. Desktop notification ───────────────────────────────────────────────
-    emit_notification(&entry.name, &conflict_name);
+    super::notification::send(
+        "stratosync: sync conflict",
+        &format!(
+            "'{original}' was modified remotely and locally.\n\
+             Your local version was saved as '{conflict_name}'.",
+            original = entry.name,
+        ),
+    );
 
     info!(
         inode = entry.inode,
@@ -354,30 +303,6 @@ fn sibling_path(remote_path: &str, new_name: &str) -> String {
     match remote_path.rfind('/') {
         Some(idx) => format!("{}/{}", &remote_path[..idx], new_name),
         None      => new_name.to_owned(),
-    }
-}
-
-// ── Desktop notification ──────────────────────────────────────────────────────
-
-fn emit_notification(original: &str, conflict_name: &str) {
-    // notify-send may not be installed (headless server, non-GNOME DE, etc.).
-    // Failure is expected and acceptable — the conflict is already logged
-    // at info level by the caller.
-    match std::process::Command::new("notify-send")
-        .args([
-            "--urgency=normal",
-            "--icon=dialog-warning",
-            "stratosync: sync conflict",
-            &format!(
-                "'{original}' was modified remotely and locally.\n\
-                 Your local version was saved as '{conflict_name}'."
-            ),
-        ])
-        .status()
-    {
-        Ok(s) if s.success() => debug!("desktop notification sent for conflict"),
-        Ok(s) => debug!("notify-send exited with {s}"),
-        Err(e) => debug!("notify-send unavailable: {e}"),
     }
 }
 

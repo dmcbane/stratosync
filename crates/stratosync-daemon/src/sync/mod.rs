@@ -1,4 +1,5 @@
 pub mod conflict;
+pub mod notification;
 pub mod poller;
 pub mod upload_queue;
 

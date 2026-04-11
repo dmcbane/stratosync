@@ -37,7 +37,10 @@ enum Command {
     /// Remove an offline pin
     Unpin { path: PathBuf },
     /// List and manage conflict files
-    Conflicts,
+    Conflicts {
+        #[command(subcommand)]
+        action: Option<ConflictAction>,
+    },
     /// Print version
     Version,
 }
@@ -47,6 +50,18 @@ enum ConfigAction {
     Show,
     Test,
     Edit,
+}
+
+#[derive(Subcommand)]
+enum ConflictAction {
+    /// Upload local version, discard remote conflict file
+    KeepLocal { path: PathBuf },
+    /// Download remote version, discard local changes
+    KeepRemote { path: PathBuf },
+    /// Attempt 3-way merge using base version
+    Merge { path: PathBuf },
+    /// Show unified diff between local and remote versions
+    Diff { path: PathBuf },
 }
 
 #[tokio::main]
@@ -81,8 +96,16 @@ async fn main() -> Result<()> {
         Command::Unpin { path } => {
             println!("unpin: {} (not yet implemented)", path.display());
         }
-        Command::Conflicts => {
-            commands::conflicts::run(&config_path).await?;
+        Command::Conflicts { action } => match action {
+            None => commands::conflicts::list(&config_path).await?,
+            Some(ConflictAction::KeepLocal { path }) =>
+                commands::conflicts::keep_local(&config_path, &path).await?,
+            Some(ConflictAction::KeepRemote { path }) =>
+                commands::conflicts::keep_remote(&config_path, &path).await?,
+            Some(ConflictAction::Merge { path }) =>
+                commands::conflicts::merge(&config_path, &path).await?,
+            Some(ConflictAction::Diff { path }) =>
+                commands::conflicts::diff(&config_path, &path).await?,
         }
     }
     Ok(())

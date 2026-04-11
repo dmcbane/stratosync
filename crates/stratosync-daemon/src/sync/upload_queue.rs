@@ -208,6 +208,12 @@ async fn upload_loop(
                         if let Err(db_err) = db.set_status(inode, SyncStatus::Dirty).await {
                             warn!(inode, "failed to reset status to Dirty: {db_err}");
                         }
+                        if let Ok(Some(entry)) = db.get_by_inode(inode).await {
+                            super::notification::send(
+                                "stratosync: upload failed",
+                                &format!("Failed to upload '{}': {e}", entry.name),
+                            );
+                        }
                     }
                     Err(join_err) => {
                         warn!("upload task panicked: {join_err}");

@@ -4,6 +4,7 @@
 pub mod write_ops;
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -13,7 +14,7 @@ use anyhow::Context;
 use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
@@ -33,6 +34,11 @@ pub struct OpenFile {
     pub flags:      i32,
     pub hydrating:  bool,
 }
+
+// Extended attributes exposed as read-only metadata.
+const XATTR_STATUS: &[u8]      = b"user.stratosync.status";
+const XATTR_ETAG: &[u8]        = b"user.stratosync.etag";
+const XATTR_REMOTE_PATH: &[u8] = b"user.stratosync.remote_path";
 
 pub struct StratoFs {
     pub mount_id:          u32,
@@ -552,6 +558,68 @@ impl Filesystem for StratoFs {
         let (n, nn) = match (name.to_str(), new_name.to_str()) { (Some(a), Some(b)) => (a.to_owned(), b.to_owned()), _ => { reply.error(libc::EINVAL); return; } };
         let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
         match self.rt.block_on(write_ops::handle_rename(parent, &n, new_parent, &nn, mid, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
+    }
+
+    fn getxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let name_bytes = name.as_bytes();
+        let db = Arc::clone(&self.db);
+
+        let entry = match self.rt.block_on(db.get_by_inode(ino)) {
+            Ok(Some(e)) => e,
+            Ok(None)    => { reply.error(libc::ENOENT); return; }
+            Err(reason) => { error!(ino, "getxattr db lookup: {reason}"); reply.error(libc::EIO); return; }
+        };
+
+        let value: &[u8] = if name_bytes == XATTR_STATUS {
+            entry.status.as_str().as_bytes()
+        } else if name_bytes == XATTR_ETAG {
+            entry.etag.as_deref().unwrap_or("").as_bytes()
+        } else if name_bytes == XATTR_REMOTE_PATH {
+            entry.remote_path.as_bytes()
+        } else {
+            reply.error(libc::ENODATA);
+            return;
+        };
+
+        if size == 0 {
+            reply.size(value.len() as u32);
+        } else if size >= value.len() as u32 {
+            reply.data(value);
+        } else {
+            reply.error(libc::ERANGE);
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let db = Arc::clone(&self.db);
+        match self.rt.block_on(db.get_by_inode(ino)) {
+            Ok(Some(_)) => {}
+            Ok(None)    => { reply.error(libc::ENOENT); return; }
+            Err(reason) => { error!(ino, "listxattr db lookup: {reason}"); reply.error(libc::EIO); return; }
+        };
+
+        // xattr list format: null-terminated names concatenated
+        let mut buf = Vec::new();
+        for attr in [XATTR_STATUS, XATTR_ETAG, XATTR_REMOTE_PATH] {
+            buf.extend_from_slice(attr);
+            buf.push(0);
+        }
+
+        if size == 0 {
+            reply.size(buf.len() as u32);
+        } else if size >= buf.len() as u32 {
+            reply.data(&buf);
+        } else {
+            reply.error(libc::ERANGE);
+        }
+    }
+
+    fn setxattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, _value: &[u8], _flags: i32, _position: u32, reply: ReplyEmpty) {
+        reply.error(libc::ENOTSUP);
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(libc::ENOTSUP);
     }
 }
 
