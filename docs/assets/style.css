@@ -178,8 +178,22 @@ tbody tr:hover { background: var(--bg-card); }
 }
 .arch-top .arch-label { color: var(--heading); font-weight: 600; }
 .arch-connector {
-  color: var(--accent); font-size: .85rem; padding: .35rem 0;
-  text-align: center;
+  display: flex; flex-direction: column; align-items: center;
+  color: var(--text-dim); font-size: .8rem; gap: 0;
+  padding: 0; position: relative;
+}
+.arch-connector::before {
+  content: '';
+  width: 2px; height: 24px;
+  background: var(--accent);
+}
+.arch-connector::after {
+  content: '';
+  width: 0; height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 8px solid var(--accent);
+  margin-bottom: 2px;
 }
 .arch-daemon, .arch-core {
   background: var(--bg-code);
