@@ -106,6 +106,72 @@ jobs:
 
           dpkg-deb --build deb-root "stratosync_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb"
 
+      # ── Package: .rpm ──
+      - name: Build .rpm package
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+
+          RPM_ARCH="${{ matrix.arch_label }}"
+          # RPM uses aarch64 not arm64
+          VERSION="${{ steps.version.outputs.version }}"
+
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
+
+          # Create the installed file tree directly in BUILDROOT
+          BROOT="rpmbuild/BUILDROOT/stratosync-${VERSION}-1.${RPM_ARCH}"
+          mkdir -p "$BROOT/usr/bin"
+          mkdir -p "$BROOT/usr/lib/systemd/user"
+          mkdir -p "$BROOT/usr/share/nautilus-python/extensions"
+          mkdir -p "$BROOT/usr/share/applications"
+          mkdir -p "$BROOT/usr/share/licenses/stratosync"
+          mkdir -p "$BROOT/usr/share/doc/stratosync"
+
+          cp target/${{ matrix.target }}/release/stratosyncd "$BROOT/usr/bin/"
+          cp target/${{ matrix.target }}/release/stratosync "$BROOT/usr/bin/"
+          cp target/${{ matrix.target }}/release/stratosync-tray "$BROOT/usr/bin/" 2>/dev/null || true
+          cp contrib/systemd/stratosyncd.service "$BROOT/usr/lib/systemd/user/"
+          cp contrib/nautilus/stratosync_nautilus.py "$BROOT/usr/share/nautilus-python/extensions/"
+          cp contrib/desktop/stratosync-tray.desktop "$BROOT/usr/share/applications/" 2>/dev/null || true
+          cp LICENSE-MIT LICENSE-APACHE "$BROOT/usr/share/licenses/stratosync/"
+          cp README.md CHANGELOG.md "$BROOT/usr/share/doc/stratosync/"
+
+          cat > rpmbuild/SPECS/stratosync.spec << 'SPEC'
+          Name:           stratosync
+          Version:        VERSION_PLACEHOLDER
+          Release:        1
+          Summary:        Linux cloud sync daemon with on-demand FUSE3 filesystem
+          License:        MIT OR Apache-2.0
+          URL:            https://github.com/dmcbane/stratosync
+          AutoReqProv:    no
+
+          %description
+          Stratosync provides a FUSE3 virtual filesystem backed by rclone,
+          supporting 70+ cloud storage providers with on-demand hydration,
+          automatic upload, and conflict-safe bidirectional sync.
+
+          %files
+          /usr/bin/stratosyncd
+          /usr/bin/stratosync
+          /usr/bin/stratosync-tray
+          /usr/lib/systemd/user/stratosyncd.service
+          /usr/share/nautilus-python/extensions/stratosync_nautilus.py
+          /usr/share/applications/stratosync-tray.desktop
+          /usr/share/licenses/stratosync/LICENSE-MIT
+          /usr/share/licenses/stratosync/LICENSE-APACHE
+          /usr/share/doc/stratosync/README.md
+          /usr/share/doc/stratosync/CHANGELOG.md
+          SPEC
+          sed -i 's/^          //' rpmbuild/SPECS/stratosync.spec
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" rpmbuild/SPECS/stratosync.spec
+
+          rpmbuild --define "_topdir $(pwd)/rpmbuild" \
+                   --define "_rpmdir $(pwd)/rpmbuild/RPMS" \
+                   --target "${RPM_ARCH}" \
+                   -bb rpmbuild/SPECS/stratosync.spec
+
+          # Move RPM to predictable location
+          find rpmbuild/RPMS -name "*.rpm" -exec cp {} "stratosync-${VERSION}-1.${RPM_ARCH}.rpm" \;
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -113,6 +179,7 @@ jobs:
           path: |
             stratosync-*-linux-${{ matrix.arch_label }}.tar.gz
             stratosync_*_${{ matrix.arch }}.deb
+            stratosync-*.${{ matrix.arch_label }}.rpm
 
   release:
     needs: build
@@ -133,3 +200,4 @@ jobs:
           files: |
             stratosync-*-linux-*.tar.gz
             stratosync_*.deb
+            stratosync-*.rpm
