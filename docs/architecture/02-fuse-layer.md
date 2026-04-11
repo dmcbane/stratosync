@@ -129,9 +129,9 @@ All mutating operations:
 
 `rename` is the most complex — if cross-directory, requires an atomic remote rename. rclone exposes `moveto` for this. If the remote doesn't support server-side move (e.g. some WebDAV implementations), fall back to copy+delete.
 
-### `getxattr` / `setxattr` / `listxattr`
+### `getxattr` / `listxattr` (read-only)
 
-Used to expose sync metadata to user tools:
+Exposes sync metadata to user tools and file managers. Three read-only attributes are provided, derived directly from the `file_index` entry (not the `xattr_store` table):
 
 ```bash
 getfattr -n user.stratosync.status ~/Cloud/doc.pdf
@@ -144,7 +144,7 @@ getfattr -n user.stratosync.remote_path ~/Cloud/doc.pdf
 # → "gdrive:Documents/doc.pdf"
 ```
 
-Stored in the `xattr_store` table in state_db.
+`setxattr` and `removexattr` return `ENOTSUP` — these attributes are read-only.
 
 ## File Handle Table
 

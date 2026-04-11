@@ -49,14 +49,14 @@ Deliverables:
 - ~~Optimistic-lock upload (ETag check before and after)~~ ✓ (v0.1.0)
 - ~~Content-hash ETag detection (SHA-1/MD5 instead of file IDs)~~ ✓ (v0.8.0)
 - ~~3-way text merge via `git merge-file` with base version store~~ ✓ (v0.8.0)
-- ~~`stratosync conflicts list`~~ ✓ (v0.1.0) / `resolve` CLI
-- ~~Desktop notification on conflict (notify-send)~~ ✓ (v0.8.0)
-- xattr exposure of sync status
+- ~~`stratosync conflicts list`~~ ✓ (v0.1.0) / ~~`resolve` CLI (keep-local, keep-remote, merge, diff)~~ ✓ (v0.9.0)
+- ~~Desktop notification on conflict and upload failures (notify-send)~~ ✓ (v0.8.0/v0.9.0)
+- ~~xattr exposure of sync status (`user.stratosync.{status,etag,remote_path}`)~~ ✓ (v0.9.0)
 - ~~Change token support for GDrive (pageToken) and OneDrive (deltaLink)~~ ✓ (v0.7.0/v0.7.1)
 
 Acceptance criteria:
 - ~~Simulate concurrent edit from two machines; conflict file appears within one poll cycle~~ ✓ (live-tested v0.8.0)
-- `getfattr -n user.stratosync.status` works on any file in the mount
+- ~~`getfattr -n user.stratosync.status` works on any file in the mount~~ ✓ (v0.9.0)
 - ~~3-way text merge resolves clean conflicts automatically (when enabled)~~ ✓ (live-tested v0.8.0)
 
 ---

@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-04-11
+
+### Added
+- **`conflicts resolve` CLI**: four subcommands for resolving conflict files:
+  - `stratosync conflicts keep-local <path>` — upload local version, discard remote conflict
+  - `stratosync conflicts keep-remote <path>` — download remote version, discard local
+  - `stratosync conflicts merge <path>` — attempt 3-way merge using base version store
+  - `stratosync conflicts diff <path>` — show unified diff between local and remote
+- **Desktop notifications for upload failures**: `notify-send` alerts when uploads
+  fail fatally, in addition to existing conflict notifications.
+- **xattr sync status**: read-only extended attributes on every FUSE-mounted file:
+  - `user.stratosync.status` — current sync state (remote, cached, dirty, uploading, conflict)
+  - `user.stratosync.etag` — remote version identifier
+  - `user.stratosync.remote_path` — path on the remote backend
+  - `setxattr`/`removexattr` return `ENOTSUP` (read-only).
+- **`stratosync-core::merge` module**: extracted `MergeOutcome`, `try_three_way_merge()`,
+  and `git_available()` from the daemon into core for CLI reuse.
+- **Shared notification module** (`sync::notification`): extracted from conflict.rs
+  for reuse across upload queue and conflict resolver.
+- AWS S3 setup script (`scripts/setup-aws-s3.sh`) for bucket, IAM, rclone,
+  and stratosync config in one step.
+
+### Changed
+- **Phase 3 complete**: all planned Phase 3 deliverables are now implemented.
+
 ## [0.8.0] - 2026-04-10
 
 ### Added

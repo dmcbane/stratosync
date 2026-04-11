@@ -169,16 +169,25 @@ Directory-level conflicts (e.g., same directory deleted remotely while files wer
 
 ---
 
-## Conflict Resolution UX (Future)
+## Conflict Resolution CLI
 
-The `stratosync conflicts` CLI command will list all conflict files:
+The `stratosync conflicts` command lists all conflict files, and four subcommands resolve them:
 
 ```
 $ stratosync conflicts
-CONFLICT  ~/GoogleDrive/Documents/report.conflict.20250315T142301Z.a3f2e1b9.pdf
-          Base: report.pdf  |  Modified: 2025-03-15 14:23:01 UTC  |  Size: 12 KB
+Mount: gdrive
+────────────────────────────────────────────────────────────
+  CONFLICT  report.pdf
+            inode=42  size=12 KB  modified=2025-03-15 14:23 UTC
+            remote: Documents/report.pdf
 
-$ stratosync conflicts resolve --keep-local ~/GoogleDrive/Documents/report.pdf
-$ stratosync conflicts resolve --keep-remote ~/GoogleDrive/Documents/report.pdf
-$ stratosync conflicts resolve --open-diff ~/GoogleDrive/Documents/report.pdf
+$ stratosync conflicts keep-local  ~/GoogleDrive/Documents/report.pdf
+$ stratosync conflicts keep-remote ~/GoogleDrive/Documents/report.pdf
+$ stratosync conflicts merge       ~/GoogleDrive/Documents/report.pdf
+$ stratosync conflicts diff        ~/GoogleDrive/Documents/report.pdf
 ```
+
+- **keep-local**: uploads the local cached version, deletes the `.conflict.*` sibling
+- **keep-remote**: downloads the remote version, deletes the `.conflict.*` sibling
+- **merge**: attempts 3-way merge via `git merge-file` using the base version store; on conflict markers, writes them to the file for manual editing
+- **diff**: shows a unified diff between local and remote versions

@@ -106,7 +106,7 @@ The **upload model**: writes go to the local cache file immediately. A debounced
 
 - [x] Phase 1: Read-only VFS (lookup, getattr, readdir, open, read)
 - [x] Phase 2: Bidirectional sync (write, create, mkdir, unlink, rmdir, rename, fsync, upload queue, conflict resolver, LRU cache, inotify watcher, remote poller)
-- [ ] Phase 3: Delta API support (GDrive pageToken, OneDrive deltaLink)
+- [x] Phase 3: Conflict resolution & safety (3-way merge, delta APIs, conflicts CLI, desktop notifications, xattr sync status)
 - [ ] Phase 4: rclone serve WebDAV sidecar, partial hydration, desktop integration
 - [ ] Phase 5: Selective sync, bandwidth scheduling, Prometheus metrics
 

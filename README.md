@@ -35,7 +35,7 @@ Linux has excellent cloud sync tools, but none that provide all three: **on-dema
 
 ## Status
 
-🚧 **Pre-alpha (v0.6.1)** — Phase 1 (read-only VFS) and Phase 2 (bidirectional sync) are implemented and tested with Google Drive. The daemon mounts, lists, reads, writes, renames, and deletes files. Conflict resolution, LRU cache eviction, and inotify-based change detection are functional. See the [CHANGELOG](CHANGELOG.md) for details.
+🚧 **Pre-alpha (v0.9.0)** — Phases 1-3 complete. The daemon mounts, lists, reads, writes, renames, and deletes files with automatic conflict resolution (including 3-way text merge), LRU cache eviction, inotify-based local change detection, and delta polling for Google Drive and OneDrive. The CLI provides conflict resolution commands (`keep-local`, `keep-remote`, `merge`, `diff`). Extended attributes expose per-file sync status. See the [CHANGELOG](CHANGELOG.md) for details.
 
 ## Prerequisites
 
@@ -166,7 +166,7 @@ stratosync conflicts        # list files with sync conflicts
 - **Automatic upload**: when you write to a file, changes are saved to the local cache immediately and uploaded to the cloud in the background after a short debounce window (default 2 seconds). `fsync()` triggers an immediate upload.
 - **Conflict resolution**: if you and someone else edit the same file, the remote version wins the canonical path and your local version is saved as `filename.conflict.20260403T120000Z.a1b2c3d4.ext`.
 - **Cache management**: the local cache is bounded by `cache_quota`. When the cache fills up, least-recently-used files are evicted (their data is deleted locally but remains in the cloud). Pinned files are never evicted.
-- **Change detection**: an inotify watcher detects local changes; a polling loop detects remote changes. Future versions will support provider delta APIs for faster detection.
+- **Change detection**: an inotify watcher detects local changes; a polling loop detects remote changes. Google Drive and OneDrive use delta APIs (change tokens) for efficient incremental polling; other backends use full directory listing.
 
 ### Configuration reference
 
