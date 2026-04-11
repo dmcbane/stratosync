@@ -35,7 +35,7 @@ Linux has excellent cloud sync tools, but none that provide all three: **on-dema
 
 ## Status
 
-🚧 **Pre-alpha (v0.9.0)** — Phases 1-3 complete. The daemon mounts, lists, reads, writes, renames, and deletes files with automatic conflict resolution (including 3-way text merge), LRU cache eviction, inotify-based local change detection, and delta polling for Google Drive and OneDrive. The CLI provides conflict resolution commands (`keep-local`, `keep-remote`, `merge`, `diff`). Extended attributes expose per-file sync status. See the [CHANGELOG](CHANGELOG.md) for details.
+🚧 **Pre-alpha (v0.11.0)** — Phases 1-4 complete. On-demand FUSE3 filesystem with bidirectional sync, 3-way merge conflict resolution, delta polling (Google Drive, OneDrive), pin/unpin for offline, range-read fast path, readdir prefetch, Nautilus emblem extension, system tray indicator, WebDAV sidecar backend, and distribution packaging (.deb, .rpm, AUR) for x86_64 and ARM64. See the [CHANGELOG](CHANGELOG.md) for details.
 
 ## Prerequisites
 
