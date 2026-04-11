@@ -35,7 +35,7 @@ code, pre,
 .code-block, .code-block *,
 .arch-diagram, .arch-diagram *,
 .tree-block, .tree-block * {
-  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, Consolas, monospace !important;
 }
 
 /* ── Nav ──────────────────────────────────────────────────────────────── */
@@ -104,8 +104,7 @@ code, pre,
   background: var(--bg-code); border: 1px solid var(--border); border-radius: 10px;
   padding: 1.25rem 1.5rem; font-size: .85rem;
 }
-.tree-block pre { font-family: inherit; color: var(--text-dim); white-space: pre; overflow-x: auto; }
-.tree-block span { font-family: inherit; }
+.tree-block pre { color: var(--text-dim); white-space: pre; overflow-x: auto; }
 .tree-block .hl { color: var(--green); }
 .tree-block .dim { color: var(--text-dim); }
 .tree-block .file { color: var(--text); }
@@ -152,8 +151,7 @@ tbody tr:hover { background: var(--bg-card); }
   background: var(--bg-code); border: 1px solid var(--border); border-radius: 10px;
   padding: 1.25rem 1.5rem; overflow-x: auto; margin-bottom: 1.5rem;
 }
-.code-block pre { font-family: inherit; font-size: .82rem; line-height: 1.7; color: var(--text); }
-.code-block span { font-family: inherit; }
+.code-block pre { font-size: .82rem; line-height: 1.7; color: var(--text); }
 .code-block .comment { color: var(--text-dim); }
 .code-block .cmd { color: var(--green); }
 .code-block .flag { color: var(--orange); }
@@ -169,13 +167,9 @@ tbody tr:hover { background: var(--bg-card); }
   padding: 1.5rem; overflow-x: auto; margin: 1.5rem 0;
 }
 .arch-diagram pre {
-  font-family: inherit; font-size: .78rem; line-height: 1.6; color: var(--text-dim);
+  font-size: .78rem; line-height: 1.6; color: var(--text-dim);
   white-space: pre; min-width: 520px;
 }
-.arch-diagram span,
-.arch-diagram .layer,
-.arch-diagram .component,
-.arch-diagram .note { font-family: inherit; }
 .arch-diagram .layer { color: var(--accent); }
 .arch-diagram .component { color: var(--heading); }
 .arch-diagram .note { color: var(--green); }
