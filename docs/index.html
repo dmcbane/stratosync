@@ -16,6 +16,7 @@
     <div class="nav-logo">strato<span>sync</span></div>
     <ul class="nav-links">
       <li><a href="#features">Features</a></li>
+      <li><a href="#prerequisites">Prerequisites</a></li>
       <li><a href="#quickstart">Quick Start</a></li>
       <li><a href="#architecture">Architecture</a></li>
       <li><a href="#roadmap">Roadmap</a></li>
@@ -108,6 +109,29 @@
       <span class="icon">&#128736;</span>
       <h3>Native filesystem</h3>
       <p>FUSE3 mount works with every tool: <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code>, your IDE, your file manager. No special client needed.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Prerequisites -->
+<section id="prerequisites">
+  <h2 class="section-title">Prerequisites</h2>
+  <div class="features" style="grid-template-columns: repeat(4, 1fr);">
+    <div class="feature-card" style="text-align:center;">
+      <h3>Linux</h3>
+      <p>with FUSE3 support</p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>Rust 1.80+</h3>
+      <p><code>rustup update stable</code></p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>rclone</h3>
+      <p><a href="https://rclone.org/install/">rclone.org/install</a></p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>libfuse3-dev</h3>
+      <p><code>apt install libfuse3-dev</code></p>
     </div>
   </div>
 </section>
@@ -321,7 +345,7 @@
     <div class="phase">
       <span class="phase-badge done">Done</span>
       <h3>Phase 3: Conflict Resolution & Safety</h3>
-      <p>3-way text merge via <code>git merge-file</code>. Content-hash ETag detection. Delta APIs for Google Drive and OneDrive. Base version store. Desktop notifications. <em>Remaining: xattr sync status, <code>conflicts resolve</code> CLI.</em></p>
+      <p>3-way text merge via <code>git merge-file</code>. Content-hash ETag detection. Delta APIs for Google Drive and OneDrive. Base version store. Desktop notifications. xattr sync status. <code>conflicts resolve</code> CLI (keep-local, keep-remote, merge, diff).</p>
     </div>
     <div class="phase">
       <span class="phase-badge current">Next</span>
@@ -332,29 +356,6 @@
       <span class="phase-badge planned">Planned</span>
       <h3>Phase 5: Advanced Features</h3>
       <p>Selective sync with ignore patterns. File versioning. Bandwidth scheduling. Prometheus metrics. Encrypted cache.</p>
-    </div>
-  </div>
-</section>
-
-<!-- Prerequisites -->
-<section>
-  <h2 class="section-title">Prerequisites</h2>
-  <div class="features" style="grid-template-columns: repeat(4, 1fr);">
-    <div class="feature-card" style="text-align:center;">
-      <h3>Linux</h3>
-      <p>with FUSE3 support</p>
-    </div>
-    <div class="feature-card" style="text-align:center;">
-      <h3>Rust 1.80+</h3>
-      <p><code>rustup update stable</code></p>
-    </div>
-    <div class="feature-card" style="text-align:center;">
-      <h3>rclone</h3>
-      <p><a href="https://rclone.org/install/">rclone.org/install</a></p>
-    </div>
-    <div class="feature-card" style="text-align:center;">
-      <h3>libfuse3-dev</h3>
-      <p><code>apt install libfuse3-dev</code></p>
     </div>
   </div>
 </section>
