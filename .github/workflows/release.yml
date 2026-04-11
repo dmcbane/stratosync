@@ -18,15 +18,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
             arch_label: x86_64
-            runner: ubuntu-latest
-            cross: false
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             arch_label: aarch64
-            runner: ubuntu-latest
-            cross: true
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -35,30 +31,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (arm64)
-        if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
-          # Install arm64 libfuse3-dev via multiarch
-          sudo dpkg --add-architecture arm64
-          # Add arm64 package sources
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main universe" | sudo tee /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev:arm64
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Install native dependencies (x86_64)
-        if: "!matrix.cross"
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config dpkg-dev
-
-      - name: Configure cross-compilation environment
-        if: matrix.cross
-        run: |
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+      - name: Install native dependencies (for tests on x86_64)
+        if: matrix.arch == 'amd64'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -69,12 +47,12 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run tests (native only)
-        if: "!matrix.cross"
+      - name: Run tests (native x86_64 only)
+        if: matrix.arch == 'amd64'
         run: cargo test --workspace
 
       - name: Build release binaries
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        run: cross build --release --workspace --target ${{ matrix.target }}
 
       - name: Extract version
         id: version
