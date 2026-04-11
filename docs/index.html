@@ -18,6 +18,7 @@
       <li><a href="#features">Features</a></li>
       <li><a href="#prerequisites">Prerequisites</a></li>
       <li><a href="#quickstart">Quick Start</a></li>
+      <li><a href="#build">Build</a></li>
       <li><a href="#architecture">Architecture</a></li>
       <li><a href="#roadmap">Roadmap</a></li>
       <li><a href="https://github.com/dmcbane/stratosync">GitHub</a></li>
@@ -116,22 +117,18 @@
 <!-- Prerequisites -->
 <section id="prerequisites">
   <h2 class="section-title">Prerequisites</h2>
-  <div class="features" style="grid-template-columns: repeat(4, 1fr);">
+  <div class="features" style="grid-template-columns: repeat(3, 1fr);">
     <div class="feature-card" style="text-align:center;">
       <h3>Linux</h3>
-      <p>with FUSE3 support</p>
+      <p>x86_64 or ARM64<br>with FUSE3 support</p>
     </div>
     <div class="feature-card" style="text-align:center;">
-      <h3>Rust 1.80+</h3>
-      <p><code>rustup update stable</code></p>
+      <h3>FUSE3</h3>
+      <p><code>apt install fuse3</code><br>or <code>dnf install fuse3</code></p>
     </div>
     <div class="feature-card" style="text-align:center;">
       <h3>rclone</h3>
       <p><a href="https://rclone.org/install/">rclone.org/install</a></p>
-    </div>
-    <div class="feature-card" style="text-align:center;">
-      <h3>libfuse3-dev</h3>
-      <p><code>apt install libfuse3-dev</code></p>
     </div>
   </div>
 </section>
@@ -149,10 +146,24 @@
 
   <p class="code-label">2. Install stratosync</p>
   <div class="code-block">
-<pre><span class="cmd">git clone</span> <span class="str">https://github.com/dmcbane/stratosync</span>
-<span class="cmd">cd</span> stratosync
-<span class="cmd">./install.sh</span>                       <span class="comment"># builds, installs to ~/.local/bin, enables systemd service</span></pre>
+<pre><span class="comment"># Debian / Ubuntu</span>
+<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync_0.11.0_amd64.deb</span>
+<span class="cmd">sudo dpkg</span> <span class="flag">-i</span> stratosync_0.11.0_amd64.deb
+
+<span class="comment"># Fedora / RHEL</span>
+<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync-0.11.0-1.x86_64.rpm</span>
+<span class="cmd">sudo dnf install</span> ./stratosync-0.11.0-1.x86_64.rpm
+
+<span class="comment"># Arch (AUR)</span>
+<span class="cmd">yay</span> <span class="flag">-S</span> stratosync-git
+
+<span class="comment"># Any distro (tarball)</span>
+<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync-0.11.0-linux-x86_64.tar.gz</span>
+<span class="cmd">tar xzf</span> stratosync-0.11.0-linux-x86_64.tar.gz
+<span class="cmd">sudo cp</span> stratosync-0.11.0-linux-x86_64/stratosync* <span class="str">/usr/local/bin/</span></pre>
   </div>
+  <p style="margin-top:0.5em;color:#888;font-size:0.9em;">ARM64 packages also available &mdash; replace <code>amd64</code>/<code>x86_64</code> with <code>arm64</code>/<code>aarch64</code>.
+    See all downloads on the <a href="https://github.com/dmcbane/stratosync/releases/latest">releases page</a>.</p>
 
   <p class="code-label">3. Configure a mount</p>
   <div class="code-block">
@@ -173,6 +184,37 @@
   <div class="code-block">
 <pre><span class="cmd">systemctl</span> <span class="flag">--user</span> start stratosyncd
 <span class="cmd">ls</span> ~/GoogleDrive/                  <span class="comment"># your cloud files are here</span></pre>
+  </div>
+</section>
+
+<!-- Build from Source -->
+<section id="build">
+  <h2 class="section-title">Build from Source</h2>
+  <p class="section-sub">For development or if prebuilt packages aren't available for your platform.</p>
+
+  <div class="features" style="grid-template-columns: repeat(4, 1fr); margin-bottom: 1.5em;">
+    <div class="feature-card" style="text-align:center;">
+      <h3>Rust 1.80+</h3>
+      <p><code>rustup update stable</code></p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>libfuse3-dev</h3>
+      <p><code>apt install libfuse3-dev</code></p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>pkg-config</h3>
+      <p><code>apt install pkg-config</code></p>
+    </div>
+    <div class="feature-card" style="text-align:center;">
+      <h3>rclone</h3>
+      <p><a href="https://rclone.org/install/">rclone.org/install</a></p>
+    </div>
+  </div>
+
+  <div class="code-block">
+<pre><span class="cmd">git clone</span> <span class="str">https://github.com/dmcbane/stratosync</span>
+<span class="cmd">cd</span> stratosync
+<span class="cmd">./install.sh</span>                       <span class="comment"># builds, installs to ~/.local/bin, enables systemd service</span></pre>
   </div>
 </section>
 
