@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config dpkg-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      # ── Package: tarball ──
+      - name: Create tarball
+        run: |
+          DIST="stratosync-${{ steps.version.outputs.version }}-linux-x86_64"
+          mkdir -p "$DIST"
+          cp target/release/stratosyncd "$DIST/"
+          cp target/release/stratosync "$DIST/"
+          cp target/release/stratosync-tray "$DIST/" 2>/dev/null || true
+          cp contrib/systemd/stratosyncd.service "$DIST/"
+          cp contrib/nautilus/stratosync_nautilus.py "$DIST/"
+          cp contrib/desktop/stratosync-tray.desktop "$DIST/"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$DIST/"
+          tar czf "$DIST.tar.gz" "$DIST"
+
+      # ── Package: .deb ──
+      - name: Build .deb package
+        run: |
+          mkdir -p deb-root/usr/bin
+          mkdir -p deb-root/usr/lib/systemd/user
+          mkdir -p deb-root/usr/share/nautilus-python/extensions
+          mkdir -p deb-root/usr/share/applications
+          mkdir -p deb-root/DEBIAN
+
+          cp target/release/stratosyncd deb-root/usr/bin/
+          cp target/release/stratosync deb-root/usr/bin/
+          cp target/release/stratosync-tray deb-root/usr/bin/ 2>/dev/null || true
+          cp contrib/systemd/stratosyncd.service deb-root/usr/lib/systemd/user/
+          cp contrib/nautilus/stratosync_nautilus.py deb-root/usr/share/nautilus-python/extensions/
+          cp contrib/desktop/stratosync-tray.desktop deb-root/usr/share/applications/ 2>/dev/null || true
+
+          cat > deb-root/DEBIAN/control << 'CTRL'
+          Package: stratosync
+          Version: ${{ steps.version.outputs.version }}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libfuse3-3, fuse3, rclone
+          Recommends: python3-nautilus
+          Maintainer: Dale McBane <noreply@example.com>
+          Description: Linux cloud sync daemon with on-demand FUSE3 filesystem
+           Stratosync provides a FUSE3 virtual filesystem backed by rclone,
+           supporting 70+ cloud storage providers with on-demand hydration,
+           automatic upload, and conflict-safe bidirectional sync.
+          CTRL
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' deb-root/DEBIAN/control
+
+          dpkg-deb --build deb-root "stratosync_${{ steps.version.outputs.version }}_amd64.deb"
+
+      # ── Package: .rpm (spec only — no rpmbuild in CI) ──
+      # RPM is built by users via the spec file or COPR
+
+      # ── GitHub Release ──
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            stratosync-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+            stratosync_${{ steps.version.outputs.version }}_amd64.deb
