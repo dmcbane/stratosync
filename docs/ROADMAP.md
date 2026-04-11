@@ -66,13 +66,13 @@ Acceptance criteria:
 **Goal**: Fast enough for daily use; desktop integration.
 
 Deliverables:
-- `rclone serve webdav` sidecar for low-latency transfers
+- ~~`rclone serve webdav` sidecar for low-latency transfers~~ ✓ (v0.11.0)
 - ~~Partial/range hydration for large files (`download_range` via `rclone cat --offset/--count`)~~ ✓ (v0.10.0)
 - ~~Prefetch heuristics (readdir → prefetch small files under configurable threshold)~~ ✓ (v0.10.0)
 - ~~`stratosync pin` / `stratosync unpin` for offline availability~~ ✓ (v0.10.0)
-- GNOME/Nautilus emblem extension (status overlays)
-- Tray indicator (optional, via `ksni` or `tray-icon` crate)
-- Packaging: Debian `.deb`, Fedora `.rpm`, Arch AUR
+- ~~GNOME/Nautilus emblem extension (Python, reads `user.stratosync.status` xattr)~~ ✓ (v0.11.0)
+- ~~Tray indicator (`stratosync-tray` via `ksni` StatusNotifierItem)~~ ✓ (v0.11.0)
+- ~~Packaging: Debian `.deb`, Fedora `.rpm`, Arch AUR~~ ✓ (v0.11.0)
 
 ---
 

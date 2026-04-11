@@ -53,20 +53,22 @@ pub struct DaemonConfig {
     pub log_level: LogLevel,
     pub log_file:  Option<PathBuf>,
     pub pid_file:  Option<PathBuf>,
-    pub socket:    Option<PathBuf>,
-    pub fuse:      FuseConfig,
-    pub sync:      SyncConfig,
+    pub socket:         Option<PathBuf>,
+    pub webdav_sidecar: bool,
+    pub fuse:           FuseConfig,
+    pub sync:           SyncConfig,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            log_level: LogLevel::Info,
-            log_file:  None,
-            pid_file:  None,
-            socket:    None,
-            fuse:      FuseConfig::default(),
-            sync:      SyncConfig::default(),
+            log_level:      LogLevel::Info,
+            log_file:       None,
+            pid_file:       None,
+            socket:         None,
+            webdav_sidecar: false,
+            fuse:           FuseConfig::default(),
+            sync:           SyncConfig::default(),
         }
     }
 }

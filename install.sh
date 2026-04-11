@@ -144,6 +144,21 @@ if [[ "$INSTALL_SERVICE" == "true" ]]; then
     fi
 fi
 
+# ── Nautilus extension ────────────────────────────────────────────────────────
+NAUTILUS_EXT_DIR="${HOME}/.local/share/nautilus-python/extensions"
+NAUTILUS_SRC="${REPO_DIR}/contrib/nautilus/stratosync_nautilus.py"
+if [[ -f "$NAUTILUS_SRC" ]]; then
+    if command -v nautilus &>/dev/null && python3 -c "import gi; gi.require_version('Nautilus','4.0')" 2>/dev/null || \
+       python3 -c "import gi; gi.require_version('Nautilus','3.0')" 2>/dev/null; then
+        mkdir -p "${NAUTILUS_EXT_DIR}"
+        cp "$NAUTILUS_SRC" "${NAUTILUS_EXT_DIR}/"
+        echo "✓ Nautilus extension installed (restart Nautilus: nautilus -q)"
+    else
+        echo "  Nautilus extension available but python3-nautilus not found — skipping"
+        echo "  Install python3-nautilus and re-run to enable file manager emblems"
+    fi
+fi
+
 # ── Fuse configuration ────────────────────────────────────────────────────────
 FUSE_CONF="/etc/fuse.conf"
 if [[ -f "$FUSE_CONF" ]] && ! grep -q "^user_allow_other" "$FUSE_CONF"; then

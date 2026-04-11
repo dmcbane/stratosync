@@ -1,0 +1,6 @@
+stratosync (0.11.0-1) unstable; urgency=medium
+
+  * Phase 4 complete: WebDAV sidecar, Nautilus extension, tray indicator,
+    pin/unpin, range hydration, readdir prefetch.
+
+ -- Dale McBane <noreply@example.com>  Fri, 11 Apr 2026 12:00:00 -0400

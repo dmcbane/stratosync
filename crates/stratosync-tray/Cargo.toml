@@ -1,0 +1,22 @@
+[package]
+name        = "stratosync-tray"
+description = "stratosync system tray indicator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stratosync-tray"
+path = "src/main.rs"
+
+[dependencies]
+stratosync-core = { path = "../stratosync-core" }
+ksni             = { version = "0.3", features = ["blocking"] }
+tokio.workspace  = true
+rusqlite.workspace = true
+dirs.workspace   = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+bytesize.workspace = true
+toml.workspace     = true

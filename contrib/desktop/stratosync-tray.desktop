@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Stratosync Tray
+Comment=System tray indicator for stratosync cloud sync
+Exec=stratosync-tray
+Icon=folder-cloud
+Terminal=false
+Categories=Utility;System;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

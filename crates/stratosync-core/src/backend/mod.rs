@@ -3,6 +3,7 @@
 /// See docs/architecture/05-backend.md for design rationale.
 pub(crate) mod delta;
 pub(crate) mod rclone_config;
+pub mod webdav;
 
 use std::path::Path;
 use std::time::Duration;
@@ -155,6 +156,11 @@ pub struct RcloneBackend {
 }
 
 impl RcloneBackend {
+    /// Locate the rclone binary on $PATH or via $STRATOSYNC_RCLONE.
+    pub fn which_rclone() -> Result<std::path::PathBuf> {
+        which_rclone()
+    }
+
     pub fn new(remote_root: impl Into<String>) -> Result<Self> {
         let remote_root = remote_root.into();
         let rclone_bin = which_rclone()?;

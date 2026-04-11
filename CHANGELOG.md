@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-04-11
+
+### Added
+- **WebDAV sidecar backend**: Optional `rclone serve webdav` subprocess per mount
+  for low-latency HTTP-based transfers instead of spawning rclone per operation.
+  Enable with `[daemon] webdav_sidecar = true`. Implements full Backend trait
+  via HTTP/WebDAV protocol (GET, PUT, PROPFIND, MKCOL, DELETE, MOVE).
+- **Nautilus file manager extension**: Python GObject extension reads
+  `user.stratosync.status` xattr to show sync status emblem overlays
+  (checkmark for cached, sync arrows for uploading, warning for conflicts).
+  Supports Nautilus 3.0 and 4.0.
+- **System tray indicator** (`stratosync-tray`): New workspace crate using
+  `ksni` (StatusNotifierItem). Polls mount databases every 5s, shows per-mount
+  cache usage, syncing count, conflicts, and pinned files. Autostart desktop
+  file included.
+- **Distribution packaging templates**: Debian `.deb` (via debian/), Fedora
+  `.rpm` (spec file), and Arch AUR (PKGBUILD). All include binaries, systemd
+  unit, and Nautilus extension.
+- `RcloneBackend::which_rclone()` public method for locating the rclone binary.
+
+### Changed
+- **Phase 4 complete**: all planned Phase 4 deliverables are now implemented.
+
 ## [0.10.0] - 2026-04-11
 
 ### Added

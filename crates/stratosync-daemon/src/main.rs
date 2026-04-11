@@ -11,6 +11,7 @@ mod config_io;
 mod fuse;
 mod sync;
 mod watcher;
+mod webdav;
 
 use stratosync_core::{
     backend::RcloneBackend,
@@ -36,8 +37,11 @@ async fn main() -> Result<()> {
     let mut fuse_threads = vec![];
     let mut mount_paths = vec![];
     let mut _watchers = vec![]; // must outlive fuse_threads to keep inotify alive
+    let mut sidecars: Vec<webdav::WebDavSidecar> = vec![];
+    let mut mount_id_counter = 0u32;
 
     for mount_cfg in cfg.mounts.iter().filter(|m| m.enabled) {
+        mount_id_counter += 1;
         // Per-mount database — each mount gets its own SQLite file so inodes
         // and file entries are fully isolated.  This prevents the bug where
         // two mounts sharing a single DB would return cross-mount children
@@ -51,10 +55,22 @@ async fn main() -> Result<()> {
         let reset = db.reset_hydrating().await?;
         if reset > 0 { info!(count = reset, mount = %mount_cfg.name, "reset stale hydrations"); }
 
-        let mut rclone_backend = RcloneBackend::new(&mount_cfg.remote)
-            .with_context(|| format!("backend for {:?}", mount_cfg.name))?;
-        rclone_backend.init_delta().await;
-        let backend: Arc<dyn Backend> = Arc::new(rclone_backend);
+        let backend: Arc<dyn Backend> = if cfg.daemon.webdav_sidecar {
+            let sidecar = webdav::WebDavSidecar::start(
+                &RcloneBackend::which_rclone()?,
+                &mount_cfg.remote,
+                mount_id_counter,
+            ).await.with_context(|| format!("WebDAV sidecar for {:?}", mount_cfg.name))?;
+            sidecars.push(sidecar);
+            Arc::new(stratosync_core::WebDavBackend::new(
+                sidecars.last().unwrap().base_url(),
+            ))
+        } else {
+            let mut rclone_backend = RcloneBackend::new(&mount_cfg.remote)
+                .with_context(|| format!("backend for {:?}", mount_cfg.name))?;
+            rclone_backend.init_delta().await;
+            Arc::new(rclone_backend)
+        };
 
         let mount_id = db.upsert_mount(
             &mount_cfg.name, &mount_cfg.remote,
@@ -176,6 +192,11 @@ async fn main() -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal — unmounting");
+
+    // Stop WebDAV sidecars
+    for mut sidecar in sidecars {
+        sidecar.stop().await;
+    }
     for path in &mount_paths {
         info!(path = %path.display(), "unmounting");
         // fusermount3 for FUSE3, fusermount for FUSE2, umount as fallback

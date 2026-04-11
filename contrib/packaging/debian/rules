@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release
+
+override_dh_auto_install:
+	install -Dm755 target/release/stratosyncd $(CURDIR)/debian/stratosync/usr/bin/stratosyncd
+	install -Dm755 target/release/stratosync $(CURDIR)/debian/stratosync/usr/bin/stratosync
+	install -Dm644 contrib/systemd/stratosyncd.service $(CURDIR)/debian/stratosync/usr/lib/systemd/user/stratosyncd.service
+	install -Dm644 contrib/nautilus/stratosync_nautilus.py $(CURDIR)/debian/stratosync/usr/share/nautilus-python/extensions/stratosync_nautilus.py
+
+override_dh_auto_test:
+	cargo test --workspace

@@ -1,0 +1,43 @@
+# Maintainer: Dale McBane <noreply@example.com>
+pkgname=stratosync-git
+pkgver=0.11.0
+pkgrel=1
+pkgdesc="Linux cloud sync daemon with on-demand FUSE3 filesystem"
+arch=('x86_64')
+url="https://github.com/dmcbane/stratosync"
+license=('MIT' 'Apache-2.0')
+depends=('fuse3' 'rclone')
+makedepends=('rust' 'cargo' 'git')
+optdepends=(
+    'python-nautilus: Nautilus file manager sync status emblems'
+    'libappindicator-gtk3: system tray indicator support'
+)
+provides=('stratosync')
+conflicts=('stratosync')
+source=("git+https://github.com/dmcbane/stratosync.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd stratosync
+    git describe --long --tags 2>/dev/null | sed 's/^v//;s/-/.r/;s/-/./' || echo "$pkgver"
+}
+
+build() {
+    cd stratosync
+    cargo build --release
+}
+
+check() {
+    cd stratosync
+    cargo test --workspace
+}
+
+package() {
+    cd stratosync
+    install -Dm755 target/release/stratosyncd "$pkgdir/usr/bin/stratosyncd"
+    install -Dm755 target/release/stratosync "$pkgdir/usr/bin/stratosync"
+    install -Dm644 contrib/systemd/stratosyncd.service "$pkgdir/usr/lib/systemd/user/stratosyncd.service"
+    install -Dm644 contrib/nautilus/stratosync_nautilus.py "$pkgdir/usr/share/nautilus-python/extensions/stratosync_nautilus.py"
+    install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}
