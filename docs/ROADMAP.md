@@ -67,9 +67,9 @@ Acceptance criteria:
 
 Deliverables:
 - `rclone serve webdav` sidecar for low-latency transfers
-- Partial/range hydration for large files
-- Prefetch heuristics (open dir → prefetch small files)
-- `stratosync pin` / `stratosync unpin`
+- ~~Partial/range hydration for large files (`download_range` via `rclone cat --offset/--count`)~~ ✓ (v0.10.0)
+- ~~Prefetch heuristics (readdir → prefetch small files under configurable threshold)~~ ✓ (v0.10.0)
+- ~~`stratosync pin` / `stratosync unpin` for offline availability~~ ✓ (v0.10.0)
 - GNOME/Nautilus emblem extension (status overlays)
 - Tray indicator (optional, via `ksni` or `tray-icon` crate)
 - Packaging: Debian `.deb`, Fedora `.rpm`, Arch AUR

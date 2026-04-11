@@ -244,6 +244,9 @@ pub enum SyncError {
     #[error("change token expired or invalidated")]
     TokenExpired,
 
+    #[error("operation not supported")]
+    NotSupported,
+
     #[error("backend fatal: {0}")]
     Fatal(String),
 

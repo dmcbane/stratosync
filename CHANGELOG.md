@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-04-11
+
+### Added
+- **Pin/unpin for offline availability**: `stratosync pin <path>` downloads and pins
+  files so they survive cache eviction. Supports recursive directory pinning.
+  `stratosync unpin <path>` releases the pin. `stratosync status` shows pinned count.
+- **Background hydration with range-read fast path**: `read()` on a file that's still
+  downloading now uses `rclone cat --offset/--count` to serve the requested bytes
+  immediately while the full download continues in the background. Falls back to
+  blocking wait for backends that don't support range requests.
+- **`download_range()` Backend trait method**: New `download_range(remote, offset, len)`
+  with default `NotSupported` fallback. Implemented for RcloneBackend and MockBackend.
+- **`SyncError::NotSupported` variant** for graceful feature detection.
+- **Readdir small-file prefetch**: When a directory is listed for the first time,
+  files under `prefetch_threshold` (default 1 MB) are hydrated in the background.
+  Configurable via `[daemon.sync] prefetch_threshold = "1 MB"` (set to "0" to disable).
+- **StateDb pinning methods**: `set_pinned()`, `is_pinned()`, `pinned_count()`,
+  `list_file_descendants()`.
+
 ## [0.9.0] - 2026-04-11
 
 ### Added

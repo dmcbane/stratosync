@@ -124,6 +124,7 @@ pub struct SyncConfig {
     pub base_retention_days:       u32,
     pub base_max_file_size:        String,
     pub text_extensions:           Vec<String>,
+    pub prefetch_threshold:        String,
 }
 
 impl Default for SyncConfig {
@@ -138,6 +139,7 @@ impl Default for SyncConfig {
             base_max_file_size:        "10 MB".into(),
             text_extensions:           crate::base_store::DEFAULT_TEXT_EXTENSIONS
                                            .iter().map(|s| (*s).to_string()).collect(),
+            prefetch_threshold:        "1 MB".into(),
         }
     }
 }
@@ -146,6 +148,10 @@ impl SyncConfig {
     pub fn upload_debounce(&self)       -> Duration { Duration::from_millis(self.upload_debounce_ms)       }
     pub fn upload_close_debounce(&self) -> Duration { Duration::from_millis(self.upload_close_debounce_ms) }
     pub fn base_max_file_size_bytes(&self) -> anyhow::Result<u64> { parse_size(&self.base_max_file_size) }
+    /// Returns the prefetch size threshold in bytes, or 0 if disabled.
+    pub fn prefetch_threshold_bytes(&self) -> u64 {
+        parse_size(&self.prefetch_threshold).unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

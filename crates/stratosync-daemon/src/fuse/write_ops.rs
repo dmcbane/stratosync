@@ -165,6 +165,7 @@ pub async fn handle_create(
     open_files.insert(fh, super::OpenFile {
         inode,
         cache_path,
+        remote_path: remote_path.to_owned(),
         flags: libc::O_WRONLY,
         hydrating: false,
     });

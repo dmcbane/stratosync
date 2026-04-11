@@ -33,6 +33,10 @@ pub async fn run(config_path: &Path) -> Result<()> {
             pct,
         );
 
+        let pinned = db.pinned_count(mount_id).await?;
+        if pinned > 0 {
+            println!("    pinned: {} file(s)", pinned);
+        }
         println!("    mount: {}", mount.mount_path.display());
         println!("    remote: {}", mount.remote);
     }

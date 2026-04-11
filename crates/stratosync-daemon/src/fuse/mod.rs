@@ -29,10 +29,11 @@ use stratosync_core::{
 use crate::sync::upload_queue::{UploadQueue, UploadTrigger};
 
 pub struct OpenFile {
-    pub inode:      Inode,
-    pub cache_path: PathBuf,
-    pub flags:      i32,
-    pub hydrating:  bool,
+    pub inode:       Inode,
+    pub cache_path:  PathBuf,
+    pub remote_path: String,
+    pub flags:       i32,
+    pub hydrating:   bool,
 }
 
 // Extended attributes exposed as read-only metadata.
@@ -83,6 +84,7 @@ fn errno(e: &SyncError) -> libc::c_int {
         SyncError::Network(_)          => libc::EHOSTUNREACH,
         SyncError::Transient(_)        => libc::EAGAIN,
         SyncError::Conflict { .. }     => libc::EEXIST,
+        SyncError::NotSupported        => libc::ENOTSUP,
         SyncError::Io(io)              => io.raw_os_error().unwrap_or(libc::EIO),
         _                              => libc::EIO,
     }
@@ -303,6 +305,47 @@ fn spawn_prefetch_child_dirs(
     });
 }
 
+/// Background-prefetch small files after a directory listing.
+/// Files under the configured `prefetch_threshold` are hydrated in the
+/// background so they're cached before the user opens them.
+fn spawn_prefetch_small_files(
+    db: Arc<StateDb>, backend: Arc<dyn Backend>, mid: u32, parent_inode: Inode,
+    cache_dir: PathBuf,
+    waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    base_store: Arc<BaseStore>, sync_config: Arc<SyncConfig>,
+) {
+    let threshold = sync_config.prefetch_threshold_bytes();
+    if threshold == 0 { return; }
+
+    tokio::spawn(async move {
+        let children = db.list_children(mid, parent_inode).await.unwrap_or_default();
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+
+        for child in children {
+            if child.kind != FileKind::File { continue; }
+            if !child.status.needs_hydration() { continue; }
+            if child.size > threshold { continue; }
+
+            let db = Arc::clone(&db);
+            let backend = Arc::clone(&backend);
+            let cache_dir = cache_dir.clone();
+            let waiters = Arc::clone(&waiters);
+            let base_store = Arc::clone(&base_store);
+            let sync_config = Arc::clone(&sync_config);
+            let sem = Arc::clone(&sem);
+
+            tokio::spawn(async move {
+                let Ok(_permit) = sem.acquire().await else { return };
+                if db.set_status(child.inode, SyncStatus::Hydrating).await.is_err() { return; }
+                let _ = do_hydrate(
+                    &db, &backend, &cache_dir, &waiters,
+                    &child, &base_store, &sync_config,
+                ).await;
+            });
+        }
+    });
+}
+
 impl Filesystem for StratoFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
@@ -378,9 +421,20 @@ impl Filesystem for StratoFs {
 
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
+        let (base_store, sync_config, cache_dir) = (
+            Arc::clone(&self.base_store), Arc::clone(&self.sync_config), self.cache_dir.clone(),
+        );
+        let waiters = Arc::clone(&self.hydration_waiters);
         let result = self.rt.block_on(async move {
             let dir = db.get_by_inode(ino).await?.ok_or_else(|| anyhow::anyhow!("inode {ino}"))?;
-            if dir.dir_listed.is_none() { populate_directory(&db, &backend, mid, &dir).await?; }
+            if dir.dir_listed.is_none() {
+                populate_directory(&db, &backend, mid, &dir).await?;
+                // Prefetch small files in the background
+                spawn_prefetch_small_files(
+                    Arc::clone(&db), Arc::clone(&backend), mid, ino,
+                    cache_dir, waiters, base_store, sync_config,
+                );
+            }
             db.list_children(mid, ino).await
         });
         match result {
@@ -451,6 +505,7 @@ impl Filesystem for StratoFs {
             open_files.insert(fh, OpenFile {
                 inode: ino,
                 cache_path,
+                remote_path: entry.remote_path.clone(),
                 flags,
                 hydrating: needs_hydration || is_hydrating,
             });
@@ -467,27 +522,55 @@ impl Filesystem for StratoFs {
         );
         let (base_store, sync_config) = (Arc::clone(&self.base_store), Arc::clone(&self.sync_config));
         let result = self.rt.block_on(async move {
-            // If file is still hydrating, wait for download to complete
-            let (ino, needs_wait) = {
+            let (ino, needs_wait, remote_path) = {
                 let entry = open_files.get(&fh).ok_or_else(|| SyncError::Fatal(format!("bad fh {fh}")))?;
-                (entry.inode, entry.hydrating)
+                (entry.inode, entry.hydrating, entry.remote_path.clone())
             };
+
             if needs_wait {
-                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &base_store, &sync_config).await?;
-                // Update the OpenFile with the actual cache path
-                if let Some(mut entry) = open_files.get_mut(&fh) {
-                    if let Ok(Some(fe)) = db.get_by_inode(entry.inode).await {
-                        if let Some(cp) = fe.cache_path {
-                            entry.cache_path = cp;
+                // Check if full hydration has completed since open()
+                if let Ok(Some(fe)) = db.get_by_inode(ino).await {
+                    if fe.status.has_local_data() && !fe.status.is_hydrating() {
+                        // Full download finished — read from cache
+                        if let Some(mut entry) = open_files.get_mut(&fh) {
+                            if let Some(ref cp) = fe.cache_path { entry.cache_path = cp.clone(); }
+                            entry.hydrating = false;
+                        }
+                        let _ = db.touch_lru(ino).await;
+                        // Fall through to normal cache read below
+                    } else {
+                        // Still hydrating — try range download for this read
+                        match backend.download_range(&remote_path, offset as u64, size as u64).await {
+                            Ok(data) => return Ok(data),
+                            Err(SyncError::NotSupported) => {
+                                // Backend doesn't support ranges — fall back to blocking wait
+                                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &base_store, &sync_config).await?;
+                                if let Some(mut entry) = open_files.get_mut(&fh) {
+                                    if let Ok(Some(fe)) = db.get_by_inode(entry.inode).await {
+                                        if let Some(cp) = fe.cache_path { entry.cache_path = cp; }
+                                    }
+                                    entry.hydrating = false;
+                                }
+                                let _ = db.touch_lru(ino).await;
+                            }
+                            Err(e) => {
+                                // Range download failed — fall back to blocking wait
+                                warn!(ino, "range download failed, waiting for full hydration: {e}");
+                                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &base_store, &sync_config).await?;
+                                if let Some(mut entry) = open_files.get_mut(&fh) {
+                                    if let Ok(Some(fe)) = db.get_by_inode(entry.inode).await {
+                                        if let Some(cp) = fe.cache_path { entry.cache_path = cp; }
+                                    }
+                                    entry.hydrating = false;
+                                }
+                                let _ = db.touch_lru(ino).await;
+                            }
                         }
                     }
-                    entry.hydrating = false;
-                }
-                if let Err(e) = db.touch_lru(ino).await {
-                    warn!(ino, "touch_lru failed: {e}");
                 }
             }
 
+            // Normal read from cache file
             let entry = open_files.get(&fh).ok_or_else(|| SyncError::Fatal(format!("bad fh {fh}")))?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut f = tokio::fs::File::open(&entry.cache_path).await.map_err(SyncError::Io)?;

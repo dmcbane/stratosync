@@ -533,6 +533,62 @@ impl StateDb {
         Ok(rows)
     }
 
+    // ── Pinning ───────────────────────────────────────────────────────────────
+
+    /// Pin a file — prevents LRU eviction.
+    pub async fn set_pinned(&self, inode: Inode, pinned: bool) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let val = if pinned { 1i64 } else { 0 };
+        conn.execute(
+            "INSERT INTO cache_lru (inode, last_access, pinned) VALUES (?1, unixepoch(), ?2)
+             ON CONFLICT(inode) DO UPDATE SET pinned = ?2",
+            params![inode as i64, val],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a file is pinned.
+    pub async fn is_pinned(&self, inode: Inode) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let pinned: i64 = conn.query_row(
+            "SELECT COALESCE(pinned, 0) FROM cache_lru WHERE inode = ?1",
+            params![inode as i64],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        Ok(pinned != 0)
+    }
+
+    /// Count pinned files for a mount.
+    pub async fn pinned_count(&self, mount_id: u32) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM cache_lru l
+             JOIN file_index f ON l.inode = f.inode
+             WHERE f.mount_id = ?1 AND l.pinned = 1",
+            params![mount_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// List all file descendants under a remote path prefix.
+    pub async fn list_file_descendants(
+        &self, mount_id: u32, remote_path_prefix: &str,
+    ) -> Result<Vec<FileEntry>> {
+        let conn = self.conn.lock().await;
+        let pattern = format!("{}%", remote_path_prefix.trim_end_matches('/').to_owned() + "/");
+        let mut stmt = conn.prepare(
+            "SELECT inode, mount_id, parent_inode, name, remote_path, kind,
+                    size, mtime, etag, status, cache_path, cache_size, dir_listed
+             FROM file_index
+             WHERE mount_id = ?1 AND remote_path LIKE ?2 AND kind = 'file'
+             ORDER BY remote_path ASC",
+        )?;
+        let rows = stmt.query_map(params![mount_id, pattern], row_to_entry)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ── Recovery on restart ───────────────────────────────────────────────────
 
     /// Reset all HYDRATING entries back to REMOTE (crash recovery).

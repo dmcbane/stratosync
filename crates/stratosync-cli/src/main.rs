@@ -109,10 +109,10 @@ async fn main() -> Result<()> {
             ConfigAction::Edit => commands::config::edit(&config_path)?,
         },
         Command::Pin { path } => {
-            println!("pin: {} (not yet implemented)", path.display());
+            commands::pin::pin(&config_path, &path).await?;
         }
         Command::Unpin { path } => {
-            println!("unpin: {} (not yet implemented)", path.display());
+            commands::pin::unpin(&config_path, &path).await?;
         }
         Command::Conflicts { action } => match action {
             None => commands::conflicts::list(&config_path).await?,

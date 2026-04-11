@@ -47,6 +47,19 @@ pub trait Backend: Send + Sync + 'static {
     /// The local path must be a full file path (not a directory).
     async fn download(&self, remote: &str, local: &Path) -> Result<(), SyncError>;
 
+    /// Download a byte range of a remote file into memory.
+    /// Returns the bytes `[offset .. offset+len]` (or fewer if past EOF).
+    /// Default returns `NotSupported` — backends that don't support ranges
+    /// fall back to blocking on the full download.
+    async fn download_range(
+        &self,
+        _remote: &str,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<Vec<u8>, SyncError> {
+        Err(SyncError::NotSupported)
+    }
+
     // Mutations ----------------------------------------------------------
 
     /// Upload a local file to a remote path.
@@ -404,6 +417,15 @@ impl Backend for RcloneBackend {
         Ok(())
     }
 
+    async fn download_range(
+        &self, remote: &str, offset: u64, len: u64,
+    ) -> Result<Vec<u8>, SyncError> {
+        let rp = self.rpath(remote);
+        let offset_str = offset.to_string();
+        let count_str = len.to_string();
+        self.run(&["cat", &rp, "--offset", &offset_str, "--count", &count_str]).await
+    }
+
     async fn upload(
         &self,
         local:    &Path,
@@ -655,6 +677,17 @@ pub mod mock {
             tokio::fs::create_dir_all(local.parent().unwrap()).await?;
             tokio::fs::write(local, &data).await?;
             Ok(())
+        }
+
+        async fn download_range(
+            &self, remote: &str, offset: u64, len: u64,
+        ) -> Result<Vec<u8>, SyncError> {
+            let inner = self.inner.lock().unwrap();
+            let (_, data) = inner.files.get(remote)
+                .ok_or_else(|| SyncError::NotFound(remote.to_owned()))?;
+            let start = (offset as usize).min(data.len());
+            let end = ((offset + len) as usize).min(data.len());
+            Ok(data[start..end].to_vec())
         }
 
         async fn upload(

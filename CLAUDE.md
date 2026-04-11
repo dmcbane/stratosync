@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Stratosync is a Linux cloud sync daemon providing on-demand virtual filesystem via FUSE3, with multi-backend support through rclone. Files appear immediately with metadata-only placeholders, hydrate on `open()`, and uploads propagate automatically with conflict detection.
 
-**Status**: Pre-alpha (v0.9.0). Phases 1-3 complete. Phase 3: conflict resolution with 3-way text merge, delta polling (GDrive + OneDrive), content-hash ETag detection, base version store, `conflicts resolve` CLI (keep-local/keep-remote/merge/diff subcommands), desktop notifications for conflicts and upload failures, xattr sync status (`user.stratosync.{status,etag,remote_path}`). Phase 4+ not started.
+**Status**: Pre-alpha (v0.10.0). Phases 1-3 complete, Phase 4 in progress. Phase 4 so far: pin/unpin for offline availability, background hydration with range-read fast path (`download_range` via `rclone cat --offset/--count`), readdir small-file prefetch (configurable threshold). Remaining Phase 4: Nautilus overlays, tray indicator, packaging.
 
 ## Build & Test Commands
 
