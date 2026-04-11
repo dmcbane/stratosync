@@ -31,7 +31,10 @@ body {
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-code, pre, .code-block, .arch-diagram, .tree-block {
+code, pre,
+.code-block, .code-block *,
+.arch-diagram, .arch-diagram *,
+.tree-block, .tree-block * {
   font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
 }
 
