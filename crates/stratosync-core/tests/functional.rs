@@ -1343,3 +1343,36 @@ async fn delta_full_workflow() {
     let c = db.get_by_parent_name(mid, root, "c.txt").await.unwrap();
     assert!(c.is_some(), "c.txt should remain");
 }
+
+#[tokio::test]
+async fn batch_mark_dirs_listed_sets_all_directories() {
+    let (db, mid, root) = setup().await;
+
+    // Create a directory tree: root -> docs -> drafts
+    let docs = insert_dir(&db, mid, root, "Documents", "Documents").await;
+    let drafts = insert_dir(&db, mid, docs, "drafts", "Documents/drafts").await;
+
+    // Verify none are marked as listed yet (root was just created)
+    let root_entry = db.get_by_inode(root).await.unwrap().unwrap();
+    assert!(root_entry.dir_listed.is_none(), "root should not be listed yet");
+    let docs_entry = db.get_by_inode(docs).await.unwrap().unwrap();
+    assert!(docs_entry.dir_listed.is_none(), "docs should not be listed yet");
+    let drafts_entry = db.get_by_inode(drafts).await.unwrap().unwrap();
+    assert!(drafts_entry.dir_listed.is_none(), "drafts should not be listed yet");
+
+    // Batch mark all dirs as listed
+    let count = db.batch_mark_dirs_listed(mid).await.unwrap();
+    assert_eq!(count, 3, "should mark root + docs + drafts");
+
+    // Verify all are now marked
+    let root_entry = db.get_by_inode(root).await.unwrap().unwrap();
+    assert!(root_entry.dir_listed.is_some(), "root should be listed");
+    let docs_entry = db.get_by_inode(docs).await.unwrap().unwrap();
+    assert!(docs_entry.dir_listed.is_some(), "docs should be listed");
+    let drafts_entry = db.get_by_inode(drafts).await.unwrap().unwrap();
+    assert!(drafts_entry.dir_listed.is_some(), "drafts should be listed");
+
+    // Calling again should mark 0 (idempotent)
+    let count2 = db.batch_mark_dirs_listed(mid).await.unwrap();
+    assert_eq!(count2, 0, "no directories should need marking on second call");
+}

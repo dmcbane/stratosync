@@ -19,7 +19,7 @@ use stratosync_core::{
     config::{ConflictStrategy, SyncConfig},
     merge::{MergeOutcome, try_three_way_merge},
     state::StateDb,
-    types::{FileEntry, FileKind, SyncStatus},
+    types::{FileEntry, FileKind, SyncStatus, CONFLICT_PREFIX},
 };
 use stratosync_core::state::NewFileEntry;
 
@@ -151,7 +151,7 @@ pub async fn resolve(
 
     // ── 1. Build conflict filename ────────────────────────────────────────────
     let conflict_name = make_conflict_name(&entry.name, &cache_path);
-    let conflict_remote = sibling_path(&entry.remote_path, &conflict_name);
+    let conflict_remote = conflict_remote_path(&entry.remote_path, &conflict_name);
 
     info!(
         inode = entry.inode,
@@ -221,7 +221,7 @@ pub async fn resolve(
         size:        conflict_size,
         mtime:       std::time::SystemTime::now(),
         etag:        conflict_etag,
-        status:      SyncStatus::Cached,
+        status:      SyncStatus::Conflict,
         cache_path:  None,   // conflict file lives remotely; not pinned locally
         cache_size:  None,
     }).await?;
@@ -303,6 +303,23 @@ fn sibling_path(remote_path: &str, new_name: &str) -> String {
     match remote_path.rfind('/') {
         Some(idx) => format!("{}/{}", &remote_path[..idx], new_name),
         None      => new_name.to_owned(),
+    }
+}
+
+/// Build the remote path for a conflict file under the `.stratosync-conflicts/`
+/// namespace, preserving the original directory structure.
+///
+/// `conflict_remote_path("Documents/report.pdf", "report.conflict.…pdf")`
+/// → `".stratosync-conflicts/Documents/report.conflict.…pdf"`
+fn conflict_remote_path(remote_path: &str, conflict_name: &str) -> String {
+    let parent = match remote_path.rfind('/') {
+        Some(idx) => &remote_path[..idx],
+        None      => "",
+    };
+    if parent.is_empty() {
+        format!("{CONFLICT_PREFIX}{conflict_name}")
+    } else {
+        format!("{CONFLICT_PREFIX}{parent}/{conflict_name}")
     }
 }
 
@@ -397,6 +414,30 @@ mod tests {
     #[test]
     fn sibling_path_no_parent() {
         assert_eq!(sibling_path("report.pdf", "report.conflict.pdf"), "report.conflict.pdf");
+    }
+
+    #[test]
+    fn conflict_remote_path_with_parent() {
+        assert_eq!(
+            conflict_remote_path("Documents/report.pdf", "report.conflict.20250315T142301Z.a3f2e1b9.pdf"),
+            ".stratosync-conflicts/Documents/report.conflict.20250315T142301Z.a3f2e1b9.pdf"
+        );
+    }
+
+    #[test]
+    fn conflict_remote_path_no_parent() {
+        assert_eq!(
+            conflict_remote_path("report.pdf", "report.conflict.20250315T142301Z.a3f2e1b9.pdf"),
+            ".stratosync-conflicts/report.conflict.20250315T142301Z.a3f2e1b9.pdf"
+        );
+    }
+
+    #[test]
+    fn conflict_remote_path_nested() {
+        assert_eq!(
+            conflict_remote_path("a/b/c/file.txt", "file.conflict.20250315T142301Z.a3f2e1b9.txt"),
+            ".stratosync-conflicts/a/b/c/file.conflict.20250315T142301Z.a3f2e1b9.txt"
+        );
     }
 
     // ── End-to-end resolve() tests with MockBackend ─────────────────────
@@ -565,13 +606,17 @@ mod tests {
         let canonical = std::fs::read_to_string(&cache_path).unwrap();
         assert_eq!(canonical, "remote version");
 
-        // A conflict sibling should exist in the DB
+        // A conflict sibling should exist in the DB with Conflict status
         let children = db.list_children(mount_id, FUSE_ROOT_INODE).await.unwrap();
         let conflict_entries: Vec<_> = children.iter()
             .filter(|e| e.name.contains("conflict"))
             .collect();
         assert_eq!(conflict_entries.len(), 1, "should have one conflict file");
         assert!(conflict_entries[0].name.starts_with("doc.conflict."));
+        assert_eq!(conflict_entries[0].status, SyncStatus::Conflict);
+        assert!(conflict_entries[0].remote_path.starts_with(".stratosync-conflicts/"),
+            "conflict file should be under .stratosync-conflicts/ prefix: {}",
+            conflict_entries[0].remote_path);
     }
 
     #[tokio::test]

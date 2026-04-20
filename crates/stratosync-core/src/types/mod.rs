@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 pub type Inode = u64;
 pub const FUSE_ROOT_INODE: Inode = 1;
 
+/// Remote path prefix where conflict files are stored, keeping them
+/// out of the user-visible namespace on the cloud backend.
+pub const CONFLICT_PREFIX: &str = ".stratosync-conflicts/";
+
 // ── File kind ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

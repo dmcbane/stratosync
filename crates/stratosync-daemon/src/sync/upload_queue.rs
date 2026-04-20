@@ -239,6 +239,13 @@ async fn run_upload(
         .map_err(|e| SyncError::Fatal(e.to_string()))?
         .ok_or_else(|| SyncError::NotFound(format!("inode {inode}")))?;
 
+    // Skip conflict files — they are stored under .stratosync-conflicts/
+    // and must not be re-uploaded through the normal upload path.
+    if entry.status == SyncStatus::Conflict {
+        debug!(inode, "skipping upload of conflict file");
+        return Ok(());
+    }
+
     let cache_path = entry.cache_path
         .ok_or_else(|| SyncError::Fatal(format!("inode {inode}: dirty but no cache_path")))?;
 

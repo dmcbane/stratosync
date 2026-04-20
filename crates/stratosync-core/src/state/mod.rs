@@ -421,6 +421,20 @@ impl StateDb {
         Ok(())
     }
 
+    /// Mark all directories in the given mount as listed.
+    /// Safe to call after a full `list_recursive("/")` poll, since the
+    /// complete tree is present in the DB. Returns the number of
+    /// directories marked.
+    pub async fn batch_mark_dirs_listed(&self, mount_id: u32) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE file_index SET dir_listed = unixepoch() \
+             WHERE mount_id = ?1 AND kind = 'dir' AND dir_listed IS NULL",
+            params![mount_id],
+        )?;
+        Ok(changed as u64)
+    }
+
     // ── Sync queue ────────────────────────────────────────────────────────────
 
     pub async fn enqueue_upload(

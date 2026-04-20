@@ -42,9 +42,16 @@ impl RemotePoller {
         let base_interval = self.poll_interval;
         let mut current_interval = base_interval;
         let mut consecutive_failures: u32 = 0;
+        let mut first_run = true;
 
         loop {
-            tokio::time::sleep(current_interval).await;
+            // Poll immediately on first run so the directory tree is
+            // populated before the user navigates.
+            if first_run {
+                first_run = false;
+            } else {
+                tokio::time::sleep(current_interval).await;
+            }
             let result = if use_delta {
                 self.poll_once_delta().await
             } else {
@@ -116,6 +123,13 @@ impl RemotePoller {
             // Safety: skip path traversal and null bytes
             if meta.path.contains("..") || meta.path.contains('\0') || meta.name.contains('/') {
                 skipped_unsafe += 1;
+                continue;
+            }
+
+            // Skip conflict files stored under the conflict namespace.
+            // These are tracked in the DB from creation and must not be
+            // re-imported as regular files.
+            if meta.path.starts_with(CONFLICT_PREFIX) {
                 continue;
             }
 
@@ -203,6 +217,15 @@ impl RemotePoller {
 
         if skipped_unsafe > 0 {
             warn!(skipped_unsafe, "entries skipped due to unsafe paths");
+        }
+
+        // Mark all directories as listed — safe after a full recursive listing
+        // since the complete tree is present in the DB. This prevents FUSE
+        // readdir from redundantly calling backend.list() for every directory.
+        match self.db.batch_mark_dirs_listed(self.mount_id).await {
+            Ok(n) if n > 0 => debug!(n, "directories marked as listed after full poll"),
+            Ok(_) => {}
+            Err(e) => warn!("batch_mark_dirs_listed failed: {e}"),
         }
 
         debug!(
@@ -297,6 +320,11 @@ impl RemotePoller {
         for change in &changes {
             match change {
                 RemoteChange::Added { meta } | RemoteChange::Modified { meta, .. } => {
+                    // Skip conflict namespace
+                    if meta.path.starts_with(CONFLICT_PREFIX) {
+                        continue;
+                    }
+
                     // Skip tombstoned paths
                     if tombstones.iter().any(|t| {
                         meta.path == *t || meta.path.starts_with(&format!("{t}/"))

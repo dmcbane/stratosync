@@ -99,6 +99,9 @@ async fn handle_event(
         // Look up the current inode by remote_path (stable across poller upserts)
         match db.get_by_remote_path(mount_id, &remote_path).await {
             Ok(Some(entry)) => {
+                if entry.status == SyncStatus::Conflict {
+                    continue; // conflict files must not be re-uploaded
+                }
                 if matches!(entry.status, SyncStatus::Cached | SyncStatus::Dirty) {
                     debug!(inode = entry.inode, path = ?path, event = ?event.kind, "fs event");
                     upload_queue.enqueue(UploadTrigger::Write { inode: entry.inode }).await;
