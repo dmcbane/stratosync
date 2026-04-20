@@ -203,7 +203,7 @@ async fn find_conflict_sibling(
             // Look up canonical entry
             let rows: Vec<(i64,)> = conn.prepare(
                 "SELECT inode FROM file_index
-                 WHERE mount_id=?1 AND parent=?2 AND name=?3"
+                 WHERE mount_id=?1 AND parent_inode=?2 AND name=?3"
             )?.query_map(
                 rusqlite::params![mount_id, entry.parent, canonical_name],
                 |r| Ok((r.get(0)?,))
@@ -223,7 +223,7 @@ async fn find_conflict_sibling(
 
     let rows: Vec<(i64, String)> = conn.prepare(
         "SELECT inode, name FROM file_index
-         WHERE mount_id=?1 AND parent=?2 AND name LIKE ?3
+         WHERE mount_id=?1 AND parent_inode=?2 AND name LIKE ?3
          ORDER BY mtime DESC LIMIT 1"
     )?.query_map(
         rusqlite::params![mount_id, parent, format!("{stem}.conflict.%")],
