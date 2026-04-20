@@ -10,7 +10,6 @@ use tracing::{debug, info, warn};
 pub struct WebDavSidecar {
     child:    Child,
     base_url: String,
-    port:     u16,
 }
 
 impl WebDavSidecar {
@@ -42,7 +41,7 @@ impl WebDavSidecar {
             .spawn()
             .with_context(|| format!("failed to spawn rclone serve webdav for {remote}"))?;
 
-        let sidecar = Self { child, base_url: base_url.clone(), port };
+        let sidecar = Self { child, base_url: base_url.clone() };
 
         // Wait for the server to become ready (health check)
         let client = reqwest::Client::builder()
@@ -71,10 +70,6 @@ impl WebDavSidecar {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
     }
 
     /// Stop the sidecar process gracefully.
