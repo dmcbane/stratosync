@@ -102,6 +102,7 @@ pub async fn list(config_path: &Path) -> Result<()> {
         println!("  stratosync conflicts keep-remote <path>   — download remote, discard local");
         println!("  stratosync conflicts merge       <path>   — attempt 3-way merge");
         println!("  stratosync conflicts diff        <path>   — show differences");
+        println!("  stratosync conflicts cleanup              — remove conflicts whose content matches the canonical");
     }
 
     Ok(())
@@ -382,6 +383,122 @@ pub async fn merge(config_path: &Path, path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── cleanup ──────────────────────────────────────────────────────────────────
+
+/// Walk every existing conflict entry and remove those whose content is
+/// identical to their canonical sibling. Genuinely-differing conflicts are
+/// left alone for manual resolution via keep-local/keep-remote/merge.
+pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
+    let cfg = crate::config_io::load(config_path)?;
+    let mut total_checked = 0usize;
+    let mut total_removed = 0usize;
+    let mut total_kept = 0usize;
+    let mut total_skipped = 0usize;
+
+    for mount in cfg.mounts.iter().filter(|m| m.enabled) {
+        let db_path = default_data_dir().join(format!("{}.db", mount.name));
+        if !db_path.exists() { continue; }
+
+        let db = StateDb::open(&db_path)?;
+        let Some(mount_id) = db.get_mount_id(&mount.name).await? else { continue };
+        let backend_dyn: std::sync::Arc<dyn Backend> =
+            std::sync::Arc::new(RcloneBackend::new(&mount.remote)?);
+
+        // Collect all conflict entries: by status or by filename pattern.
+        let entries = collect_conflict_entries(&db, mount_id).await?;
+        if entries.is_empty() {
+            continue;
+        }
+
+        println!("Mount: {} ({} conflict entries)", mount.name, entries.len());
+        println!("{}", "─".repeat(60));
+
+        let work_dir = mount.cache_dir().join(".meta").join("cleanup");
+        std::fs::create_dir_all(&work_dir).ok();
+
+        for sibling in entries {
+            total_checked += 1;
+
+            let Some(canonical) = find_conflict_sibling(&db, mount_id, &sibling).await? else {
+                println!("  SKIP  {} (no canonical file found)", sibling.name);
+                total_skipped += 1;
+                continue;
+            };
+
+            let equal = match stratosync_core::content::remote_eq_remote(
+                &canonical.remote_path, &sibling.remote_path, &backend_dyn, &work_dir,
+            ).await {
+                Ok(eq) => eq,
+                Err(e) => {
+                    println!("  SKIP  {} (comparison failed: {e})", sibling.name);
+                    total_skipped += 1;
+                    continue;
+                }
+            };
+
+            if !equal {
+                println!("  KEEP  {} (content differs — resolve manually)", sibling.name);
+                total_kept += 1;
+                continue;
+            }
+
+            if dry_run {
+                println!("  [dry-run] would remove {}", sibling.name);
+                total_removed += 1;
+                continue;
+            }
+
+            // Spurious conflict — delete from remote + DB
+            match backend_dyn.delete(&sibling.remote_path).await {
+                Ok(()) | Err(stratosync_core::types::SyncError::NotFound(_)) => {}
+                Err(e) => {
+                    println!("  SKIP  {} (remote delete failed: {e})", sibling.name);
+                    total_skipped += 1;
+                    continue;
+                }
+            }
+            if let Err(e) = db.delete_entry(sibling.inode).await {
+                println!("  SKIP  {} (db delete failed: {e})", sibling.name);
+                total_skipped += 1;
+                continue;
+            }
+            println!("  REMOVED  {} (spurious conflict)", sibling.name);
+            total_removed += 1;
+        }
+        println!();
+    }
+
+    println!("Summary: checked={total_checked} removed={total_removed} kept={total_kept} skipped={total_skipped}");
+    if dry_run && total_removed > 0 {
+        println!("Re-run without --dry-run to actually remove the spurious conflicts.");
+    }
+    Ok(())
+}
+
+/// Collect every entry that looks like a conflict file — either by
+/// `status='conflict'` or by filename pattern `%.conflict.%`.
+async fn collect_conflict_entries(db: &StateDb, mount_id: u32) -> Result<Vec<FileEntry>> {
+    let conn = db.raw_conn().await;
+    let rows: Vec<u64> = conn.prepare(
+        "SELECT inode FROM file_index
+         WHERE mount_id=?1 AND (status='conflict' OR name LIKE '%.conflict.%')
+         ORDER BY mtime DESC",
+    )?
+    .query_map(rusqlite::params![mount_id], |r| Ok(r.get::<_, i64>(0)? as u64))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    drop(conn);
+
+    let mut out = Vec::with_capacity(rows.len());
+    for inode in rows {
+        if let Some(e) = db.get_by_inode(inode).await? {
+            out.push(e);
+        }
+    }
+    Ok(out)
 }
 
 // ── diff ─────────────────────────────────────────────────────────────────────

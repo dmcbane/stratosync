@@ -78,6 +78,12 @@ enum ConflictAction {
         #[arg(add = ArgValueCompleter::new(completions::complete_conflict_path))]
         path: PathBuf,
     },
+    /// Remove conflict files whose content is identical to the canonical sibling
+    Cleanup {
+        /// Report what would be removed without modifying anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -124,6 +130,8 @@ async fn main() -> Result<()> {
                 commands::conflicts::merge(&config_path, &path).await?,
             Some(ConflictAction::Diff { path }) =>
                 commands::conflicts::diff(&config_path, &path).await?,
+            Some(ConflictAction::Cleanup { dry_run }) =>
+                commands::conflicts::cleanup(&config_path, dry_run).await?,
         }
         Command::Completions => {
             println!("Add one of the following to your shell config:\n");

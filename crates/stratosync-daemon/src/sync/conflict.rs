@@ -55,6 +55,36 @@ pub async fn resolve(
         }
     };
 
+    // ── Content-equality pre-check ───────────────────────────────────────────
+    // An ETag mismatch from the backend doesn't guarantee the bytes differ
+    // (providers can bump ETags on re-uploads, metadata changes, or hash
+    // format shifts). Compare local vs remote content before declaring a
+    // real conflict — if they match, just refresh the DB ETag.
+    match stratosync_core::content::local_eq_remote(
+        &cache_path, &entry.remote_path, backend,
+    ).await {
+        Ok((true, remote_meta)) => {
+            let fs_meta = tokio::fs::metadata(&cache_path).await?;
+            info!(
+                inode = entry.inode,
+                path = %entry.remote_path,
+                "conflict: local and remote contain identical bytes, refreshing ETag"
+            );
+            db.set_cached(
+                entry.inode, &cache_path, fs_meta.len(),
+                remote_meta.etag.as_deref(), remote_meta.mtime, remote_meta.size,
+            ).await?;
+            return Ok(());
+        }
+        Ok((false, _)) => { /* content differs — proceed with resolution */ }
+        Err(e) => {
+            warn!(
+                inode = entry.inode,
+                "content-equality check failed, falling through: {e}"
+            );
+        }
+    }
+
     // ── Attempt 3-way merge if conditions are met ────────────────────────────
     if has_git && sync_config.text_conflict_strategy == ConflictStrategy::Merge {
         if let Some(base_hash) = db.get_base_hash(entry.inode, entry.mount_id).await? {
@@ -582,6 +612,34 @@ mod tests {
             .collect();
         assert_eq!(conflict_entries.len(), 1, "should have one conflict sibling");
         assert!(conflict_entries[0].name.starts_with("config.conflict."));
+    }
+
+    #[tokio::test]
+    async fn e2e_identical_content_no_conflict_file() {
+        // If local and remote contain identical bytes (spurious ETag mismatch),
+        // no conflict file should be created — just refresh the ETag.
+        let (db, backend, base_store, sync_config, dir, mount_id) = setup_e2e().await;
+
+        let identical = b"identical bytes on both sides";
+        let cache_path = dir.path().join("Hellboy.chum");
+        let entry = insert_file_entry(&db, mount_id, "Hellboy.chum", &cache_path, identical).await;
+
+        // Seed the remote with the exact same content the local cache has.
+        backend.upload(&cache_path, "Hellboy.chum", None).await.unwrap();
+
+        resolve(&entry, &db, &backend, &base_store, &sync_config, true).await.unwrap();
+
+        // No conflict sibling should exist — the pre-check short-circuits.
+        let children = db.list_children(mount_id, FUSE_ROOT_INODE).await.unwrap();
+        let conflict_entries: Vec<_> = children.iter()
+            .filter(|e| e.name.contains("conflict"))
+            .collect();
+        assert!(conflict_entries.is_empty(),
+            "identical content should not create a conflict file, got {conflict_entries:?}");
+
+        // Canonical entry should be Cached (ETag refreshed).
+        let updated = db.get_by_inode(entry.inode).await.unwrap().unwrap();
+        assert_eq!(updated.status, SyncStatus::Cached);
     }
 
     #[tokio::test]
