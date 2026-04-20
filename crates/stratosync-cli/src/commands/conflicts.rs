@@ -412,40 +412,56 @@ pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
             continue;
         }
 
-        println!("Mount: {} ({} conflict entries)", mount.name, entries.len());
+        let total = entries.len();
+        println!("Mount: {} ({total} conflict entries)", mount.name);
         println!("{}", "─".repeat(60));
 
         let work_dir = mount.cache_dir().join(".meta").join("cleanup");
         std::fs::create_dir_all(&work_dir).ok();
 
-        for sibling in entries {
+        for (i, sibling) in entries.into_iter().enumerate() {
             total_checked += 1;
+            let idx = i + 1;
+
+            use std::io::Write;
+            print!("  [{idx:>3}/{total}] {} ... ", sibling.name);
+            std::io::stdout().flush().ok();
 
             let Some(canonical) = find_conflict_sibling(&db, mount_id, &sibling).await? else {
-                println!("  SKIP  {} (no canonical file found)", sibling.name);
+                println!("SKIP (no canonical in DB)");
                 total_skipped += 1;
                 continue;
             };
 
-            let equal = match stratosync_core::content::remote_eq_remote(
-                &canonical.remote_path, &sibling.remote_path, &backend_dyn, &work_dir,
-            ).await {
+            // If the canonical file is cached locally, compare local-to-remote
+            // (saves one download per entry). Otherwise fall back to
+            // remote-to-remote comparison.
+            let equal_result = match canonical.cache_path.as_ref() {
+                Some(cp) if cp.exists() => stratosync_core::content::local_eq_remote(
+                    cp, &sibling.remote_path, &backend_dyn,
+                ).await.map(|(eq, _)| eq),
+                _ => stratosync_core::content::remote_eq_remote(
+                    &canonical.remote_path, &sibling.remote_path, &backend_dyn, &work_dir,
+                ).await,
+            };
+
+            let equal = match equal_result {
                 Ok(eq) => eq,
                 Err(e) => {
-                    println!("  SKIP  {} (comparison failed: {e})", sibling.name);
+                    println!("SKIP (comparison failed: {e})");
                     total_skipped += 1;
                     continue;
                 }
             };
 
             if !equal {
-                println!("  KEEP  {} (content differs — resolve manually)", sibling.name);
+                println!("KEEP (content differs)");
                 total_kept += 1;
                 continue;
             }
 
             if dry_run {
-                println!("  [dry-run] would remove {}", sibling.name);
+                println!("WOULD REMOVE");
                 total_removed += 1;
                 continue;
             }
@@ -454,17 +470,17 @@ pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
             match backend_dyn.delete(&sibling.remote_path).await {
                 Ok(()) | Err(stratosync_core::types::SyncError::NotFound(_)) => {}
                 Err(e) => {
-                    println!("  SKIP  {} (remote delete failed: {e})", sibling.name);
+                    println!("SKIP (remote delete failed: {e})");
                     total_skipped += 1;
                     continue;
                 }
             }
             if let Err(e) = db.delete_entry(sibling.inode).await {
-                println!("  SKIP  {} (db delete failed: {e})", sibling.name);
+                println!("SKIP (db delete failed: {e})");
                 total_skipped += 1;
                 continue;
             }
-            println!("  REMOVED  {} (spurious conflict)", sibling.name);
+            println!("REMOVED");
             total_removed += 1;
         }
         println!();
