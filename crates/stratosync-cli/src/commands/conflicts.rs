@@ -187,54 +187,53 @@ async fn find_conflict_sibling(
     mount_id: u32,
     entry: &FileEntry,
 ) -> Result<Option<FileEntry>> {
-    let conn = db.raw_conn().await;
+    // IMPORTANT: release the raw_conn MutexGuard BEFORE calling any other
+    // StateDb async method — those methods also lock `conn`, and holding
+    // the guard across an await on them would self-deadlock.
+    let target_inode: Option<u64> = {
+        let conn = db.raw_conn().await;
 
-    if entry.name.contains(".conflict.") {
-        // This IS the conflict sibling — find the canonical entry.
-        // Strip .conflict.{ts}.{hash} from the name to get the canonical name.
-        if let Some(idx) = entry.name.find(".conflict.") {
-            let stem = &entry.name[..idx];
-            let ext = entry.name.rsplit('.').next().unwrap_or("");
-            let canonical_name = if ext.is_empty() || stem.ends_with(&format!(".{ext}")) {
-                stem.to_owned()
+        if entry.name.contains(".conflict.") {
+            if let Some(idx) = entry.name.find(".conflict.") {
+                let stem = &entry.name[..idx];
+                let ext = entry.name.rsplit('.').next().unwrap_or("");
+                let canonical_name = if ext.is_empty() || stem.ends_with(&format!(".{ext}")) {
+                    stem.to_owned()
+                } else {
+                    format!("{stem}.{ext}")
+                };
+                let rows: Vec<i64> = conn.prepare(
+                    "SELECT inode FROM file_index
+                     WHERE mount_id=?1 AND parent_inode=?2 AND name=?3"
+                )?.query_map(
+                    rusqlite::params![mount_id, entry.parent, canonical_name],
+                    |r| r.get(0),
+                )?.filter_map(|r| r.ok()).collect();
+                rows.first().map(|&i| i as u64)
             } else {
-                format!("{stem}.{ext}")
-            };
-            // Look up canonical entry
-            let rows: Vec<(i64,)> = conn.prepare(
-                "SELECT inode FROM file_index
-                 WHERE mount_id=?1 AND parent_inode=?2 AND name=?3"
-            )?.query_map(
-                rusqlite::params![mount_id, entry.parent, canonical_name],
-                |r| Ok((r.get(0)?,))
-            )?.filter_map(|r| r.ok()).collect();
-
-            if let Some((inode,)) = rows.first() {
-                return db.get_by_inode(*inode as u64).await;
+                None
             }
+        } else {
+            // Entry is canonical — find sibling with `.conflict.` in name.
+            let stem = Path::new(&entry.name).file_stem()
+                .and_then(|s| s.to_str()).unwrap_or(&entry.name);
+            let rows: Vec<i64> = conn.prepare(
+                "SELECT inode FROM file_index
+                 WHERE mount_id=?1 AND parent_inode=?2 AND name LIKE ?3
+                 ORDER BY mtime DESC LIMIT 1"
+            )?.query_map(
+                rusqlite::params![mount_id, entry.parent, format!("{stem}.conflict.%")],
+                |r| r.get(0),
+            )?.filter_map(|r| r.ok()).collect();
+            rows.first().map(|&i| i as u64)
         }
-        return Ok(None);
+        // `conn` dropped here — lock released.
+    };
+
+    match target_inode {
+        Some(inode) => db.get_by_inode(inode).await,
+        None        => Ok(None),
     }
-
-    // Entry is canonical — find sibling with `.conflict.` in name
-    let parent = entry.parent;
-    let stem = Path::new(&entry.name).file_stem()
-        .and_then(|s| s.to_str()).unwrap_or(&entry.name);
-
-    let rows: Vec<(i64, String)> = conn.prepare(
-        "SELECT inode, name FROM file_index
-         WHERE mount_id=?1 AND parent_inode=?2 AND name LIKE ?3
-         ORDER BY mtime DESC LIMIT 1"
-    )?.query_map(
-        rusqlite::params![mount_id, parent, format!("{stem}.conflict.%")],
-        |r| Ok((r.get(0)?, r.get(1)?))
-    )?.filter_map(|r| r.ok()).collect();
-
-    if let Some((inode, _name)) = rows.first() {
-        return db.get_by_inode(*inode as u64).await;
-    }
-
-    Ok(None)
 }
 
 /// Cleanup after resolution: delete conflict sibling from remote and DB,
@@ -469,8 +468,37 @@ pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    finish_progress(&line_prefix, &format!("SKIP (stat failed: {e})"));
-                    total_skipped += 1;
+                    // Most common case: the conflict sibling's remote file
+                    // no longer exists (deleted out-of-band, or never made it
+                    // during an earlier aborted resolution). The DB still
+                    // tracks it, so clean up the orphan row.
+                    let err_msg = format!("{e}");
+                    let is_missing = err_msg.contains("not found")
+                        || err_msg.contains("directory not found");
+                    if is_missing {
+                        if dry_run {
+                            finish_progress(&line_prefix,
+                                "WOULD REMOVE (orphan: remote gone)");
+                            total_removed += 1;
+                        } else {
+                            match db.delete_entry(sibling.inode).await {
+                                Ok(_) => {
+                                    finish_progress(&line_prefix,
+                                        "REMOVED (orphan: remote gone)");
+                                    total_removed += 1;
+                                }
+                                Err(de) => {
+                                    finish_progress(&line_prefix,
+                                        &format!("SKIP (db delete failed: {de})"));
+                                    total_skipped += 1;
+                                }
+                            }
+                        }
+                    } else {
+                        finish_progress(&line_prefix,
+                            &format!("SKIP (stat failed: {e})"));
+                        total_skipped += 1;
+                    }
                     continue;
                 }
             };
