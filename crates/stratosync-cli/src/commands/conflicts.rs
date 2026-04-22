@@ -423,45 +423,66 @@ pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
             total_checked += 1;
             let idx = i + 1;
 
-            use std::io::Write;
-            print!("  [{idx:>3}/{total}] {} ... ", sibling.name);
-            std::io::stdout().flush().ok();
+            let line_prefix = format!("  [{idx:>3}/{total}] {}", sibling.name);
+            print_progress(&line_prefix, "…");
 
             let Some(canonical) = find_conflict_sibling(&db, mount_id, &sibling).await? else {
-                println!("SKIP (no canonical in DB)");
+                finish_progress(&line_prefix, "SKIP (no canonical in DB)");
                 total_skipped += 1;
                 continue;
             };
 
-            // If the canonical file is cached locally, compare local-to-remote
-            // (saves one download per entry). Otherwise fall back to
-            // remote-to-remote comparison.
-            let equal_result = match canonical.cache_path.as_ref() {
-                Some(cp) if cp.exists() => stratosync_core::content::local_eq_remote(
-                    cp, &sibling.remote_path, &backend_dyn,
-                ).await.map(|(eq, _)| eq),
-                _ => stratosync_core::content::remote_eq_remote(
-                    &canonical.remote_path, &sibling.remote_path, &backend_dyn, &work_dir,
-                ).await,
-            };
-
-            let equal = match equal_result {
-                Ok(eq) => eq,
+            // Fast path: stat both sides and compare content hashes. For
+            // Google Drive / OneDrive etc. this is decisive with zero
+            // downloads. Falls back to a byte-level comparison only when
+            // the provider doesn't expose a content hash for one side.
+            let equal = match run_with_spinner(&line_prefix, "stat", async {
+                stratosync_core::content::stat_remote_eq(
+                    &canonical.remote_path, &sibling.remote_path, &backend_dyn,
+                ).await
+            }).await {
+                Ok(stratosync_core::content::StatEqResult::Equal) => true,
+                Ok(stratosync_core::content::StatEqResult::Different) => false,
+                Ok(stratosync_core::content::StatEqResult::Unknown) => {
+                    // Fall back to byte comparison.
+                    let fallback = match canonical.cache_path.as_ref() {
+                        Some(cp) if cp.exists() => run_with_spinner(&line_prefix, "verify", async {
+                            stratosync_core::content::local_eq_remote(
+                                cp, &sibling.remote_path, &backend_dyn,
+                            ).await.map(|(eq, _)| eq)
+                        }).await,
+                        _ => run_with_spinner(&line_prefix, "download", async {
+                            stratosync_core::content::remote_eq_remote(
+                                &canonical.remote_path, &sibling.remote_path,
+                                &backend_dyn, &work_dir,
+                            ).await
+                        }).await,
+                    };
+                    match fallback {
+                        Ok(eq) => eq,
+                        Err(e) => {
+                            finish_progress(&line_prefix,
+                                &format!("SKIP (comparison failed: {e})"));
+                            total_skipped += 1;
+                            continue;
+                        }
+                    }
+                }
                 Err(e) => {
-                    println!("SKIP (comparison failed: {e})");
+                    finish_progress(&line_prefix, &format!("SKIP (stat failed: {e})"));
                     total_skipped += 1;
                     continue;
                 }
             };
 
             if !equal {
-                println!("KEEP (content differs)");
+                finish_progress(&line_prefix, "KEEP (content differs)");
                 total_kept += 1;
                 continue;
             }
 
             if dry_run {
-                println!("WOULD REMOVE");
+                finish_progress(&line_prefix, "WOULD REMOVE");
                 total_removed += 1;
                 continue;
             }
@@ -470,17 +491,19 @@ pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
             match backend_dyn.delete(&sibling.remote_path).await {
                 Ok(()) | Err(stratosync_core::types::SyncError::NotFound(_)) => {}
                 Err(e) => {
-                    println!("SKIP (remote delete failed: {e})");
+                    finish_progress(&line_prefix,
+                        &format!("SKIP (remote delete failed: {e})"));
                     total_skipped += 1;
                     continue;
                 }
             }
             if let Err(e) = db.delete_entry(sibling.inode).await {
-                println!("SKIP (db delete failed: {e})");
+                finish_progress(&line_prefix,
+                    &format!("SKIP (db delete failed: {e})"));
                 total_skipped += 1;
                 continue;
             }
-            println!("REMOVED");
+            finish_progress(&line_prefix, "REMOVED");
             total_removed += 1;
         }
         println!();
@@ -491,6 +514,45 @@ pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
         println!("Re-run without --dry-run to actually remove the spurious conflicts.");
     }
     Ok(())
+}
+
+/// Write a single-line progress indicator: `<prefix> ... <state>` with a
+/// carriage return so it can be overwritten by later calls.
+fn print_progress(prefix: &str, state: &str) {
+    use std::io::Write;
+    // Trailing spaces clear any longer previous line.
+    print!("\r{prefix} ... {state}    ");
+    let _ = std::io::stdout().flush();
+}
+
+/// Finalize the progress line with a terminal newline so the next line
+/// starts fresh. Pads with spaces to wipe any previous state text.
+fn finish_progress(prefix: &str, result: &str) {
+    println!("\r{prefix} ... {result}                                        ");
+}
+
+/// Run a future while updating the progress line with elapsed seconds.
+/// Spawns a background ticker that prints `(elapsed Ns)` every second so
+/// long rclone calls look alive.
+async fn run_with_spinner<F, T>(prefix: &str, stage: &str, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let start = std::time::Instant::now();
+    let prefix_owned = prefix.to_string();
+    let stage_owned = stage.to_string();
+    let ticker = tokio::spawn(async move {
+        // First tick: show stage immediately, then update every second.
+        print_progress(&prefix_owned, &stage_owned);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let elapsed = start.elapsed().as_secs();
+            print_progress(&prefix_owned, &format!("{stage_owned} ({elapsed}s)"));
+        }
+    });
+    let out = fut.await;
+    ticker.abort();
+    out
 }
 
 /// Collect every entry that looks like a conflict file — either by

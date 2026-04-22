@@ -46,6 +46,49 @@ pub async fn local_eq_remote(
     Ok((equal?, remote_meta))
 }
 
+/// Three-valued result of a stat-only (no-download) remote-to-remote
+/// equality check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatEqResult {
+    /// Sizes match and content hashes match — bytes are equal.
+    Equal,
+    /// Sizes differ, or content hashes exist on both sides but differ.
+    Different,
+    /// Can't decide from stat alone (hash absent on one/both sides).
+    /// Caller should fall back to `remote_eq_remote`.
+    Unknown,
+}
+
+/// Quick remote-to-remote equality check that uses only `stat` (no download).
+///
+/// - Size mismatch → `Different` (cheap).
+/// - Both sizes match AND both ETags are present AND equal → `Equal`.
+/// - Both sizes match AND both ETags are present AND differ → `Different`.
+/// - Any ETag missing → `Unknown`.
+///
+/// For content-hash-based ETags (Google Drive MD5, OneDrive SHA1, etc.) this
+/// is authoritative. For providers whose ETag is a file ID rather than a
+/// content hash, equal ETags still mean "same object" (which for cleanup
+/// purposes is still fine — we wouldn't be removing a sibling we shouldn't).
+pub async fn stat_remote_eq(
+    path_a: &str,
+    path_b: &str,
+    backend: &Arc<dyn Backend>,
+) -> Result<StatEqResult> {
+    let meta_a = backend.stat(path_a).await
+        .map_err(|e| anyhow::anyhow!("stat {path_a}: {e}"))?;
+    let meta_b = backend.stat(path_b).await
+        .map_err(|e| anyhow::anyhow!("stat {path_b}: {e}"))?;
+    if meta_a.size != meta_b.size {
+        return Ok(StatEqResult::Different);
+    }
+    match (&meta_a.etag, &meta_b.etag) {
+        (Some(a), Some(b)) if a == b => Ok(StatEqResult::Equal),
+        (Some(_), Some(_))           => Ok(StatEqResult::Different),
+        _                             => Ok(StatEqResult::Unknown),
+    }
+}
+
 /// Compare two remote files byte-for-byte by downloading both to a work directory.
 /// Short-circuits on size mismatch without downloading.
 pub async fn remote_eq_remote(
@@ -161,6 +204,22 @@ mod tests {
         let (equal, meta) = local_eq_remote(&local, "a.bin", &backend).await.unwrap();
         assert!(!equal);
         assert_eq!(meta.size, 24);
+    }
+
+    #[tokio::test]
+    async fn stat_remote_eq_size_mismatch_is_different() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.seed");
+        let b = dir.path().join("b.seed");
+        std::fs::write(&a, b"short").unwrap();
+        std::fs::write(&b, b"longer content here").unwrap();
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::default());
+        backend.upload(&a, "a.bin", None).await.unwrap();
+        backend.upload(&b, "b.bin", None).await.unwrap();
+
+        let result = stat_remote_eq("a.bin", "b.bin", &backend).await.unwrap();
+        assert_eq!(result, StatEqResult::Different);
     }
 
     #[tokio::test]
