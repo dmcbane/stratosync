@@ -9,18 +9,23 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 mod cache;
 mod config_io;
 mod fuse;
+mod server;
+mod state;
 mod sync;
 mod watcher;
 mod webdav;
 
+use dashmap::DashMap;
 use stratosync_core::{
     backend::RcloneBackend,
     base_store::BaseStore,
-    config::{default_data_dir, Config},
+    config::{default_data_dir, default_runtime_socket, Config},
     state::StateDb,
     Backend,
 };
 use sync::{RemotePoller, UploadQueue};
+
+use state::{DaemonState, MountHandle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,6 +44,7 @@ async fn main() -> Result<()> {
     let mut _watchers = vec![]; // must outlive fuse_threads to keep inotify alive
     let mut sidecars: Vec<webdav::WebDavSidecar> = vec![];
     let mut mount_id_counter = 0u32;
+    let mut mount_handles: Vec<MountHandle> = Vec::new();
 
     for mount_cfg in cfg.mounts.iter().filter(|m| m.enabled) {
         mount_id_counter += 1;
@@ -150,10 +156,28 @@ async fn main() -> Result<()> {
             mount_id, Arc::clone(&db), Arc::clone(&backend),
             mount_cfg.poll_duration()?,
         );
+        let poller_state = poller.state_handle();
         let poller_mount = mount_cfg.name.clone();
         tokio::spawn(async move {
             poller.run().await;
             error!(mount = %poller_mount, "remote poller exited unexpectedly");
+        });
+
+        // Hydration waiters — created up-front so both FUSE and the dashboard
+        // share the same DashMap.
+        let hydration_waiters = Arc::new(DashMap::new());
+
+        // Collect a handle for the dashboard IPC aggregator.
+        mount_handles.push(MountHandle {
+            name:              mount_cfg.name.clone(),
+            remote:            mount_cfg.remote.clone(),
+            mount_path:        mount_cfg.mount_path.to_string_lossy().into_owned(),
+            quota_bytes:       mount_cfg.cache_quota_bytes()?,
+            mount_id,
+            db:                Arc::clone(&db),
+            upload_queue:      Arc::clone(&upload_queue),
+            poller_state,
+            hydration_waiters: Arc::clone(&hydration_waiters),
         });
 
         // FUSE mount (blocking thread)
@@ -165,6 +189,7 @@ async fn main() -> Result<()> {
         let queue_c      = Arc::clone(&upload_queue);
         let base_store_c = Arc::clone(&base_store);
         let sync_cfg_c   = Arc::clone(&sync_config);
+        let waiters_c    = Arc::clone(&hydration_waiters);
         // Capture the tokio Handle here (main thread has runtime context).
         // The spawned std::thread has no tokio context, so Handle::current()
         // would panic if called from within it.
@@ -177,6 +202,7 @@ async fn main() -> Result<()> {
                     &mount_name, mount_id, &mount_path,
                     cache_dir, db_c, backend_c, queue_c,
                     base_store_c, sync_cfg_c, fuse_cfg, rt_handle,
+                    waiters_c,
                 ) {
                     error!(mount = %mount_name, "FUSE error: {e}");
                 }
@@ -190,8 +216,22 @@ async fn main() -> Result<()> {
         anyhow::bail!("no enabled mounts in {config_path:?}");
     }
 
+    // Dashboard IPC server — serves DaemonStatus over a Unix socket so
+    // the `stratosync dashboard` CLI can visualize what's happening.
+    let socket_path = cfg.daemon.socket.clone().unwrap_or_else(default_runtime_socket);
+    let daemon_state = Arc::new(DaemonState::new(mount_handles));
+    let server_socket = socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) = server::serve(server_socket, daemon_state).await {
+            error!("IPC server exited: {e}");
+        }
+    });
+
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal — unmounting");
+
+    // Remove the IPC socket so the next startup gets a clean bind.
+    let _ = std::fs::remove_file(&socket_path);
 
     // Stop WebDAV sidecars
     for mut sidecar in sidecars {

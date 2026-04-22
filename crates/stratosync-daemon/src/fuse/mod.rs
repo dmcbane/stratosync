@@ -756,6 +756,7 @@ pub fn mount(
     upload_queue: Arc<UploadQueue>,
     base_store: Arc<BaseStore>, sync_config: Arc<SyncConfig>,
     cfg: FuseConfig, rt: Handle,
+    hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
     use std::os::unix::fs::PermissionsExt;
@@ -764,7 +765,7 @@ pub fn mount(
     // Restrict partial dir to owner-only (prevents symlink attacks by other users)
     std::fs::set_permissions(&partial_dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(mount_path)?;
-    let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, base_store, sync_config, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters: Arc::new(DashMap::new()), upload_queue };
+    let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, base_store, sync_config, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters, upload_queue };
     let mut opts = vec![MountOption::FSName(format!("stratosync:{mount_name}")), MountOption::AutoUnmount, MountOption::DefaultPermissions];
     if cfg.allow_other { opts.push(MountOption::AllowOther); }
     fuser::mount2(fs, mount_path, &opts)?;

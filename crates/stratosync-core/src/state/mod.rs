@@ -573,6 +573,32 @@ impl StateDb {
     }
 
     /// Count pinned files for a mount.
+    /// Count entries with the given SyncStatus for a mount.
+    pub async fn count_by_status(
+        &self, mount_id: u32, status: crate::types::SyncStatus,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_index WHERE mount_id=?1 AND status=?2",
+            params![mount_id, status.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Count conflict files for a mount: either entries with status=Conflict,
+    /// or legacy entries whose filename still contains `.conflict.`.
+    pub async fn count_conflicts(&self, mount_id: u32) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_index
+             WHERE mount_id=?1 AND (status='conflict' OR name LIKE '%.conflict.%')",
+            params![mount_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     pub async fn pinned_count(&self, mount_id: u32) -> Result<u64> {
         let conn = self.conn.lock().await;
         let count: i64 = conn.query_row(

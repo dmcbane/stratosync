@@ -2,6 +2,7 @@ pub mod backend;
 pub mod base_store;
 pub mod config;
 pub mod content;
+pub mod ipc;
 pub mod merge;
 pub mod state;
 pub mod types;

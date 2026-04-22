@@ -24,3 +24,5 @@ dirs.workspace        = true
 rusqlite.workspace    = true
 toml.workspace        = true
 toml_edit.workspace   = true
+ratatui.workspace     = true
+crossterm.workspace   = true

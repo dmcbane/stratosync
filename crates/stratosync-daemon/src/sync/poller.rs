@@ -7,13 +7,14 @@
 ///   Changes) to fetch only what changed since the last poll.
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use stratosync_core::{
-    backend::Backend, state::StateDb, types::*, RemoteMetadata,
+    backend::Backend, ipc::PollerStatus, state::StateDb, types::*, RemoteMetadata,
 };
 
 pub struct RemotePoller {
@@ -21,6 +22,7 @@ pub struct RemotePoller {
     db:            Arc<StateDb>,
     backend:       Arc<dyn Backend>,
     poll_interval: Duration,
+    state:         Arc<RwLock<PollerStatus>>,
 }
 
 impl RemotePoller {
@@ -30,7 +32,19 @@ impl RemotePoller {
         backend:       Arc<dyn Backend>,
         poll_interval: Duration,
     ) -> Self {
-        Self { mount_id, db, backend, poll_interval }
+        let mode = if backend.supports_delta() { "delta" } else { "full-listing" };
+        let state = Arc::new(RwLock::new(PollerStatus {
+            mode: mode.to_string(),
+            current_interval_secs: poll_interval.as_secs(),
+            ..Default::default()
+        }));
+        Self { mount_id, db, backend, poll_interval, state }
+    }
+
+    /// Expose a handle to the live poller state so the IPC server can
+    /// snapshot it without going through the poller's task.
+    pub fn state_handle(&self) -> Arc<RwLock<PollerStatus>> {
+        Arc::clone(&self.state)
     }
 
     /// Run the poll loop forever. Call from a dedicated tokio task.
@@ -64,6 +78,9 @@ impl RemotePoller {
                         current_interval = base_interval;
                         consecutive_failures = 0;
                     }
+                    self.update_state(
+                        true, None, current_interval, consecutive_failures,
+                    ).await;
                 }
                 Err(e) => {
                     consecutive_failures += 1;
@@ -86,8 +103,35 @@ impl RemotePoller {
                     } else {
                         warn!(mount_id = self.mount_id, "poll error: {e}");
                     }
+                    self.update_state(
+                        false, Some(format!("{e}")), current_interval, consecutive_failures,
+                    ).await;
                 }
             }
+        }
+    }
+
+    /// Record a poll result (success or failure) into the shared state so
+    /// the dashboard can display it.
+    async fn update_state(
+        &self,
+        success: bool,
+        error: Option<String>,
+        interval: Duration,
+        failures: u32,
+    ) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        let next = now + interval.as_secs() as i64;
+        let mut s = self.state.write().await;
+        s.last_poll_unix = Some(now);
+        s.next_poll_unix = Some(next);
+        s.consecutive_failures = failures;
+        s.current_interval_secs = interval.as_secs();
+        if success {
+            s.last_error = None;
+        } else {
+            s.last_error = error;
         }
     }
 

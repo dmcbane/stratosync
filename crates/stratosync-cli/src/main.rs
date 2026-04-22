@@ -43,6 +43,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<ConflictAction>,
     },
+    /// Live dashboard of daemon state via the IPC socket
+    Dashboard {
+        /// Render a single plain-text snapshot and exit (no TUI)
+        #[arg(long)]
+        once: bool,
+    },
     /// Print shell completion setup instructions
     Completions,
     /// Print version
@@ -132,6 +138,9 @@ async fn main() -> Result<()> {
                 commands::conflicts::diff(&config_path, &path).await?,
             Some(ConflictAction::Cleanup { dry_run }) =>
                 commands::conflicts::cleanup(&config_path, dry_run).await?,
+        }
+        Command::Dashboard { once } => {
+            commands::dashboard::run(&config_path, once).await?;
         }
         Command::Completions => {
             println!("Add one of the following to your shell config:\n");

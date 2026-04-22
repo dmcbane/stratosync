@@ -19,13 +19,14 @@ use stratosync_core::{
     backend::Backend,
     base_store::BaseStore,
     config::SyncConfig,
+    ipc::{ActiveUpload, QueueStatus},
     state::{StateDb, SyncQueueJob},
     types::{Inode, SyncError, SyncStatus},
 };
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum UploadTrigger {
     /// Normal write — reset debounce window.
     Write { inode: Inode },
@@ -33,6 +34,8 @@ pub enum UploadTrigger {
     Close { inode: Inode },
     /// fsync — upload immediately.
     Fsync { inode: Inode },
+    /// Snapshot current queue state for the dashboard. Never persisted.
+    Snapshot { reply: tokio::sync::oneshot::Sender<QueueStatus> },
 }
 
 pub struct UploadQueue {
@@ -76,6 +79,17 @@ impl UploadQueue {
             warn!("upload queue send failed (loop dead?): {e}");
         }
     }
+
+    /// Request a live snapshot of queue state (pending count + in-flight
+    /// uploads with start times). Returns a default/empty snapshot if the
+    /// upload loop is dead.
+    pub async fn snapshot(&self) -> QueueStatus {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(UploadTrigger::Snapshot { reply }).await.is_err() {
+            return QueueStatus::default();
+        }
+        rx.await.unwrap_or_default()
+    }
 }
 
 // ── Internal loop ─────────────────────────────────────────────────────────────
@@ -102,6 +116,10 @@ async fn upload_loop(
     // New triggers push the deadline forward (Write) or shorten it (Close/Fsync).
     let mut pending: HashMap<Inode, PendingUpload> = HashMap::new();
     let mut in_flight: JoinSet<(Inode, Result<(), SyncError>)> = JoinSet::new();
+    // Parallel to `in_flight`: tracks when each upload was spawned so the
+    // dashboard can show elapsed time. Kept in sync with in_flight inserts
+    // and removals.
+    let mut in_flight_started: HashMap<Inode, Instant> = HashMap::new();
 
     loop {
         // Find the soonest deadline among pending items.
@@ -111,10 +129,21 @@ async fn upload_loop(
         tokio::select! {
             // Inbound trigger
             Some(trigger) = rx.recv() => {
+                // Handle the dashboard snapshot op separately — it doesn't
+                // touch the pending map.
+                if let UploadTrigger::Snapshot { reply } = trigger {
+                    let snapshot = build_queue_snapshot(
+                        &pending, &in_flight_started, &db,
+                    ).await;
+                    let _ = reply.send(snapshot);
+                    continue;
+                }
+
                 let (inode, window) = match trigger {
                     UploadTrigger::Write { inode } => (inode, debounce),
                     UploadTrigger::Close { inode } => (inode, close_debounce),
                     UploadTrigger::Fsync { inode } => (inode, Duration::ZERO),
+                    UploadTrigger::Snapshot { .. } => unreachable!("handled above"),
                 };
 
                 let new_due = tokio::time::Instant::now() + window;
@@ -123,7 +152,7 @@ async fn upload_loop(
                     Some(entry) => {
                         // Already pending — only move the deadline EARLIER
                         // (Close/Fsync shorten the window, Write resets it).
-                        if matches!(trigger, UploadTrigger::Write { .. }) {
+                        if window == debounce {
                             // Write: reset debounce from now
                             entry.due_at = new_due;
                         } else {
@@ -172,6 +201,7 @@ async fn upload_loop(
                         let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c).await;
                         (inode, result)
                     });
+                    in_flight_started.insert(inode, Instant::now());
                 }
             }
 
@@ -179,9 +209,11 @@ async fn upload_loop(
             Some(result) = in_flight.join_next() => {
                 match result {
                     Ok((inode, Ok(()))) => {
+                        in_flight_started.remove(&inode);
                         debug!(inode, "upload complete");
                     }
                     Ok((inode, Err(SyncError::Conflict { local, remote }))) => {
+                        in_flight_started.remove(&inode);
                         warn!(inode, ?local, ?remote, "upload conflict — invoking resolver");
                         if let Ok(Some(entry)) = db.get_by_inode(inode).await {
                             let has_git = super::conflict::git_available();
@@ -194,6 +226,7 @@ async fn upload_loop(
                         }
                     }
                     Ok((inode, Err(e))) if e.is_retryable() => {
+                        in_flight_started.remove(&inode);
                         warn!(inode, "upload transient error: {e} — will retry");
                         if let Err(db_err) = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await {
                             warn!(inode, "failed to record retry backoff: {db_err}");
@@ -204,6 +237,7 @@ async fn upload_loop(
                         });
                     }
                     Ok((inode, Err(e))) => {
+                        in_flight_started.remove(&inode);
                         warn!(inode, "upload fatal: {e}");
                         if let Err(db_err) = db.set_status(inode, SyncStatus::Dirty).await {
                             warn!(inode, "failed to reset status to Dirty: {db_err}");
@@ -216,6 +250,9 @@ async fn upload_loop(
                         }
                     }
                     Err(join_err) => {
+                        // JoinError doesn't carry the inode; we can't remove
+                        // the metadata entry. It will be cleaned up the next
+                        // time this inode gets picked up. This is rare.
                         warn!("upload task panicked: {join_err}");
                     }
                 }
@@ -223,6 +260,37 @@ async fn upload_loop(
 
             else => break,
         }
+    }
+}
+
+/// Build a QueueStatus snapshot for the dashboard IPC. Looks up each
+/// in-flight inode in the DB to fetch its path and size.
+async fn build_queue_snapshot(
+    pending: &HashMap<Inode, PendingUpload>,
+    in_flight_started: &HashMap<Inode, Instant>,
+    db: &Arc<StateDb>,
+) -> QueueStatus {
+    let mut in_flight: Vec<ActiveUpload> = Vec::with_capacity(in_flight_started.len());
+    for (&inode, &started) in in_flight_started {
+        let (path, size) = match db.get_by_inode(inode).await {
+            Ok(Some(e)) => (e.remote_path, e.size),
+            _ => (String::from("(unknown)"), 0),
+        };
+        let elapsed = started.elapsed().as_secs() as i64;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        in_flight.push(ActiveUpload {
+            inode,
+            path,
+            size_bytes: size,
+            started_at_unix: now - elapsed,
+        });
+    }
+    QueueStatus {
+        pending: pending.len() as u64,
+        in_flight,
     }
 }
 

@@ -35,6 +35,21 @@ pub fn expand_tilde(path: &std::path::Path) -> PathBuf {
     path.to_owned()
 }
 
+/// Runtime socket path for the daemon IPC.
+/// Prefers `$XDG_RUNTIME_DIR/stratosync.sock`, falls back to
+/// `/tmp/stratosync-$UID.sock` (same uid scheme used by systemd for runtime
+/// directories when XDG_RUNTIME_DIR is absent).
+pub fn default_runtime_socket() -> PathBuf {
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        if !rt.is_empty() {
+            return PathBuf::from(rt).join("stratosync.sock");
+        }
+    }
+    // SAFETY: getuid is always safe to call; returns current uid.
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/stratosync-{uid}.sock"))
+}
+
 // ── Top-level ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
