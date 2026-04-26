@@ -35,7 +35,7 @@ Linux has excellent cloud sync tools, but none that provide all three: **on-dema
 
 ## Status
 
-🚧 **Pre-alpha (v0.11.0)** — Phases 1-4 complete. On-demand FUSE3 filesystem with bidirectional sync, 3-way merge conflict resolution, delta polling (Google Drive, OneDrive), pin/unpin for offline, range-read fast path, readdir prefetch, Nautilus emblem extension, system tray indicator, WebDAV sidecar backend, and distribution packaging (.deb, .rpm, AUR) for x86_64 and ARM64. See the [CHANGELOG](CHANGELOG.md) for details.
+🚧 **Pre-alpha (v0.12.0)** — Phases 1-4 complete; Phase 5 in progress. On-demand FUSE3 filesystem with bidirectional sync, 3-way merge conflict resolution, delta polling (Google Drive, OneDrive), pin/unpin for offline, range-read fast path, readdir prefetch, Nautilus emblem extension, system tray indicator, WebDAV sidecar backend, distribution packaging (.deb, .rpm, AUR) for x86_64 and ARM64, live dashboard TUI (`stratosync dashboard`), conflicts cleanup CLI, and selective sync via per-mount `ignore_patterns`. See the [CHANGELOG](CHANGELOG.md) for details.
 
 ## Prerequisites
 

@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - unreleased
+
+### Added
+- **Dashboard TUI** (`stratosync dashboard`): live ratatui-based view of
+  per-mount sync state, hydration queue, upload queue, and poller status.
+  Backed by a new daemon IPC socket that aggregates per-mount status from
+  the existing state DB and queue handles.
+- **Conflicts cleanup CLI** (`stratosync conflicts cleanup`): walks the
+  conflict namespace, drops siblings whose content is byte-equal to the
+  canonical file (the common case after a transient false-positive),
+  shows per-entry progress, and accepts `--dry-run`. Includes a
+  stat-based fast path and live progress output for large trees.
+- **Selective sync (Phase 5, item 1)**: per-mount `ignore_patterns`
+  config field filters glob-matched paths out of indexing, FUSE
+  `create`/`mkdir`, and upload events. Patterns use `globset` semantics
+  (`*` matches across `/`, so `*.log` catches log files at any depth;
+  use `node_modules/**` for subtrees). Bad patterns fail the daemon at
+  startup with a clear error. Already-indexed entries that match a
+  newly-added pattern are preserved — rules prevent new indexing, never
+  retroactively unindex. Ignored FUSE creates return `EPERM` so apps see
+  a visible failure rather than silently writing into an untracked file.
+
+### Changed
+- **Conflict files isolated under `.stratosync-conflicts/`**: conflict
+  siblings are stored on the remote under a dedicated prefix instead of
+  alongside their canonical files, keeping the user-visible namespace
+  clean. Poller, watcher, and upload queue filter the conflict prefix
+  on every ingress so files don't get re-imported or re-uploaded as
+  regular content. Added a startup tree walk to migrate any
+  pre-existing conflict files into the new namespace.
+- **Poller runs immediately on startup** instead of sleeping the first
+  poll interval, so directory listings populate without latency on
+  first navigation. Directories are also bulk-marked as `dir_listed`
+  after a full recursive poll, eliminating per-directory backend
+  `list()` calls during traversal.
+
+### Fixed
+- Conflict sibling lookup used the wrong column name (`parent` vs
+  `parent_inode`), causing false negatives in the conflicts cleanup
+  walker.
+- Deadlock and orphan handling in conflicts cleanup when a sibling's
+  parent had already been removed.
+- `WebDavSidecar` carried an unused `port` field; removed.
+
 ## [0.11.0] - 2026-04-11
 
 ### Added
