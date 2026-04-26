@@ -14,6 +14,14 @@ All notable changes to this project will be documented in this file.
   canonical file (the common case after a transient false-positive),
   shows per-entry progress, and accepts `--dry-run`. Includes a
   stat-based fast path and live progress output for large trees.
+- **Bandwidth scheduling (Phase 5, item 3)**: per-mount
+  `upload_window = "HH:MM-HH:MM"` (local time, wraparound supported).
+  Outside the window the upload queue holds dirty files but does not
+  dispatch; the loop sleeps until the window reopens, no busy-wait. In-
+  flight uploads are not interrupted. `fsync()` always bypasses the
+  schedule — the user explicitly asked for durability, the bandwidth
+  policy is coarse and shouldn't override that. Polling is unaffected;
+  this gates uploads only.
 - **Prometheus metrics endpoint (Phase 5, item 2)**: optional
   `GET /metrics` HTTP endpoint exposing per-mount cache usage, queue
   depth, hydration counts, conflict count, and poller state. Opt-in via

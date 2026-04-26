@@ -53,6 +53,11 @@ ignore_patterns = [
     "**/target",
 ]
 
+# Bandwidth schedule: only dispatch uploads during this local-time window.
+# Optional; omit for 24/7 uploads. Wraparound supported (e.g. 22:00-06:00
+# means "evenings and overnight"). fsync() always bypasses this gate.
+upload_window = "22:00-06:00"
+
 [mount.rclone]
 # Extra flags passed to every rclone invocation for this mount
 extra_flags  = []
@@ -95,6 +100,50 @@ enabled     = false       # disabled by default
 [mount.rclone]
 extra_flags = ["--s3-acl", "private"]
 ```
+
+---
+
+## Bandwidth schedule (`upload_window`)
+
+Per-mount local-time window during which uploads are permitted.
+Optional — omit for 24/7 uploads (the existing default behavior).
+
+```toml
+[[mount]]
+name = "drive"
+# ...
+upload_window = "22:00-06:00"   # only upload between 10pm and 6am
+```
+
+**Format**: `"HH:MM-HH:MM"`, 24-hour. Local time (wall clock), so users
+can express schedules in terms they actually live by. Wraparound past
+midnight is supported (start later than end). The end time is exclusive
+(`06:00` means uploads stop just before 06:00).
+
+**Behavior**:
+
+- Outside the window, queued uploads are held — the loop sleeps until
+  the window opens rather than busy-checking. New writes still enqueue,
+  they just don't dispatch.
+- In-flight uploads are **not interrupted** when the window closes.
+  Cancelling mid-upload risks corrupted partial state on the remote;
+  letting them finish is safer and the bandwidth difference is small.
+- `fsync()` **always bypasses** the schedule. The user explicitly asked
+  for durability; the bandwidth policy is coarse and shouldn't override
+  that.
+- Pinning, polling, and hydration are **not gated** — only uploads.
+  Reading from the remote on demand always works.
+- The degenerate `"HH:MM-HH:MM"` (start equals end) is treated as
+  always-open, not always-closed. This is the less-surprising
+  interpretation for a typo.
+
+**Limitations** (intentional, room for follow-up):
+
+- A single window per mount. No multi-window schedules ("9–12 and
+  14–17") yet. Stack two mounts of the same remote if you need that.
+- No day-of-week selectors. Always applied.
+- No bandwidth-rate limiting (Mbps caps). Use `[mount.rclone] bwlimit`
+  for that — rclone handles it inside each upload.
 
 ---
 

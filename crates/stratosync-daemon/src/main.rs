@@ -123,6 +123,19 @@ async fn main() -> Result<()> {
             );
         }
 
+        // Bandwidth schedule: parse the optional upload_window once at
+        // startup. Bad windows abort startup with a clear error.
+        let upload_window = mount_cfg.parse_upload_window()
+            .with_context(|| format!("upload_window for mount {:?}", mount_cfg.name))?;
+        if let Some(w) = upload_window {
+            info!(
+                mount = %mount_cfg.name,
+                start = format!("{:02}:{:02}", w.start_min / 60, w.start_min % 60),
+                end   = format!("{:02}:{:02}", w.end_min   / 60, w.end_min   % 60),
+                "bandwidth schedule active"
+            );
+        }
+
         // Re-queue any dirty/uploading files from prior run
         let pending = db.get_pending_uploads(mount_id).await?;
         if !pending.is_empty() {
@@ -137,6 +150,7 @@ async fn main() -> Result<()> {
             std::time::Duration::from_millis(
                 cfg.daemon.sync.upload_close_debounce_ms),
             cfg.daemon.sync.max_upload_concurrent,
+            upload_window,
         ));
 
         for entry in pending {

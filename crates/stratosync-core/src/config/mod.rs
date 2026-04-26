@@ -227,6 +227,13 @@ pub struct MountConfig {
     /// children are skipped).
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+    /// Bandwidth schedule: `"HH:MM-HH:MM"` local-time window during which
+    /// uploads are permitted. Outside the window, queued uploads wait
+    /// until the window reopens; in-flight uploads are not interrupted.
+    /// `fsync()` always bypasses the gate (user-explicit). Empty/None means
+    /// uploads run any time. Wraparound is supported: `"22:00-06:00"`.
+    #[serde(default)]
+    pub upload_window: Option<String>,
 }
 
 fn default_cache_quota_str() -> String { "5 GiB".into()  }
@@ -249,6 +256,14 @@ impl MountConfig {
             b.add(g);
         }
         b.build().map_err(|e| anyhow::anyhow!("failed to build ignore set: {}", e))
+    }
+
+    /// Parse `upload_window` if set. Returns `Ok(None)` when unset.
+    pub fn parse_upload_window(&self) -> anyhow::Result<Option<UploadWindow>> {
+        match self.upload_window.as_deref() {
+            None | Some("") => Ok(None),
+            Some(s)         => parse_upload_window(s).map(Some),
+        }
     }
 }
 
@@ -307,6 +322,74 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(s.parse()?))
 }
 
+// ── Upload window ─────────────────────────────────────────────────────────────
+
+/// Bandwidth schedule: a daily local-time interval during which uploads
+/// are permitted. Stored as minutes-since-midnight; if `start_min ==
+/// end_min`, the window is "always open" (degenerate, but tolerated).
+/// If `start_min > end_min` the window crosses midnight (e.g. 22:00–06:00).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadWindow {
+    pub start_min: u32, // 0..1440
+    pub end_min:   u32, // 0..1440
+}
+
+impl UploadWindow {
+    /// True if the given minute-of-day falls within the window.
+    /// The window is half-open: `[start, end)` for non-wrapping, or
+    /// `[start, 1440) ∪ [0, end)` when wrapping past midnight.
+    pub fn contains_minute(&self, m: u32) -> bool {
+        if self.start_min == self.end_min {
+            // Degenerate: treat as 24/7 open (less surprising than 24/7 closed).
+            return true;
+        }
+        if self.start_min < self.end_min {
+            self.start_min <= m && m < self.end_min
+        } else {
+            // wraps past midnight
+            m >= self.start_min || m < self.end_min
+        }
+    }
+
+    /// Seconds from `now_min` (with `now_sec` seconds-into-minute) until
+    /// the window opens. Returns 0 if currently open.
+    pub fn seconds_until_open(&self, now_min: u32, now_sec: u32) -> u64 {
+        if self.contains_minute(now_min) {
+            return 0;
+        }
+        // Minutes from now until start_min, mod 1440.
+        let now_total = now_min as i64 * 60 + now_sec as i64;
+        let start_total = self.start_min as i64 * 60;
+        let mut diff = start_total - now_total;
+        let day = 24 * 60 * 60;
+        if diff <= 0 { diff += day; }
+        diff as u64
+    }
+}
+
+/// Parse an `"HH:MM-HH:MM"` time-of-day window. Times are local-time;
+/// if the start is later than the end the window crosses midnight.
+pub fn parse_upload_window(s: &str) -> anyhow::Result<UploadWindow> {
+    let s = s.trim();
+    let (start, end) = s.split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("upload window must be HH:MM-HH:MM, got {s:?}"))?;
+    let start_min = parse_hhmm(start.trim())
+        .map_err(|e| anyhow::anyhow!("upload window start: {e}"))?;
+    let end_min   = parse_hhmm(end.trim())
+        .map_err(|e| anyhow::anyhow!("upload window end: {e}"))?;
+    Ok(UploadWindow { start_min, end_min })
+}
+
+fn parse_hhmm(s: &str) -> anyhow::Result<u32> {
+    let (h, m) = s.split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected HH:MM, got {s:?}"))?;
+    let h: u32 = h.parse().map_err(|_| anyhow::anyhow!("bad hour in {s:?}"))?;
+    let m: u32 = m.parse().map_err(|_| anyhow::anyhow!("bad minute in {s:?}"))?;
+    if h >= 24 { anyhow::bail!("hour out of range: {h}"); }
+    if m >= 60 { anyhow::bail!("minute out of range: {m}"); }
+    Ok(h * 60 + m)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -326,5 +409,66 @@ mod tests {
         assert_eq!(parse_duration("30s").unwrap(),   Duration::from_secs(30));
         assert_eq!(parse_duration("2m").unwrap(),    Duration::from_secs(120));
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn upload_window_basic_parse() {
+        let w = parse_upload_window("22:00-06:00").unwrap();
+        assert_eq!(w.start_min, 22 * 60);
+        assert_eq!(w.end_min,    6 * 60);
+    }
+
+    #[test]
+    fn upload_window_invalid_inputs() {
+        assert!(parse_upload_window("").is_err());
+        assert!(parse_upload_window("22:00").is_err());
+        assert!(parse_upload_window("25:00-06:00").is_err());
+        assert!(parse_upload_window("22:60-06:00").is_err());
+        assert!(parse_upload_window("foo-bar").is_err());
+    }
+
+    #[test]
+    fn upload_window_non_wrapping_contains() {
+        let w = parse_upload_window("09:00-17:00").unwrap();
+        assert!(!w.contains_minute(8 * 60 + 59));
+        assert!( w.contains_minute(9 * 60));
+        assert!( w.contains_minute(13 * 60));
+        assert!(!w.contains_minute(17 * 60), "end is exclusive");
+        assert!(!w.contains_minute(20 * 60));
+    }
+
+    #[test]
+    fn upload_window_wrapping_contains() {
+        let w = parse_upload_window("22:00-06:00").unwrap();
+        assert!(!w.contains_minute(8 * 60));
+        assert!(!w.contains_minute(20 * 60));
+        assert!(!w.contains_minute(21 * 60 + 59));
+        assert!( w.contains_minute(22 * 60));
+        assert!( w.contains_minute(23 * 60));
+        assert!( w.contains_minute(0));
+        assert!( w.contains_minute(5 * 60 + 59));
+        assert!(!w.contains_minute(6 * 60), "end is exclusive");
+    }
+
+    #[test]
+    fn upload_window_seconds_until_open() {
+        let w = parse_upload_window("22:00-06:00").unwrap();
+        // Currently 21:00 → 1 hour until 22:00
+        assert_eq!(w.seconds_until_open(21 * 60, 0), 3600);
+        // Currently 23:00 → window is open, 0 seconds
+        assert_eq!(w.seconds_until_open(23 * 60, 0), 0);
+        // Currently 06:00 → window just closed, 16 hours until 22:00
+        assert_eq!(w.seconds_until_open(6 * 60, 0), 16 * 3600);
+        // Currently 21:59:30 → 30 seconds until 22:00
+        assert_eq!(w.seconds_until_open(21 * 60 + 59, 30), 30);
+    }
+
+    #[test]
+    fn upload_window_degenerate_equal_start_end_means_always_open() {
+        let w = parse_upload_window("12:00-12:00").unwrap();
+        assert!(w.contains_minute(0));
+        assert!(w.contains_minute(12 * 60));
+        assert!(w.contains_minute(23 * 60 + 59));
+        assert_eq!(w.seconds_until_open(8 * 60, 0), 0);
     }
 }

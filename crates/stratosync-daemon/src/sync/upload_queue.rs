@@ -15,10 +15,12 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use chrono::{Local, Timelike};
+
 use stratosync_core::{
     backend::Backend,
     base_store::BaseStore,
-    config::SyncConfig,
+    config::{SyncConfig, UploadWindow},
     ipc::{ActiveUpload, QueueStatus},
     state::{StateDb, SyncQueueJob},
     types::{Inode, SyncError, SyncStatus},
@@ -52,6 +54,7 @@ impl UploadQueue {
         debounce:        Duration,
         close_debounce:  Duration,
         max_concurrent:  usize,
+        upload_window:   Option<UploadWindow>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(512);
         let tx_inner = tx.clone();
@@ -61,6 +64,7 @@ impl UploadQueue {
                 tx_inner, rx, mount_id, db, backend,
                 base_store, sync_config,
                 debounce, close_debounce, max_concurrent,
+                upload_window,
             ).await;
             // If we get here, the loop exited (channel closed or unexpected return).
             // Reset any stuck Uploading inodes so they're retried on restart.
@@ -98,6 +102,38 @@ impl UploadQueue {
 struct PendingUpload {
     /// When the debounce expires and the upload should start.
     due_at: tokio::time::Instant,
+    /// True if any trigger for this inode was an explicit `fsync` —
+    /// such uploads bypass the bandwidth schedule. Once set, stays
+    /// set until the upload runs (a subsequent Write does not
+    /// downgrade an fsync'd entry).
+    immediate: bool,
+}
+
+/// Compute the soonest tokio::time::Instant the upload may fire for a
+/// pending entry, given the bandwidth window. Immediate (fsync'd) entries
+/// always fire at their natural `due_at`; non-immediate entries are pushed
+/// to whichever is later: their `due_at`, or when the window opens.
+fn effective_due_at(
+    p:              &PendingUpload,
+    window:         Option<UploadWindow>,
+    now_tokio:      tokio::time::Instant,
+    secs_until_open: u64,
+) -> tokio::time::Instant {
+    if p.immediate || window.is_none() || secs_until_open == 0 {
+        return p.due_at;
+    }
+    let opens_at = now_tokio + Duration::from_secs(secs_until_open);
+    p.due_at.max(opens_at)
+}
+
+/// Seconds until the upload window opens, or 0 if it's open right now
+/// (or no window is configured).
+fn secs_until_window_opens(window: Option<UploadWindow>) -> u64 {
+    let Some(w) = window else { return 0 };
+    let now = Local::now();
+    let now_min = now.hour() * 60 + now.minute();
+    let now_sec = now.second();
+    w.seconds_until_open(now_min, now_sec)
 }
 
 async fn upload_loop(
@@ -111,6 +147,7 @@ async fn upload_loop(
     debounce:       Duration,
     close_debounce: Duration,
     max_concurrent: usize,
+    upload_window:  Option<UploadWindow>,
 ) {
     // Debounce tracking: inode → when the upload should fire.
     // New triggers push the deadline forward (Write) or shorten it (Close/Fsync).
@@ -122,8 +159,19 @@ async fn upload_loop(
     let mut in_flight_started: HashMap<Inode, Instant> = HashMap::new();
 
     loop {
-        // Find the soonest deadline among pending items.
-        let next_deadline = pending.values().map(|p| p.due_at).min();
+        // Bandwidth schedule: how long until the window reopens (0 if open
+        // right now or no schedule). Computed once per loop iteration so the
+        // deadline calc and dispatch check use a consistent snapshot.
+        let secs_until_open = secs_until_window_opens(upload_window);
+        let now_tokio = tokio::time::Instant::now();
+
+        // Find the soonest deadline among pending items, factoring in the
+        // bandwidth window — non-immediate jobs whose natural `due_at` lands
+        // outside the window get pushed to when the window opens, so the
+        // sleep_until below doesn't busy-spin re-checking past deadlines.
+        let next_deadline = pending.values()
+            .map(|p| effective_due_at(p, upload_window, now_tokio, secs_until_open))
+            .min();
         let at_capacity = in_flight.len() >= max_concurrent;
 
         tokio::select! {
@@ -139,10 +187,10 @@ async fn upload_loop(
                     continue;
                 }
 
-                let (inode, window) = match trigger {
-                    UploadTrigger::Write { inode } => (inode, debounce),
-                    UploadTrigger::Close { inode } => (inode, close_debounce),
-                    UploadTrigger::Fsync { inode } => (inode, Duration::ZERO),
+                let (inode, window, is_fsync) = match trigger {
+                    UploadTrigger::Write { inode } => (inode, debounce,        false),
+                    UploadTrigger::Close { inode } => (inode, close_debounce,  false),
+                    UploadTrigger::Fsync { inode } => (inode, Duration::ZERO,  true),
                     UploadTrigger::Snapshot { .. } => unreachable!("handled above"),
                 };
 
@@ -159,9 +207,18 @@ async fn upload_loop(
                             // Close/Fsync: shorten to min(current, new)
                             entry.due_at = entry.due_at.min(new_due);
                         }
+                        // Once fsync'd, stay fsync'd — never downgrade. A
+                        // subsequent Write that arrives mid-flight just adds
+                        // bytes; user already said "I care about durability."
+                        if is_fsync {
+                            entry.immediate = true;
+                        }
                     }
                     None => {
-                        pending.insert(inode, PendingUpload { due_at: new_due });
+                        pending.insert(inode, PendingUpload {
+                            due_at:    new_due,
+                            immediate: is_fsync,
+                        });
                     }
                 }
             }
@@ -181,8 +238,16 @@ async fn upload_loop(
                 }
             } => {
                 let now = tokio::time::Instant::now();
+                // Re-check the window — it may have just opened (sleep_until
+                // landed exactly at the boundary) or, conversely, ticked past
+                // a non-wrapping window's end while we slept.
+                let window_open_now = secs_until_window_opens(upload_window) == 0;
                 let ready: Vec<Inode> = pending.iter()
-                    .filter(|(_, p)| p.due_at <= now)
+                    .filter(|(_, p)| {
+                        // Job is ready if its debounce has expired AND
+                        // (it's an fsync OR the bandwidth window is open).
+                        p.due_at <= now && (p.immediate || window_open_now)
+                    })
                     .map(|(&inode, _)| inode)
                     .collect();
 
@@ -231,9 +296,12 @@ async fn upload_loop(
                         if let Err(db_err) = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await {
                             warn!(inode, "failed to record retry backoff: {db_err}");
                         }
-                        // Re-add to pending with debounce delay for retry
+                        // Re-add to pending with debounce delay for retry.
+                        // Retries are not "immediate" — they respect the
+                        // bandwidth window like a normal write.
                         pending.insert(inode, PendingUpload {
-                            due_at: tokio::time::Instant::now() + debounce,
+                            due_at:    tokio::time::Instant::now() + debounce,
+                            immediate: false,
                         });
                     }
                     Ok((inode, Err(e))) => {
@@ -374,4 +442,86 @@ async fn run_upload(
 
     info!(inode, path = %entry.remote_path, "upload ok");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the bandwidth-scheduling helpers.
+    //!
+    //! End-to-end dispatcher tests would require injecting a clock for
+    //! `chrono::Local::now()`, which the codebase doesn't have abstracted
+    //! today. The dispatcher's behavior follows mechanically from
+    //! `effective_due_at` + the trigger handling, so we test those at the
+    //! unit level and rely on the type system for the wiring.
+    use super::*;
+
+    fn window(start: u32, end: u32) -> UploadWindow {
+        UploadWindow { start_min: start, end_min: end }
+    }
+
+    fn pending(due_in: Duration, immediate: bool) -> PendingUpload {
+        PendingUpload {
+            due_at: tokio::time::Instant::now() + due_in,
+            immediate,
+        }
+    }
+
+    #[test]
+    fn effective_due_at_immediate_bypasses_window() {
+        let now = tokio::time::Instant::now();
+        let p = pending(Duration::from_secs(1), true);
+        // 1 hour until window opens, but immediate=true should ignore it.
+        let got = effective_due_at(&p, Some(window(22 * 60, 6 * 60)), now, 3600);
+        assert_eq!(got, p.due_at, "fsync'd entry must fire at its natural due_at");
+    }
+
+    #[test]
+    fn effective_due_at_no_window_uses_natural_deadline() {
+        let now = tokio::time::Instant::now();
+        let p = pending(Duration::from_secs(5), false);
+        let got = effective_due_at(&p, None, now, 0);
+        assert_eq!(got, p.due_at);
+    }
+
+    #[test]
+    fn effective_due_at_window_open_uses_natural_deadline() {
+        let now = tokio::time::Instant::now();
+        let p = pending(Duration::from_secs(5), false);
+        // Window present and open (secs_until_open == 0).
+        let got = effective_due_at(&p, Some(window(0, 24 * 60 - 1)), now, 0);
+        assert_eq!(got, p.due_at);
+    }
+
+    #[test]
+    fn effective_due_at_closed_window_pushes_deadline_to_open_time() {
+        let now = tokio::time::Instant::now();
+        let p = pending(Duration::from_secs(5), false);
+        // Job is naturally due in 5s, but the window opens in 600s.
+        // Effective deadline must be the LATER of the two — i.e. window-open.
+        let got = effective_due_at(&p, Some(window(22 * 60, 6 * 60)), now, 600);
+        let expected = now + Duration::from_secs(600);
+        assert_eq!(got, expected, "non-immediate job must wait for window open");
+    }
+
+    #[test]
+    fn effective_due_at_late_natural_deadline_unchanged_inside_closed_window() {
+        let now = tokio::time::Instant::now();
+        // Natural debounce expires AFTER the window opens — the job should
+        // fire at its natural deadline (the window will already be open).
+        let p = pending(Duration::from_secs(1200), false);
+        let got = effective_due_at(&p, Some(window(22 * 60, 6 * 60)), now, 600);
+        assert_eq!(got, p.due_at, "max() picks the later of natural-due and window-open");
+    }
+
+    #[tokio::test]
+    async fn secs_until_window_opens_returns_zero_for_no_window() {
+        assert_eq!(secs_until_window_opens(None), 0);
+    }
+
+    #[tokio::test]
+    async fn secs_until_window_opens_returns_zero_for_always_open_window() {
+        // 12:00–12:00 is the degenerate "always open" form.
+        let w = Some(window(12 * 60, 12 * 60));
+        assert_eq!(secs_until_window_opens(w), 0);
+    }
 }

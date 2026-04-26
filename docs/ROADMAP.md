@@ -83,7 +83,7 @@ Deliverables:
 Potential additions:
 - ~~Selective sync (per-mount `ignore_patterns` glob list)~~ ✓ (Unreleased) — `.stratosyncignore` in-tree files still pending
 - File versioning (keep N previous versions in a `.versions/` shadow tree)
-- Bandwidth scheduling (upload only at night, or within configured hours)
+- ~~Bandwidth scheduling (upload only at night, or within configured hours)~~ ✓ (Unreleased) — single per-mount window, local-time, wraparound; multi-window and day-of-week deferred
 - ~~Metrics endpoint (Prometheus-compatible `/metrics` via tokio socket)~~ ✓ (Unreleased) — gauge-only; counters (polls/skipped/bytes) deferred
 - Multiple accounts for the same provider (e.g. two Google Drive accounts)
 - Encrypted caching (encrypt local cache files at rest)
