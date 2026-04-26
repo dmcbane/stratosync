@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
   canonical file (the common case after a transient false-positive),
   shows per-entry progress, and accepts `--dry-run`. Includes a
   stat-based fast path and live progress output for large trees.
+- **Multiple accounts per provider (Phase 5, item 4)**: documented as
+  already-supported. Each `[[mount]]` block is fully isolated — its
+  own SQLite DB, cache directory, poller, upload queue, FUSE thread,
+  and (with `webdav_sidecar = true`) WebDAV sidecar on a distinct
+  port. Configuring two Google Drive accounts is a matter of two
+  rclone remotes plus two mount blocks. No code change.
 - **Bandwidth scheduling (Phase 5, item 3)**: per-mount
   `upload_window = "HH:MM-HH:MM"` (local time, wraparound supported).
   Outside the window the upload queue holds dirty files but does not

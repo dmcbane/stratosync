@@ -103,6 +103,45 @@ extra_flags = ["--s3-acl", "private"]
 
 ---
 
+## Multiple accounts for the same provider
+
+Two (or more) accounts of the same provider — e.g. a personal Google
+Drive and a work Google Drive — work today by configuring two distinct
+rclone remotes and two `[[mount]]` blocks. No daemon-side change is
+needed.
+
+```bash
+# Configure two GDrive remotes via rclone — each gets its own OAuth token.
+rclone config   # add "gdrive-personal"
+rclone config   # add "gdrive-work"
+```
+
+```toml
+[[mount]]
+name        = "gdrive-personal"
+remote      = "gdrive-personal:/"
+mount_path  = "~/Drive-Personal"
+
+[[mount]]
+name        = "gdrive-work"
+remote      = "gdrive-work:/"
+mount_path  = "~/Drive-Work"
+```
+
+Each mount gets its own SQLite database (keyed by `name`), cache
+directory, poller, FUSE thread, upload queue, and (when enabled) WebDAV
+sidecar process on a distinct port. There is no shared state between
+mounts, so concurrent sync of multiple accounts is naturally isolated.
+OAuth credentials are managed by rclone — `~/.config/rclone/rclone.conf`
+holds one token entry per remote name.
+
+CLI commands (`status`, `ls`, `conflicts`, `pin`) operate across all
+mounts; they resolve which mount to query by matching the filesystem
+path against each mount's `mount_path` prefix, so no `--mount` flag is
+needed.
+
+---
+
 ## Bandwidth schedule (`upload_window`)
 
 Per-mount local-time window during which uploads are permitted.
