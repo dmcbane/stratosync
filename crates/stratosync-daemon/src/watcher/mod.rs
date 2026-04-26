@@ -14,7 +14,7 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use stratosync_core::{state::StateDb, types::SyncStatus};
+use stratosync_core::{state::StateDb, types::SyncStatus, GlobSet};
 
 use crate::sync::upload_queue::{UploadQueue, UploadTrigger};
 
@@ -31,6 +31,7 @@ impl FsWatcher {
         mount_id:     u32,
         db:           Arc<StateDb>,
         upload_queue: Arc<UploadQueue>,
+        ignore:       Arc<GlobSet>,
     ) -> Result<Self> {
         let (tx, mut rx) = mpsc::channel::<notify::Result<Event>>(512);
 
@@ -51,7 +52,7 @@ impl FsWatcher {
         tokio::spawn(async move {
             while let Some(res) = rx.recv().await {
                 match res {
-                    Ok(event) => handle_event(event, mount_id, &cache_dir_owned, &db, &upload_queue).await,
+                    Ok(event) => handle_event(event, mount_id, &cache_dir_owned, &db, &upload_queue, &ignore).await,
                     Err(e)    => warn!("inotify error: {e}"),
                 }
             }
@@ -70,6 +71,7 @@ async fn handle_event(
     cache_dir:    &std::path::Path,
     db:           &Arc<StateDb>,
     upload_queue: &Arc<UploadQueue>,
+    ignore:       &GlobSet,
 ) {
     let is_write_event = matches!(
         event.kind,
@@ -95,6 +97,11 @@ async fn handle_event(
             },
             Err(_) => continue,
         };
+
+        // Selective sync: ignored paths must never enqueue uploads.
+        if ignore.is_match(&remote_path) {
+            continue;
+        }
 
         // Look up the current inode by remote_path (stable across poller upserts)
         match db.get_by_remote_path(mount_id, &remote_path).await {

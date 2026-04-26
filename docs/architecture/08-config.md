@@ -40,6 +40,15 @@ cache_quota = "10 GiB"
 poll_interval = "30s"
 enabled     = true
 
+# Selective sync: glob patterns to exclude from indexing/upload/FUSE create.
+# Optional; default is no patterns (full sync).
+ignore_patterns = [
+    "*.tmp",
+    "*.log",
+    "node_modules/**",
+    "**/target",
+]
+
 [mount.rclone]
 # Extra flags passed to every rclone invocation for this mount
 extra_flags  = []
@@ -82,6 +91,56 @@ enabled     = false       # disabled by default
 [mount.rclone]
 extra_flags = ["--s3-acl", "private"]
 ```
+
+---
+
+## Selective sync (`ignore_patterns`)
+
+Per-mount glob patterns that exclude matching paths from three places at
+once: the remote poller's index, FUSE `create`/`mkdir` operations, and the
+inotify-driven upload queue.
+
+```toml
+[[mount]]
+name = "drive"
+# ...
+ignore_patterns = ["*.tmp", "node_modules/**", "*.log"]
+```
+
+**Match semantics** (via the `globset` crate's defaults):
+
+- Patterns match the **remote path relative to the mount root**, with `/`
+  separators and case-sensitive comparisons.
+- `*` matches across path separators, so `*.log` catches `foo.log`,
+  `dir/foo.log`, and `a/b/c/foo.log` alike. This is more permissive than
+  shell globs but matches what most users expect from a sync tool.
+- Use `dir/**` to ignore the *contents* of a subtree. The directory entry
+  itself is unaffected — to also block creation of the directory, add the
+  bare `dir` pattern as well.
+- Patterns are validated at daemon startup; a malformed pattern aborts
+  startup with an error naming the offending pattern.
+
+**Behavior on each ingress point**:
+
+| Where               | Effect                                                                 |
+|---------------------|------------------------------------------------------------------------|
+| Remote poller       | Skips upsert; matching entries never enter `file_index`.              |
+| FUSE `create`/`mkdir` | Returns `EPERM` so applications see a clear error, not silent loss.  |
+| inotify watcher     | Skips enqueue; cache writes to ignored paths never become uploads.    |
+
+**Reversibility — preserve-on-ignore**: an entry already in the DB that
+newly matches a pattern is *preserved*, not retroactively wiped. The
+poller's stale-entry sweep is told to keep these entries by bumping their
+generation. Net effect: ignore patterns prevent new indexing; they never
+unindex. Remove the pattern and the file behaves normally again. Cleaning
+up entries that retroactively match an ignore pattern is a manual step
+(future work: a `stratosync ignore prune` CLI command).
+
+**Limitations** (intentional, room for follow-up):
+
+- No in-tree `.stratosyncignore` files (cascading per-directory rules).
+- No negation patterns (`!keep.tmp`).
+- No retroactive cleanup of entries that match a newly-added pattern.
 
 ---
 

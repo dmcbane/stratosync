@@ -21,6 +21,7 @@ libc.workspace        = true
 reqwest.workspace     = true
 sha2.workspace        = true
 urlencoding.workspace = true
+globset             = "0.4"
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }

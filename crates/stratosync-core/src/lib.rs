@@ -12,3 +12,5 @@ pub use state::StateDb;
 pub use config::Config;
 pub use backend::{Backend, RcloneBackend, RemoteAbout};
 pub use backend::webdav::WebDavBackend;
+
+pub use globset::{Glob, GlobSet, GlobSetBuilder};

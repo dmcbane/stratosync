@@ -28,6 +28,7 @@ use stratosync_core::{
     state::{NewFileEntry, StateDb},
     types::{FileEntry, FileKind, Inode, SyncError, SyncStatus},
     backend::Backend,
+    GlobSet,
 };
 use crate::sync::upload_queue::{UploadQueue, UploadTrigger};
 
@@ -126,6 +127,7 @@ pub async fn handle_create(
     cache_dir:    &Path,
     open_files:   &Arc<DashMap<u64, super::OpenFile>>,
     next_fh:      &Arc<std::sync::atomic::AtomicU64>,
+    ignore:       &GlobSet,
 ) -> Result<(Inode, u64), libc::c_int> {
     validate_filename(name)?;
 
@@ -134,6 +136,15 @@ pub async fn handle_create(
         .ok_or(libc::ENOENT)?;
 
     let remote_path = join_remote(&parent_entry.remote_path, name);
+
+    // Selective sync: refuse creates of names that would never be synced.
+    // EPERM (not ENOENT) so callers see a clear "not permitted" rather than
+    // thinking the parent vanished — and so apps don't silently lose data
+    // into an untracked file.
+    if ignore.is_match(&remote_path) {
+        return Err(libc::EPERM);
+    }
+
     let cache_path  = safe_cache_path(cache_dir, &remote_path)?;
 
     // Create the empty cache file
@@ -181,6 +192,7 @@ pub async fn handle_mkdir(
     mount_id: u32,
     db:       &Arc<StateDb>,
     backend:  &Arc<dyn Backend>,
+    ignore:   &GlobSet,
 ) -> Result<Inode, libc::c_int> {
     validate_filename(name)?;
 
@@ -189,6 +201,13 @@ pub async fn handle_mkdir(
         .ok_or(libc::ENOENT)?;
 
     let remote_path = join_remote(&parent_entry.remote_path, name);
+
+    // Selective sync: same reasoning as handle_create — block creation of
+    // a directory whose path matches the ignore set, so users don't silently
+    // accumulate untracked subtrees.
+    if ignore.is_match(&remote_path) {
+        return Err(libc::EPERM);
+    }
 
     // Insert DB entry immediately so the directory is visible in listings
     let inode = db.insert_file(&NewFileEntry {
@@ -451,5 +470,91 @@ pub fn join_remote(parent: &str, child: &str) -> String {
         child.to_string()
     } else {
         format!("{p}/{child}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use stratosync_core::{
+        backend::mock::MockBackend,
+        types::FUSE_ROOT_INODE,
+        Glob, GlobSetBuilder,
+    };
+
+    async fn setup(patterns: &[&str]) -> (
+        Arc<StateDb>,
+        u32,
+        Arc<dyn Backend>,
+        tempfile::TempDir,
+        Arc<DashMap<u64, super::super::OpenFile>>,
+        Arc<AtomicU64>,
+        GlobSet,
+    ) {
+        let db = Arc::new(StateDb::in_memory().unwrap());
+        db.migrate().await.unwrap();
+        let mid = db.upsert_mount("t", "mock:/", "/mnt/t", "/tmp/c", 1<<30, 60).await.unwrap();
+        db.insert_root(&NewFileEntry {
+            mount_id: mid, parent: 0,
+            name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::default());
+        let cache = tempfile::tempdir().unwrap();
+        let open_files = Arc::new(DashMap::new());
+        let next_fh = Arc::new(AtomicU64::new(1));
+
+        let mut b = GlobSetBuilder::new();
+        for p in patterns { b.add(Glob::new(p).unwrap()); }
+        let ignore = b.build().unwrap();
+
+        (db, mid, backend, cache, open_files, next_fh, ignore)
+    }
+
+    #[tokio::test]
+    async fn handle_create_blocks_ignored_names() {
+        let (db, mid, _backend, cache, open_files, next_fh, ignore) =
+            setup(&["*.tmp"]).await;
+
+        let err = handle_create(
+            FUSE_ROOT_INODE, "scratch.tmp", mid, &db, cache.path(),
+            &open_files, &next_fh, &ignore,
+        ).await.unwrap_err();
+        assert_eq!(err, libc::EPERM, "ignored create must return EPERM");
+
+        // DB must NOT have the entry
+        assert!(db.get_by_remote_path(mid, "scratch.tmp").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_create_allows_non_matching() {
+        let (db, mid, _backend, cache, open_files, next_fh, ignore) =
+            setup(&["*.tmp"]).await;
+
+        let (inode, _fh) = handle_create(
+            FUSE_ROOT_INODE, "keep.txt", mid, &db, cache.path(),
+            &open_files, &next_fh, &ignore,
+        ).await.expect("non-ignored create should succeed");
+        assert!(inode > 0);
+        assert!(db.get_by_remote_path(mid, "keep.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn handle_mkdir_blocks_ignored_names() {
+        // Match the directory itself; `node_modules/**` matches contents
+        // but not the dir entry, so we use a literal here.
+        let (db, mid, backend, _cache, _of, _nf, ignore) =
+            setup(&["node_modules"]).await;
+
+        let err = handle_mkdir(
+            FUSE_ROOT_INODE, "node_modules", mid, &db, &backend, &ignore,
+        ).await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+        assert!(db.get_by_remote_path(mid, "node_modules").await.unwrap().is_none());
     }
 }

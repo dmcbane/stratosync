@@ -81,9 +81,31 @@ Deliverables:
 **Goal**: Power-user capabilities.
 
 Potential additions:
-- Selective sync (ignore patterns per mount, `.stratosyncignore`)
+- ~~Selective sync (per-mount `ignore_patterns` glob list)~~ ✓ (Unreleased) — `.stratosyncignore` in-tree files still pending
 - File versioning (keep N previous versions in a `.versions/` shadow tree)
 - Bandwidth scheduling (upload only at night, or within configured hours)
 - Metrics endpoint (Prometheus-compatible `/metrics` via tokio socket)
 - Multiple accounts for the same provider (e.g. two Google Drive accounts)
 - Encrypted caching (encrypt local cache files at rest)
+
+---
+
+## Phase 6: File Manager Integration
+
+**Goal**: First-class status overlays and context-menu actions across the major Linux file managers, not just Nautilus.
+
+All extensions read the same `user.stratosync.{status,etag,remote_path}` xattrs already exposed by the FUSE layer, and talk to the daemon via the existing dashboard IPC socket for actions. Goal is feature parity: emblem/overlay icons for `synced` / `syncing` / `pinned` / `conflict`, plus context-menu entries for pin/unpin, resolve conflict, copy public link, and "open remote in browser".
+
+Deliverables:
+- **Dolphin (KDE Plasma)** — KFileItemActionPlugin (C++/Qt) for context-menu actions, plus an Overlay Icon plugin (`KOverlayIconPlugin`) for status emblems.
+- **Nemo (Cinnamon)** — Python extension via `nemo-python` (API mirrors Nautilus, mostly a port of the existing extension).
+- **Caja (MATE)** — Python extension via `caja-python` (also Nautilus-API compatible; share code with Nemo where possible).
+- **Thunar (XFCE)** — `thunarx` C plugin or `uca` (custom-actions) shim; Thunar has no native emblem API, so fall back to thumbnailer-based status badges or a sidebar panel.
+- **PCManFM / PCManFM-Qt (LXDE/LXQt)** — investigate; likely custom-actions only (no overlay API).
+- Shared logic extracted into a small helper library so each extension is a thin shell.
+- Packaging: each extension as its own optional package (`stratosync-dolphin`, `stratosync-nemo`, etc.) so users only install what their desktop uses.
+
+Acceptance criteria:
+- On a fresh KDE/Cinnamon/MATE/XFCE install, the matching extension package installs cleanly and shows the right emblem within one poll cycle of a status change.
+- Context-menu "Pin for offline" round-trips through the daemon and updates the emblem without a file-manager restart.
+- No extension blocks the file manager UI on slow network calls — all daemon RPC is async or backgrounded.

@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use stratosync_core::{
-    backend::Backend, ipc::PollerStatus, state::StateDb, types::*, RemoteMetadata,
+    backend::Backend, ipc::PollerStatus, state::StateDb, types::*, GlobSet, RemoteMetadata,
 };
 
 pub struct RemotePoller {
@@ -23,6 +23,7 @@ pub struct RemotePoller {
     backend:       Arc<dyn Backend>,
     poll_interval: Duration,
     state:         Arc<RwLock<PollerStatus>>,
+    ignore:        Arc<GlobSet>,
 }
 
 impl RemotePoller {
@@ -31,6 +32,7 @@ impl RemotePoller {
         db:            Arc<StateDb>,
         backend:       Arc<dyn Backend>,
         poll_interval: Duration,
+        ignore:        Arc<GlobSet>,
     ) -> Self {
         let mode = if backend.supports_delta() { "delta" } else { "full-listing" };
         let state = Arc::new(RwLock::new(PollerStatus {
@@ -38,7 +40,7 @@ impl RemotePoller {
             current_interval_secs: poll_interval.as_secs(),
             ..Default::default()
         }));
-        Self { mount_id, db, backend, poll_interval, state }
+        Self { mount_id, db, backend, poll_interval, state, ignore }
     }
 
     /// Expose a handle to the live poller state so the IPC server can
@@ -162,6 +164,7 @@ impl RemotePoller {
         let mut unchanged_inodes: Vec<Inode> = Vec::new();
         let mut skipped_tombstoned = 0usize;
         let mut skipped_unsafe = 0usize;
+        let mut skipped_ignored = 0usize;
 
         for meta in &remote_files {
             // Safety: skip path traversal and null bytes
@@ -180,6 +183,19 @@ impl RemotePoller {
             // Skip tombstoned paths
             if tombstones.iter().any(|t| meta.path == *t || meta.path.starts_with(&format!("{t}/"))) {
                 skipped_tombstoned += 1;
+                continue;
+            }
+
+            // Selective sync: never index entries matching ignore_patterns.
+            // If an entry was already indexed before the pattern was added,
+            // bump its generation so phase-3 delete_stale_entries doesn't
+            // wipe it. Ignore rules prevent NEW indexing, never retroactively
+            // unindex (matches gitignore behavior; reversible).
+            if self.ignore.is_match(&meta.path) {
+                if let Some(snap) = db_snapshot.get(&meta.path) {
+                    unchanged_inodes.push(snap.inode);
+                }
+                skipped_ignored += 1;
                 continue;
             }
 
@@ -279,6 +295,7 @@ impl RemotePoller {
             unchanged   = unchanged_inodes.len(),
             deleted     = deleted.len(),
             tombstoned  = skipped_tombstoned,
+            ignored     = skipped_ignored,
             "poll complete"
         );
         Ok(())
@@ -383,6 +400,12 @@ impl RemotePoller {
                         continue;
                     }
 
+                    // Selective sync: never insert ignored entries. Delta
+                    // mode has no generation sweep, so a plain skip is fine.
+                    if self.ignore.is_match(&meta.path) {
+                        continue;
+                    }
+
                     let kind = if meta.is_dir {
                         FileKind::Directory
                     } else {
@@ -438,5 +461,124 @@ impl RemotePoller {
             "delta poll complete"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stratosync_core::{
+        backend::mock::MockBackend,
+        state::NewFileEntry,
+        types::{FileKind, SyncStatus},
+        GlobSetBuilder,
+    };
+
+    async fn setup(patterns: &[&str]) -> (Arc<StateDb>, u32, MockBackend, Arc<GlobSet>) {
+        let db = Arc::new(StateDb::in_memory().unwrap());
+        db.migrate().await.unwrap();
+        let mount_id = db
+            .upsert_mount("test", "mock:/", "/mnt/test", "/tmp/cache", 5 << 30, 60)
+            .await
+            .unwrap();
+        db.insert_root(&NewFileEntry {
+            mount_id, parent: 0,
+            name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let mut b = GlobSetBuilder::new();
+        for p in patterns {
+            b.add(stratosync_core::Glob::new(p).unwrap());
+        }
+        let ignore = Arc::new(b.build().unwrap());
+
+        (db, mount_id, MockBackend::default(), ignore)
+    }
+
+    fn poller(
+        mount_id: u32,
+        db: Arc<StateDb>,
+        backend: MockBackend,
+        ignore: Arc<GlobSet>,
+    ) -> RemotePoller {
+        let backend: Arc<dyn Backend> = Arc::new(backend);
+        RemotePoller::new(mount_id, db, backend, Duration::from_secs(60), ignore)
+    }
+
+    #[tokio::test]
+    async fn poll_skips_ignored_remote_files() {
+        let (db, mid, backend, ignore) = setup(&["*.log", "node_modules/**"]).await;
+
+        backend.seed_file("keep.txt", b"hi");
+        backend.seed_file("noisy.log", b"trace");
+        backend.seed_file("node_modules/lib.js", b"x");
+        backend.seed_file("src/main.rs", b"fn main(){}");
+
+        let p = poller(mid, Arc::clone(&db), backend, ignore);
+        p.poll_once().await.unwrap();
+
+        // Non-ignored files indexed
+        assert!(db.get_by_remote_path(mid, "keep.txt").await.unwrap().is_some());
+        assert!(db.get_by_remote_path(mid, "src/main.rs").await.unwrap().is_some());
+
+        // Ignored files not indexed
+        assert!(db.get_by_remote_path(mid, "noisy.log").await.unwrap().is_none());
+        assert!(db.get_by_remote_path(mid, "node_modules/lib.js").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_preserves_already_indexed_entries_that_newly_match() {
+        // Regression guard: phase-3 delete_stale_entries would otherwise wipe
+        // entries that we silently dropped from the upsert/unchanged sets.
+        // Pre-seed the DB with a file, then add an ignore pattern that matches
+        // it and run a poll. The entry must survive.
+
+        let (db, mid, backend, _) = setup(&[]).await;
+
+        // First pass: index legacy.log normally.
+        backend.seed_file("legacy.log", b"old");
+        backend.seed_file("kept.txt", b"keep");
+        let p1 = {
+            let b = backend.clone();
+            poller(mid, Arc::clone(&db), b, Arc::new(GlobSet::empty()))
+        };
+        p1.poll_once().await.unwrap();
+        let before = db.get_by_remote_path(mid, "legacy.log").await.unwrap();
+        assert!(before.is_some(), "legacy.log should be indexed by first poll");
+        let before_inode = before.unwrap().inode;
+
+        // Second pass: ignore *.log. legacy.log must still be in the DB
+        // (preserve-on-ignore), inode unchanged. kept.txt also still there.
+        let mut b = GlobSetBuilder::new();
+        b.add(stratosync_core::Glob::new("*.log").unwrap());
+        let ignore = Arc::new(b.build().unwrap());
+        let p2 = poller(mid, Arc::clone(&db), backend, ignore);
+        p2.poll_once().await.unwrap();
+
+        let after = db.get_by_remote_path(mid, "legacy.log").await.unwrap();
+        assert!(after.is_some(), "legacy.log must NOT be wiped by stale-sweep");
+        assert_eq!(after.unwrap().inode, before_inode, "inode must not change");
+        assert!(db.get_by_remote_path(mid, "kept.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn poll_does_not_re_index_ignored_after_remote_modification() {
+        let (db, mid, backend, ignore) = setup(&["*.log"]).await;
+
+        backend.seed_file("trace.log", b"v1");
+        let p = poller(mid, Arc::clone(&db), backend.clone(), Arc::clone(&ignore));
+        p.poll_once().await.unwrap();
+        assert!(db.get_by_remote_path(mid, "trace.log").await.unwrap().is_none());
+
+        backend.modify_file("trace.log", b"v2-now-bigger");
+        p.poll_once().await.unwrap();
+        assert!(
+            db.get_by_remote_path(mid, "trace.log").await.unwrap().is_none(),
+            "modification of an ignored remote must not insert it"
+        );
     }
 }

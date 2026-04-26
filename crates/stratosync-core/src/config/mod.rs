@@ -192,6 +192,18 @@ pub struct MountConfig {
     pub rclone:        RcloneConfig,
     #[serde(default)]
     pub eviction:      EvictionConfig,
+    /// Glob patterns matched against the remote path (relative to the mount
+    /// root, `/`-separated, case-sensitive). Matching entries are excluded
+    /// from indexing, FUSE creates, and upload events. Already-indexed
+    /// entries that newly match are preserved (not retroactively removed).
+    ///
+    /// Pattern semantics (via `globset` defaults): `*` matches across path
+    /// separators, so `*.log` catches `foo.log`, `dir/foo.log`, and
+    /// `a/b/c/foo.log` alike. Use `node_modules/**` to ignore a subtree's
+    /// contents (the directory entry itself is still indexed; only its
+    /// children are skipped).
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
 }
 
 fn default_cache_quota_str() -> String { "5 GiB".into()  }
@@ -203,6 +215,18 @@ impl MountConfig {
     pub fn poll_duration(&self)     -> anyhow::Result<Duration> { parse_duration(&self.poll_interval) }
     pub fn resolved_mount_path(&self) -> PathBuf { expand_tilde(&self.mount_path) }
     pub fn cache_dir(&self)         -> PathBuf   { default_cache_dir().join(&self.name) }
+
+    /// Compile `ignore_patterns` into a single matcher. Empty patterns
+    /// produce an empty `GlobSet` (matches nothing).
+    pub fn build_ignore_set(&self) -> anyhow::Result<globset::GlobSet> {
+        let mut b = globset::GlobSetBuilder::new();
+        for pat in &self.ignore_patterns {
+            let g = globset::Glob::new(pat)
+                .map_err(|e| anyhow::anyhow!("invalid ignore pattern {:?}: {}", pat, e))?;
+            b.add(g);
+        }
+        b.build().map_err(|e| anyhow::anyhow!("failed to build ignore set: {}", e))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -282,6 +282,7 @@ fn config_mount_cache_quota_and_poll() {
         enabled: true,
         rclone: RcloneConfig::default(),
         eviction: EvictionConfig::default(),
+        ignore_patterns: Vec::new(),
     };
     assert_eq!(m.cache_quota_bytes().unwrap(), 10u64 * (1 << 30));
     assert_eq!(m.poll_duration().unwrap().as_secs(), 30);
@@ -580,6 +581,90 @@ async fn multi_mount_get_by_parent_name_isolated() {
     assert_eq!(entry_b.mount_id, mid_b);
     assert_eq!(entry_b.size, 200);
 
+}
+
+// ── Selective sync (ignore patterns) ──────────────────────────────────────────
+
+fn mount_with_patterns(patterns: &[&str]) -> MountConfig {
+    MountConfig {
+        name: "test".into(),
+        remote: "local:/".into(),
+        mount_path: "/mnt/test".into(),
+        cache_quota: "1 GiB".into(),
+        poll_interval: "60s".into(),
+        enabled: true,
+        rclone: RcloneConfig::default(),
+        eviction: EvictionConfig::default(),
+        ignore_patterns: patterns.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn ignore_set_top_level_glob() {
+    let m = mount_with_patterns(&["*.tmp"]);
+    let set = m.build_ignore_set().unwrap();
+
+    assert!(set.is_match("foo.tmp"));
+    assert!(!set.is_match("foo.txt"));
+}
+
+#[test]
+fn ignore_set_recursive_pattern() {
+    let m = mount_with_patterns(&["node_modules/**"]);
+    let set = m.build_ignore_set().unwrap();
+
+    assert!(set.is_match("node_modules/foo"));
+    assert!(set.is_match("node_modules/sub/bar.js"));
+    assert!(!set.is_match("node_modules"), "the dir itself is not matched by node_modules/**");
+    assert!(!set.is_match("src/main.rs"));
+}
+
+#[test]
+fn ignore_set_extension_pattern_matches_at_any_depth() {
+    // globset default semantics: `*` matches across path separators,
+    // so a bare `*.log` catches log files at every depth — this is
+    // friendlier than strict shell-glob and matches what most users
+    // expect from a sync tool.
+    let m = mount_with_patterns(&["*.log"]);
+    let set = m.build_ignore_set().unwrap();
+
+    assert!(set.is_match("foo.log"));
+    assert!(set.is_match("dir/foo.log"));
+    assert!(set.is_match("a/b/c/foo.log"));
+    assert!(!set.is_match("foo.txt"));
+}
+
+#[test]
+fn ignore_set_empty_matches_nothing() {
+    let m = mount_with_patterns(&[]);
+    let set = m.build_ignore_set().unwrap();
+    assert!(!set.is_match("anything.tmp"));
+    assert!(!set.is_match("foo/bar"));
+}
+
+#[test]
+fn ignore_set_invalid_pattern_errors() {
+    let m = mount_with_patterns(&["[unclosed"]);
+    let err = m.build_ignore_set().unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("invalid ignore pattern"), "got: {msg}");
+    assert!(msg.contains("[unclosed"), "should mention the offending pattern: {msg}");
+}
+
+#[test]
+fn ignore_patterns_default_is_empty() {
+    // Round-trip via JSON (already a dep) to confirm the serde default
+    // kicks in when the field is absent — ensures existing user configs
+    // without `ignore_patterns = ...` keep working.
+    let json = r#"{
+        "name": "test",
+        "remote": "local:/",
+        "mount_path": "/mnt/test"
+    }"#;
+    let m: MountConfig = serde_json::from_str(json).unwrap();
+    assert!(m.ignore_patterns.is_empty());
+    let set = m.build_ignore_set().unwrap();
+    assert!(!set.is_match("foo.tmp"));
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

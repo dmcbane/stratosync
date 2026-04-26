@@ -108,6 +108,20 @@ async fn main() -> Result<()> {
         );
         let sync_config = Arc::new(cfg.daemon.sync.clone());
 
+        // Selective sync: compile ignore patterns once, share the matcher.
+        // Fail fast on bad patterns so users see the error at startup.
+        let ignore = Arc::new(
+            mount_cfg.build_ignore_set()
+                .with_context(|| format!("ignore patterns for mount {:?}", mount_cfg.name))?
+        );
+        if !mount_cfg.ignore_patterns.is_empty() {
+            info!(
+                mount = %mount_cfg.name,
+                count = mount_cfg.ignore_patterns.len(),
+                "selective sync enabled"
+            );
+        }
+
         // Re-queue any dirty/uploading files from prior run
         let pending = db.get_pending_uploads(mount_id).await?;
         if !pending.is_empty() {
@@ -146,6 +160,7 @@ async fn main() -> Result<()> {
         match watcher::FsWatcher::start(
             mount_cfg.cache_dir(), mount_id,
             Arc::clone(&db), Arc::clone(&upload_queue),
+            Arc::clone(&ignore),
         ) {
             Ok(w) => _watchers.push(w),
             Err(e) => warn!(mount = %mount_cfg.name, "inotify watcher failed to start: {e}"),
@@ -155,6 +170,7 @@ async fn main() -> Result<()> {
         let poller = RemotePoller::new(
             mount_id, Arc::clone(&db), Arc::clone(&backend),
             mount_cfg.poll_duration()?,
+            Arc::clone(&ignore),
         );
         let poller_state = poller.state_handle();
         let poller_mount = mount_cfg.name.clone();
@@ -190,6 +206,7 @@ async fn main() -> Result<()> {
         let base_store_c = Arc::clone(&base_store);
         let sync_cfg_c   = Arc::clone(&sync_config);
         let waiters_c    = Arc::clone(&hydration_waiters);
+        let ignore_c     = Arc::clone(&ignore);
         // Capture the tokio Handle here (main thread has runtime context).
         // The spawned std::thread has no tokio context, so Handle::current()
         // would panic if called from within it.
@@ -202,7 +219,7 @@ async fn main() -> Result<()> {
                     &mount_name, mount_id, &mount_path,
                     cache_dir, db_c, backend_c, queue_c,
                     base_store_c, sync_cfg_c, fuse_cfg, rt_handle,
-                    waiters_c,
+                    waiters_c, ignore_c,
                 ) {
                     error!(mount = %mount_name, "FUSE error: {e}");
                 }

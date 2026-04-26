@@ -24,7 +24,7 @@ use tracing::{debug, error, warn};
 use stratosync_core::{
     backend::Backend, base_store::BaseStore,
     config::{FuseConfig, SyncConfig},
-    state::{NewFileEntry, StateDb}, types::*,
+    state::{NewFileEntry, StateDb}, types::*, GlobSet,
 };
 use crate::sync::upload_queue::{UploadQueue, UploadTrigger};
 
@@ -55,6 +55,7 @@ pub struct StratoFs {
     pub next_fh:           Arc<AtomicU64>,
     pub hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
     pub upload_queue:      Arc<UploadQueue>,
+    pub ignore:            Arc<GlobSet>,
 }
 
 fn entry_to_attr(e: &FileEntry) -> FileAttr {
@@ -603,8 +604,8 @@ impl Filesystem for StratoFs {
 
     fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
-        let (db, cache_dir, open_files, next_fh, cfg, mid) = (Arc::clone(&self.db), self.cache_dir.clone(), Arc::clone(&self.open_files), Arc::clone(&self.next_fh), self.cfg.clone(), self.mount_id);
-        match self.rt.block_on(write_ops::handle_create(parent, &name_str, mid, &db, &cache_dir, &open_files, &next_fh)) {
+        let (db, cache_dir, open_files, next_fh, cfg, mid, ignore) = (Arc::clone(&self.db), self.cache_dir.clone(), Arc::clone(&self.open_files), Arc::clone(&self.next_fh), self.cfg.clone(), self.mount_id, Arc::clone(&self.ignore));
+        match self.rt.block_on(write_ops::handle_create(parent, &name_str, mid, &db, &cache_dir, &open_files, &next_fh, &ignore)) {
             Ok((inode, fh)) => {
                 let attr = FileAttr { ino: inode, size: 0, blocks: 0, atime: SystemTime::now(), mtime: SystemTime::now(), ctime: SystemTime::now(), crtime: SystemTime::now(), kind: FileType::RegularFile, perm: 0o644, nlink: 1, uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() }, rdev: 0, blksize: 4096, flags: 0 };
                 reply.created(&cfg.entry_timeout(), &attr, 0, fh, 0);
@@ -615,8 +616,8 @@ impl Filesystem for StratoFs {
 
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
-        let (db, backend, cfg, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.cfg.clone(), self.mount_id);
-        match self.rt.block_on(write_ops::handle_mkdir(parent, &name_str, mid, &db, &backend)) {
+        let (db, backend, cfg, mid, ignore) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.cfg.clone(), self.mount_id, Arc::clone(&self.ignore));
+        match self.rt.block_on(write_ops::handle_mkdir(parent, &name_str, mid, &db, &backend, &ignore)) {
             Ok(inode) => {
                 let attr = FileAttr { ino: inode, size: 0, blocks: 0, atime: SystemTime::now(), mtime: SystemTime::now(), ctime: SystemTime::now(), crtime: SystemTime::now(), kind: FileType::Directory, perm: 0o755, nlink: 2, uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() }, rdev: 0, blksize: 4096, flags: 0 };
                 reply.entry(&cfg.entry_timeout(), &attr, 0);
@@ -757,6 +758,7 @@ pub fn mount(
     base_store: Arc<BaseStore>, sync_config: Arc<SyncConfig>,
     cfg: FuseConfig, rt: Handle,
     hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    ignore: Arc<GlobSet>,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
     use std::os::unix::fs::PermissionsExt;
@@ -765,7 +767,7 @@ pub fn mount(
     // Restrict partial dir to owner-only (prevents symlink attacks by other users)
     std::fs::set_permissions(&partial_dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(mount_path)?;
-    let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, base_store, sync_config, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters, upload_queue };
+    let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, base_store, sync_config, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters, upload_queue, ignore };
     let mut opts = vec![MountOption::FSName(format!("stratosync:{mount_name}")), MountOption::AutoUnmount, MountOption::DefaultPermissions];
     if cfg.allow_other { opts.push(MountOption::AllowOther); }
     fuser::mount2(fs, mount_path, &opts)?;
