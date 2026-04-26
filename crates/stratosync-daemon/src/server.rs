@@ -151,6 +151,7 @@ mod tests {
             Arc::clone(&base_store), Arc::clone(&sync_config),
             Duration::from_secs(60), Duration::from_millis(500), 2,
             None,  // no bandwidth schedule in tests
+            0,     // versioning disabled in tests
         ));
         let poller_state = Arc::new(tokio::sync::RwLock::new(PollerStatus {
             mode: "full-listing".into(),

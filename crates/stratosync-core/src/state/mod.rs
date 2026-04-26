@@ -712,6 +712,49 @@ pub struct EvictionCandidate {
     pub cache_size: u64,
 }
 
+/// A single entry in `version_history`.
+#[derive(Debug, Clone)]
+pub struct VersionEntry {
+    pub id:          i64,
+    pub inode:       Inode,
+    pub mount_id:    u32,
+    pub object_hash: String,
+    /// Unix timestamp — when the snapshot was captured.
+    pub recorded_at: i64,
+    pub file_size:   u64,
+    pub etag:        Option<String>,
+    pub source:      VersionSource,
+}
+
+/// Why this version was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSource {
+    /// Local cache content snapshotted before the poller invalidated it
+    /// to apply a remote change.
+    BeforePoll,
+    /// Content captured immediately after a successful upload.
+    AfterUpload,
+    /// Reserved for future user-driven snapshots.
+    Manual,
+}
+
+impl VersionSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BeforePoll  => "before_poll",
+            Self::AfterUpload => "after_upload",
+            Self::Manual      => "manual",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "before_poll"  => Self::BeforePoll,
+            "after_upload" => Self::AfterUpload,
+            _              => Self::Manual,
+        }
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn to_unix(t: SystemTime) -> i64 {
@@ -767,6 +810,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0002", include_str!("migrations/0002_delete_tombstones.sql")),
     ("0003", include_str!("migrations/0003_poll_generation.sql")),
     ("0004", include_str!("migrations/0004_base_versions.sql")),
+    ("0005", include_str!("migrations/0005_version_history.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -1190,6 +1234,146 @@ mod tests {
         db.delete_entry(inode).await.unwrap();
         assert!(db.get_base_hash(inode, mount_id).await.unwrap().is_none());
     }
+
+    // ── Version history tests ───────────────────────────────────────────
+
+    async fn make_file(db: &StateDb, mount_id: u32, root: Inode, name: &str) -> Inode {
+        db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: name.into(),
+            remote_path: name.into(),
+            kind: FileKind::File,
+            size: 100,
+            mtime: SystemTime::now(),
+            etag: Some("e1".into()),
+            status: SyncStatus::Cached,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn version_history_insert_and_list() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+        let inode = make_file(&db, mount_id, root, "doc.txt").await;
+
+        db.insert_version_history(inode, mount_id, "h1", 100, Some("e1"),
+            VersionSource::AfterUpload).await.unwrap();
+        // Sleep briefly so recorded_at differs (sqlite unixepoch() is 1s
+        // resolution; we order by id within the same second).
+        db.insert_version_history(inode, mount_id, "h2", 110, Some("e2"),
+            VersionSource::BeforePoll).await.unwrap();
+
+        let history = db.list_version_history(inode).await.unwrap();
+        assert_eq!(history.len(), 2);
+        // Newest first by (recorded_at DESC, id DESC).
+        assert_eq!(history[0].object_hash, "h2");
+        assert_eq!(history[0].source, VersionSource::BeforePoll);
+        assert_eq!(history[1].object_hash, "h1");
+        assert_eq!(history[1].source, VersionSource::AfterUpload);
+    }
+
+    #[tokio::test]
+    async fn version_history_prune_keeps_newest_n() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+        let inode = make_file(&db, mount_id, root, "doc.txt").await;
+
+        for i in 0..5 {
+            db.insert_version_history(
+                inode, mount_id, &format!("h{i}"), 100, None,
+                VersionSource::AfterUpload,
+            ).await.unwrap();
+        }
+
+        // Keep 2 newest, prune the rest. Pruned hashes should come back
+        // as orphaned (unique hashes, no other references).
+        let orphans = db.prune_version_history(inode, 2).await.unwrap();
+        assert_eq!(orphans.len(), 3, "3 oldest should be pruned and orphaned");
+        // The orphans are the hashes of the OLDEST entries (h0, h1, h2).
+        let mut sorted = orphans.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["h0".to_string(), "h1".to_string(), "h2".to_string()]);
+
+        let remaining = db.list_version_history(inode).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn version_history_prune_skips_blob_referenced_by_base_versions() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+        let inode = make_file(&db, mount_id, root, "doc.txt").await;
+
+        // The same hash exists in BOTH version_history (oldest entry)
+        // and base_versions. After pruning the version_history row, the
+        // blob must NOT be reported as orphaned.
+        let shared = "shared_hash";
+        db.insert_version_history(
+            inode, mount_id, shared, 100, None, VersionSource::AfterUpload,
+        ).await.unwrap();
+        db.insert_version_history(
+            inode, mount_id, "newer_hash", 100, None, VersionSource::AfterUpload,
+        ).await.unwrap();
+        db.set_base_hash(inode, mount_id, shared, 100).await.unwrap();
+
+        let orphans = db.prune_version_history(inode, 1).await.unwrap();
+        assert!(orphans.is_empty(),
+            "shared_hash is still referenced by base_versions, must not be reported orphaned");
+    }
+
+    #[tokio::test]
+    async fn version_history_prune_skips_blob_referenced_by_other_inode() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+        let inode1 = make_file(&db, mount_id, root, "a.txt").await;
+        let inode2 = make_file(&db, mount_id, root, "b.txt").await;
+
+        let shared = "shared_hash";
+        db.insert_version_history(
+            inode1, mount_id, shared, 100, None, VersionSource::AfterUpload,
+        ).await.unwrap();
+        db.insert_version_history(
+            inode1, mount_id, "newer", 100, None, VersionSource::AfterUpload,
+        ).await.unwrap();
+        // inode2 also references shared.
+        db.insert_version_history(
+            inode2, mount_id, shared, 100, None, VersionSource::AfterUpload,
+        ).await.unwrap();
+
+        // Prune inode1 down to 1 → drops the shared entry on inode1, but
+        // inode2 still references the blob.
+        let orphans = db.prune_version_history(inode1, 1).await.unwrap();
+        assert!(orphans.is_empty(),
+            "blob is still referenced via another inode's history");
+    }
+
+    #[tokio::test]
+    async fn version_history_cascades_on_file_delete() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+        let inode = make_file(&db, mount_id, root, "doc.txt").await;
+
+        db.insert_version_history(
+            inode, mount_id, "h1", 100, None, VersionSource::AfterUpload,
+        ).await.unwrap();
+
+        db.delete_entry(inode).await.unwrap();
+        assert!(db.list_version_history(inode).await.unwrap().is_empty(),
+            "version_history must cascade on file_index delete");
+    }
+
+    #[tokio::test]
+    async fn version_history_prune_with_keep_zero_drops_everything() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+        let inode = make_file(&db, mount_id, root, "doc.txt").await;
+
+        for i in 0..3 {
+            db.insert_version_history(
+                inode, mount_id, &format!("h{i}"), 100, None, VersionSource::AfterUpload,
+            ).await.unwrap();
+        }
+        let orphans = db.prune_version_history(inode, 0).await.unwrap();
+        assert_eq!(orphans.len(), 3);
+        assert!(db.list_version_history(inode).await.unwrap().is_empty());
+    }
 }
 
 impl StateDb {
@@ -1606,6 +1790,109 @@ impl StateDb {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    // ── Version history methods ───────────────────────────────────────────
+
+    /// Insert a row into `version_history`. Returns the new row id.
+    pub async fn insert_version_history(
+        &self,
+        inode:    Inode,
+        mount_id: u32,
+        hash:     &str,
+        size:     u64,
+        etag:     Option<&str>,
+        source:   VersionSource,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO version_history
+                (inode, mount_id, object_hash, file_size, etag, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![inode as i64, mount_id, hash, size as i64, etag, source.as_str()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Return all version_history rows for an inode, newest first.
+    pub async fn list_version_history(&self, inode: Inode) -> Result<Vec<VersionEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, inode, mount_id, object_hash, recorded_at, file_size, etag, source
+             FROM version_history WHERE inode = ?1
+             ORDER BY recorded_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![inode as i64], |r| {
+            Ok(VersionEntry {
+                id:          r.get(0)?,
+                inode:       r.get::<_, i64>(1)? as u64,
+                mount_id:    r.get(2)?,
+                object_hash: r.get(3)?,
+                recorded_at: r.get(4)?,
+                file_size:   r.get::<_, i64>(5)? as u64,
+                etag:        r.get(6)?,
+                source:      VersionSource::from_str(&r.get::<_, String>(7)?),
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(rows)
+    }
+
+    /// Trim history for an inode down to `keep` newest rows. Returns the
+    /// hashes of pruned rows whose blobs are now unreferenced anywhere
+    /// (across both `version_history` and `base_versions`) — caller can
+    /// safely delete those from the BaseStore on disk.
+    pub async fn prune_version_history(
+        &self,
+        inode: Inode,
+        keep:  u32,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().await;
+        // Collect hashes that will be deleted.
+        let mut stmt = conn.prepare(
+            "SELECT object_hash FROM version_history
+             WHERE inode = ?1
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT -1 OFFSET ?2",
+        )?;
+        let stale_hashes: Vec<String> = stmt
+            .query_map(params![inode as i64, keep], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        if stale_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Delete the rows.
+        conn.execute(
+            "DELETE FROM version_history WHERE id IN (
+               SELECT id FROM version_history WHERE inode = ?1
+               ORDER BY recorded_at DESC, id DESC
+               LIMIT -1 OFFSET ?2
+             )",
+            params![inode as i64, keep],
+        )?;
+
+        // For each pruned hash, check whether any other row (in either
+        // table) still references it. Return hashes that are now orphaned.
+        let mut now_unreferenced = Vec::new();
+        for hash in stale_hashes {
+            let still_in_history: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM version_history WHERE object_hash = ?1",
+                params![&hash], |r| r.get(0),
+            )?;
+            let still_in_bases: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM base_versions WHERE object_hash = ?1",
+                params![&hash], |r| r.get(0),
+            )?;
+            if still_in_history == 0 && still_in_bases == 0 {
+                now_unreferenced.push(hash);
+            }
+        }
+        Ok(now_unreferenced)
     }
 
     /// Delete a single file_index entry by remote path.

@@ -49,6 +49,11 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// File version history — list and restore prior versions of a file
+    Versions {
+        #[command(subcommand)]
+        action: VersionsAction,
+    },
     /// Print shell completion setup instructions
     Completions,
     /// Print version
@@ -60,6 +65,19 @@ enum ConfigAction {
     Show,
     Test,
     Edit,
+}
+
+#[derive(Subcommand)]
+enum VersionsAction {
+    /// List recorded versions for a file (newest first)
+    List { path: PathBuf },
+    /// Restore a recorded version into the cache (marks file Dirty for re-upload)
+    Restore {
+        path: PathBuf,
+        /// Which historical version to restore (0 = most recent)
+        #[arg(long)]
+        index: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -142,6 +160,12 @@ async fn main() -> Result<()> {
         Command::Dashboard { once } => {
             commands::dashboard::run(&config_path, once).await?;
         }
+        Command::Versions { action } => match action {
+            VersionsAction::List { path } =>
+                commands::versions::list(&config_path, &path).await?,
+            VersionsAction::Restore { path, index } =>
+                commands::versions::restore(&config_path, &path, index).await?,
+        },
         Command::Completions => {
             println!("Add one of the following to your shell config:\n");
             println!("  Bash (~/.bashrc):");

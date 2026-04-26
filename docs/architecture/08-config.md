@@ -58,6 +58,12 @@ ignore_patterns = [
 # means "evenings and overnight"). fsync() always bypasses this gate.
 upload_window = "22:00-06:00"
 
+# File versioning: keep up to N historical snapshots per file. 0 disables.
+# Snapshots are captured on poll-replace and after each successful upload,
+# stored content-addressed in <cache_dir>/.bases/. Recover with
+# `stratosync versions list <path>` and `stratosync versions restore`.
+version_retention = 10
+
 [mount.rclone]
 # Extra flags passed to every rclone invocation for this mount
 extra_flags  = []
@@ -100,6 +106,61 @@ enabled     = false       # disabled by default
 [mount.rclone]
 extra_flags = ["--s3-acl", "private"]
 ```
+
+---
+
+## File versioning (`version_retention`)
+
+Captures snapshots of file content at the two moments where a sync tool
+can quietly lose data:
+
+1. **Pre-replace** — the poller has detected a remote change to a file
+   you have cached locally, and is about to invalidate that cache. The
+   old local content is snapshotted before it disappears.
+2. **Post-upload** — your local upload just succeeded. The content you
+   uploaded is snapshotted, so you can roll back if a later upload turns
+   out to be wrong (corrupt edit, paste accident, regret).
+
+```toml
+[[mount]]
+# ...
+version_retention = 10   # keep 10 most recent versions per file; 0 = disabled
+```
+
+**Storage**: snapshots reuse the content-addressed `BaseStore` already
+present at `<cache_dir>/.bases/objects/`. Identical content (e.g. a
+poll that re-fetches an unchanged file) deduplicates to a single blob.
+A blob is removed from disk only when no `version_history` row and no
+`base_versions` row references it.
+
+**Size cap**: files larger than `[daemon.sync] base_max_file_size`
+(default 10 MiB) are not snapshotted. The version cache is for
+documents and source code, not media archives.
+
+**CLI**:
+
+```bash
+stratosync versions list ~/Drive/notes.md
+#  #   recorded             size       source         hash
+#  0   2026-04-26 14:02:11   12.3 KB   after_upload   a1b2c3d4...
+#  1   2026-04-26 11:18:03   12.1 KB   before_poll    998877ee...
+#  2   2026-04-25 22:44:17   11.9 KB   after_upload   ff00aa11...
+
+stratosync versions restore ~/Drive/notes.md --index 2
+```
+
+Restore copies the blob over the cache file and marks the entry Dirty,
+so the next sync uploads the restored content as the new canonical
+version. The restored version itself becomes a new history entry on
+that upload.
+
+**Limitations** (intentional, room for follow-up):
+
+- No FUSE-visible `.versions/` shadow tree yet — versioning is CLI-only.
+  See ROADMAP item "Phase 5 follow-up: FUSE shadow tree for versions".
+- No bulk restore across a directory.
+- No diff between versions (use `stratosync versions restore` followed
+  by your usual diff tooling).
 
 ---
 

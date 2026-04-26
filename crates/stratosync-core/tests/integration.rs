@@ -284,6 +284,7 @@ fn config_mount_cache_quota_and_poll() {
         eviction: EvictionConfig::default(),
         ignore_patterns: Vec::new(),
         upload_window:   None,
+        version_retention: 0,
     };
     assert_eq!(m.cache_quota_bytes().unwrap(), 10u64 * (1 << 30));
     assert_eq!(m.poll_duration().unwrap().as_secs(), 30);
@@ -598,6 +599,7 @@ fn mount_with_patterns(patterns: &[&str]) -> MountConfig {
         eviction: EvictionConfig::default(),
         ignore_patterns: patterns.iter().map(|s| s.to_string()).collect(),
         upload_window:   None,
+        version_retention: 0,
     }
 }
 

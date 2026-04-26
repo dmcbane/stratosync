@@ -234,7 +234,16 @@ pub struct MountConfig {
     /// uploads run any time. Wraparound is supported: `"22:00-06:00"`.
     #[serde(default)]
     pub upload_window: Option<String>,
+    /// File-version retention: keep up to this many historical snapshots
+    /// per file. Snapshots are captured (a) just before the poller
+    /// replaces a cached file with a remote change, and (b) just after a
+    /// successful upload. `0` disables versioning entirely (the default
+    /// behavior prior to v0.13.0). Recover with `stratosync versions`.
+    #[serde(default = "default_version_retention")]
+    pub version_retention: u32,
 }
+
+fn default_version_retention() -> u32 { 10 }
 
 fn default_cache_quota_str() -> String { "5 GiB".into()  }
 fn default_poll_interval()   -> String { "60s".into()    }

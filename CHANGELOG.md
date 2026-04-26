@@ -14,6 +14,19 @@ All notable changes to this project will be documented in this file.
   canonical file (the common case after a transient false-positive),
   shows per-entry progress, and accepts `--dry-run`. Includes a
   stat-based fast path and live progress output for large trees.
+- **File versioning (Phase 5, item 5)**: per-mount
+  `version_retention` (default 10) records snapshots of file content
+  at the moments it would otherwise be lost — local cache content
+  before a poller-detected remote change replaces it (`before_poll`),
+  and the just-uploaded content after a successful upload
+  (`after_upload`). Snapshots reuse the existing content-addressed
+  `BaseStore`, so identical content across versions deduplicates
+  automatically. New `stratosync versions list <path>` and
+  `stratosync versions restore <path> --index N` CLI commands let
+  users recover prior versions; restore copies the blob back to the
+  cache and marks the file Dirty for re-upload. Files larger than
+  `[daemon.sync] base_max_file_size` are skipped to bound disk
+  usage. Set `version_retention = 0` to disable.
 - **Multiple accounts per provider (Phase 5, item 4)**: documented as
   already-supported. Each `[[mount]]` block is fully isolated — its
   own SQLite DB, cache directory, poller, upload queue, FUSE thread,

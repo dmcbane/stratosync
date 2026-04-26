@@ -22,7 +22,7 @@ use stratosync_core::{
     base_store::BaseStore,
     config::{SyncConfig, UploadWindow},
     ipc::{ActiveUpload, QueueStatus},
-    state::{StateDb, SyncQueueJob},
+    state::{StateDb, SyncQueueJob, VersionSource},
     types::{Inode, SyncError, SyncStatus},
 };
 
@@ -55,6 +55,7 @@ impl UploadQueue {
         close_debounce:  Duration,
         max_concurrent:  usize,
         upload_window:   Option<UploadWindow>,
+        version_retention: u32,
     ) -> Self {
         let (tx, rx) = mpsc::channel(512);
         let tx_inner = tx.clone();
@@ -64,7 +65,7 @@ impl UploadQueue {
                 tx_inner, rx, mount_id, db, backend,
                 base_store, sync_config,
                 debounce, close_debounce, max_concurrent,
-                upload_window,
+                upload_window, version_retention,
             ).await;
             // If we get here, the loop exited (channel closed or unexpected return).
             // Reset any stuck Uploading inodes so they're retried on restart.
@@ -148,6 +149,7 @@ async fn upload_loop(
     close_debounce: Duration,
     max_concurrent: usize,
     upload_window:  Option<UploadWindow>,
+    version_retention: u32,
 ) {
     // Debounce tracking: inode → when the upload should fire.
     // New triggers push the deadline forward (Write) or shorten it (Close/Fsync).
@@ -263,7 +265,7 @@ async fn upload_loop(
                     let sc_c  = Arc::clone(&sync_config);
 
                     in_flight.spawn(async move {
-                        let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c).await;
+                        let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c, version_retention).await;
                         (inode, result)
                     });
                     in_flight_started.insert(inode, Instant::now());
@@ -369,6 +371,7 @@ async fn run_upload(
     backend:     &Arc<dyn Backend>,
     base_store:  &Arc<BaseStore>,
     sync_config: &Arc<SyncConfig>,
+    version_retention: u32,
 ) -> Result<(), SyncError> {
     // Load the job spec from DB
     let entry = db.get_by_inode(inode).await
@@ -418,8 +421,19 @@ async fn run_upload(
         meta.size,
     ).await.map_err(|e| SyncError::Fatal(e.to_string()))?;
 
-    // Snapshot base version for 3-way merge (best-effort)
+    // Versioning: record the just-uploaded content as a historical
+    // snapshot. Best-effort — failure here doesn't roll back the upload.
     let max_size = sync_config.base_max_file_size_bytes().unwrap_or(10 * 1024 * 1024);
+    if let Err(e) = super::versioning::capture(
+        db, base_store, inode, mount_id, &cache_path,
+        meta.size, meta.etag.as_deref(),
+        VersionSource::AfterUpload,
+        max_size, version_retention,
+    ).await {
+        warn!(inode, "post-upload version snapshot failed: {e}");
+    }
+
+    // Snapshot base version for 3-way merge (best-effort)
     if BaseStore::is_text_mergeable(&cache_path, meta.size, max_size, &sync_config.text_extensions) {
         let bs = Arc::clone(base_store);
         let cp = cache_path.clone();

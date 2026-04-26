@@ -78,15 +78,28 @@ Deliverables:
 
 ## Phase 5: Advanced Features
 
-**Goal**: Power-user capabilities.
+**Goal**: Power-user capabilities. **Status**: complete for v0.12.0; encrypted caching deferred.
 
-Potential additions:
-- ~~Selective sync (per-mount `ignore_patterns` glob list)~~ ✓ (Unreleased) — `.stratosyncignore` in-tree files still pending
-- File versioning (keep N previous versions in a `.versions/` shadow tree)
-- ~~Bandwidth scheduling (upload only at night, or within configured hours)~~ ✓ (Unreleased) — single per-mount window, local-time, wraparound; multi-window and day-of-week deferred
-- ~~Metrics endpoint (Prometheus-compatible `/metrics` via tokio socket)~~ ✓ (Unreleased) — gauge-only; counters (polls/skipped/bytes) deferred
-- ~~Multiple accounts for the same provider (e.g. two Google Drive accounts)~~ ✓ (Unreleased) — verified already supported via per-mount isolation; documentation added
-- Encrypted caching (encrypt local cache files at rest)
+Shipped (Unreleased, in v0.12.0 dev cycle):
+- ~~Selective sync (per-mount `ignore_patterns` glob list)~~ ✓ — `.stratosyncignore` in-tree files still pending
+- ~~Metrics endpoint (Prometheus-compatible `/metrics` via tokio socket)~~ ✓ — gauge-only; counters (polls/skipped/bytes) deferred
+- ~~Bandwidth scheduling (upload only at night, or within configured hours)~~ ✓ — single per-mount window, local-time, wraparound; multi-window and day-of-week deferred
+- ~~Multiple accounts for the same provider~~ ✓ — verified already supported via per-mount isolation; documentation added
+- ~~File versioning (keep N previous versions, CLI-driven)~~ ✓ — `version_retention` config + `stratosync versions list/restore`; FUSE `.versions/` shadow tree deferred (see follow-ups below)
+
+Deferred to **v0.13.0+**:
+- Encrypted caching (encrypt local cache files at rest) — significant crypto work; deserves its own release cycle
+
+### Phase 5 follow-ups (not yet scheduled)
+
+Smaller scope-creep items split out of the main Phase 5 deliverables. Not blocking any release, but called out so they don't get lost.
+
+- **`.stratosyncignore` in-tree files** — gitignore-style cascading ignore files inside the synced tree, on top of the per-mount `ignore_patterns` list. Needs a parser and per-directory caching at lookup time.
+- **Selective-sync retroactive cleanup** — a `stratosync ignore prune` CLI that walks the index and removes entries newly matching an ignore pattern (today, ignore rules only prevent NEW indexing).
+- **Bandwidth scheduling extensions** — multiple windows per mount, day-of-week selectors, and per-mount Mbps caps surfaced as `bwlimit` rather than going through rclone flags.
+- **Metrics counters** — `stratosync_poll_skipped_ignored_total`, `stratosync_polls_total`, and `stratosync_*_bytes_total` for upload/download. Need new atomic counters in the poller and upload queue.
+- **FUSE shadow tree for versions** — expose recorded versions as a read-only `.versions/<original_path>/<timestamp>.<ext>` subtree visible in the FUSE mount, so users can browse history with their normal file manager. Today versions are CLI-only. Real implementation work: needs readdir filtering of the shadow prefix (similar to `.stratosync-conflicts/`), retention policy in the cache eviction loop, and conflict-handling for paths that legitimately end in `.versions/` on the remote.
+- **Versions enhancements** — bulk restore (`--all` for a directory), diff between versions, and a per-mount size cap for the version-blob store independent of `base_max_file_size`.
 
 ---
 

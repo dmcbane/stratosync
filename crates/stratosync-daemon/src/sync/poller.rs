@@ -14,7 +14,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use stratosync_core::{
-    backend::Backend, ipc::PollerStatus, state::StateDb, types::*, GlobSet, RemoteMetadata,
+    backend::Backend, base_store::BaseStore, ipc::PollerStatus,
+    state::{StateDb, VersionSource}, types::*, GlobSet, RemoteMetadata,
 };
 
 pub struct RemotePoller {
@@ -24,6 +25,13 @@ pub struct RemotePoller {
     poll_interval: Duration,
     state:         Arc<RwLock<PollerStatus>>,
     ignore:        Arc<GlobSet>,
+    base_store:    Arc<BaseStore>,
+    /// File size cap for version snapshots — files larger than this are
+    /// not snapshotted, to keep the version cache bounded.
+    version_max_size:  u64,
+    /// `0` disables versioning. Otherwise: keep this many history rows
+    /// per inode.
+    version_retention: u32,
 }
 
 impl RemotePoller {
@@ -33,6 +41,9 @@ impl RemotePoller {
         backend:       Arc<dyn Backend>,
         poll_interval: Duration,
         ignore:        Arc<GlobSet>,
+        base_store:    Arc<BaseStore>,
+        version_max_size:  u64,
+        version_retention: u32,
     ) -> Self {
         let mode = if backend.supports_delta() { "delta" } else { "full-listing" };
         let state = Arc::new(RwLock::new(PollerStatus {
@@ -40,7 +51,10 @@ impl RemotePoller {
             current_interval_secs: poll_interval.as_secs(),
             ..Default::default()
         }));
-        Self { mount_id, db, backend, poll_interval, state, ignore }
+        Self {
+            mount_id, db, backend, poll_interval, state, ignore,
+            base_store, version_max_size, version_retention,
+        }
     }
 
     /// Expose a handle to the live poller state so the IPC server can
@@ -215,6 +229,36 @@ impl RemotePoller {
                 None => {
                     // New entry — needs upsert
                     to_upsert.push(meta);
+                }
+            }
+        }
+
+        // ── Phase 2.5: Version-history snapshots ─────────────────────────────
+        // Capture pre-replace snapshots for entries that are about to be
+        // overwritten by a remote change. Only files currently in `Cached`
+        // status have meaningful local content to preserve — Dirty/Uploading
+        // produce conflict files via the existing conflict path, and
+        // Hydrating/Remote have no committed local content yet.
+        if self.version_retention > 0 {
+            for meta in &to_upsert {
+                let Some(snap) = db_snapshot.get(&meta.path) else { continue };
+                if snap.status != SyncStatus::Cached { continue; }
+                // Look up the cache_path for this inode. We don't have it in
+                // the snapshot (only inode/etag/size/status are there); a
+                // single-row fetch is fine — this branch is rare.
+                let entry = match self.db.get_by_inode(snap.inode).await {
+                    Ok(Some(e)) => e,
+                    _ => continue,
+                };
+                let Some(cp) = entry.cache_path.as_deref() else { continue };
+                if let Err(e) = super::versioning::capture(
+                    &self.db, &self.base_store,
+                    snap.inode, self.mount_id, cp,
+                    entry.size, entry.etag.as_deref(),
+                    VersionSource::BeforePoll,
+                    self.version_max_size, self.version_retention,
+                ).await {
+                    warn!(inode = snap.inode, "version snapshot failed: {e}");
                 }
             }
         }
@@ -406,6 +450,28 @@ impl RemotePoller {
                         continue;
                     }
 
+                    // Versioning: snapshot pre-replace content if the
+                    // existing entry was cached (same logic as full poll).
+                    if self.version_retention > 0 {
+                        if let Some(snap) = db_snapshot.get(&meta.path) {
+                            if snap.status == SyncStatus::Cached {
+                                if let Ok(Some(entry)) = self.db.get_by_inode(snap.inode).await {
+                                    if let Some(cp) = entry.cache_path.as_deref() {
+                                        if let Err(e) = super::versioning::capture(
+                                            &self.db, &self.base_store,
+                                            snap.inode, self.mount_id, cp,
+                                            entry.size, entry.etag.as_deref(),
+                                            VersionSource::BeforePoll,
+                                            self.version_max_size, self.version_retention,
+                                        ).await {
+                                            warn!(inode = snap.inode, "version snapshot failed (delta): {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let kind = if meta.is_dir {
                         FileKind::Directory
                     } else {
@@ -505,8 +571,23 @@ mod tests {
         backend: MockBackend,
         ignore: Arc<GlobSet>,
     ) -> RemotePoller {
+        poller_with_versioning(mount_id, db, backend, ignore, 0)
+    }
+
+    fn poller_with_versioning(
+        mount_id: u32,
+        db: Arc<StateDb>,
+        backend: MockBackend,
+        ignore: Arc<GlobSet>,
+        retention: u32,
+    ) -> RemotePoller {
         let backend: Arc<dyn Backend> = Arc::new(backend);
-        RemotePoller::new(mount_id, db, backend, Duration::from_secs(60), ignore)
+        let bs_dir = tempfile::tempdir().unwrap().keep();
+        let bs = Arc::new(BaseStore::new(bs_dir).unwrap());
+        RemotePoller::new(
+            mount_id, db, backend, Duration::from_secs(60), ignore,
+            bs, 10 * 1024 * 1024, retention,
+        )
     }
 
     #[tokio::test]
@@ -563,6 +644,81 @@ mod tests {
         assert!(after.is_some(), "legacy.log must NOT be wiped by stale-sweep");
         assert_eq!(after.unwrap().inode, before_inode, "inode must not change");
         assert!(db.get_by_remote_path(mid, "kept.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn poll_captures_version_before_replacing_cached_file() {
+        // First poll indexes the file. We then force the entry into Cached
+        // state with a real cache file on disk, modify the remote (changing
+        // size/etag), and re-poll. The pre-replace snapshot should land in
+        // version_history and the blob should exist in BaseStore.
+        let (db, mid, backend, ignore) = setup(&[]).await;
+
+        // Stage the cache file ourselves so the entry is plausibly Cached.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_path = cache_dir.path().join("doc.txt");
+        std::fs::write(&cache_path, b"the original content").unwrap();
+
+        backend.seed_file("doc.txt", b"the original content");
+        let bs_dir = tempfile::tempdir().unwrap().keep();
+        let bs = Arc::new(BaseStore::new(bs_dir.clone()).unwrap());
+        let backend_arc: Arc<dyn Backend> = Arc::new(backend.clone());
+        let p = RemotePoller::new(
+            mid, Arc::clone(&db), backend_arc, Duration::from_secs(60),
+            Arc::clone(&ignore), Arc::clone(&bs), 10 * 1024 * 1024, 5,
+        );
+        p.poll_once().await.unwrap();
+
+        // Mark the indexed entry as Cached with our staged cache file.
+        let entry = db.get_by_remote_path(mid, "doc.txt").await.unwrap().unwrap();
+        db.set_cached(entry.inode, &cache_path,
+            "the original content".len() as u64,
+            entry.etag.as_deref(), std::time::SystemTime::now(),
+            "the original content".len() as u64,
+        ).await.unwrap();
+
+        // Remote changes — size & etag now differ.
+        backend.modify_file("doc.txt", b"DIFFERENT REMOTE CONTENT NOW");
+        p.poll_once().await.unwrap();
+
+        // The OLD cache content should be in version_history.
+        let history = db.list_version_history(entry.inode).await.unwrap();
+        assert_eq!(history.len(), 1, "exactly one snapshot — pre-replace");
+        assert_eq!(history[0].source, VersionSource::BeforePoll);
+        assert_eq!(history[0].file_size, "the original content".len() as u64);
+
+        // And the blob should exist on disk under the BaseStore.
+        let blob_path = bs.object_path(&history[0].object_hash);
+        assert!(blob_path.exists(), "version blob must be on disk");
+        let body = std::fs::read(&blob_path).unwrap();
+        assert_eq!(body, b"the original content");
+    }
+
+    #[tokio::test]
+    async fn poll_skips_version_capture_when_retention_zero() {
+        // With retention=0, the poller must NOT capture a snapshot even
+        // when a Cached file is being replaced. (Default behavior for
+        // mounts that haven't opted into versioning.)
+        let (db, mid, backend, ignore) = setup(&[]).await;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_path = cache_dir.path().join("doc.txt");
+        std::fs::write(&cache_path, b"original").unwrap();
+
+        backend.seed_file("doc.txt", b"original");
+        let p = poller_with_versioning(mid, Arc::clone(&db),
+            backend.clone(), Arc::clone(&ignore), 0); // retention=0
+        p.poll_once().await.unwrap();
+
+        let entry = db.get_by_remote_path(mid, "doc.txt").await.unwrap().unwrap();
+        db.set_cached(entry.inode, &cache_path, 8, entry.etag.as_deref(),
+            std::time::SystemTime::now(), 8).await.unwrap();
+
+        backend.modify_file("doc.txt", b"changed");
+        p.poll_once().await.unwrap();
+
+        let history = db.list_version_history(entry.inode).await.unwrap();
+        assert!(history.is_empty(), "retention=0 must skip capture entirely");
     }
 
     #[tokio::test]

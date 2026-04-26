@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
                 cfg.daemon.sync.upload_close_debounce_ms),
             cfg.daemon.sync.max_upload_concurrent,
             upload_window,
+            mount_cfg.version_retention,
         ));
 
         for entry in pending {
@@ -182,10 +183,15 @@ async fn main() -> Result<()> {
         }
 
         // Remote poller
+        let version_max_size = cfg.daemon.sync.base_max_file_size_bytes()
+            .unwrap_or(10 * 1024 * 1024);
         let poller = RemotePoller::new(
             mount_id, Arc::clone(&db), Arc::clone(&backend),
             mount_cfg.poll_duration()?,
             Arc::clone(&ignore),
+            Arc::clone(&base_store),
+            version_max_size,
+            mount_cfg.version_retention,
         );
         let poller_state = poller.state_handle();
         let poller_mount = mount_cfg.name.clone();
