@@ -14,6 +14,13 @@ All notable changes to this project will be documented in this file.
   canonical file (the common case after a transient false-positive),
   shows per-entry progress, and accepts `--dry-run`. Includes a
   stat-based fast path and live progress output for large trees.
+- **Prometheus metrics endpoint (Phase 5, item 2)**: optional
+  `GET /metrics` HTTP endpoint exposing per-mount cache usage, queue
+  depth, hydration counts, conflict count, and poller state. Opt-in via
+  `[daemon.metrics] enabled = true` (default off, default bind
+  `127.0.0.1:9090`). Hand-rolled HTTP/1.1 listener on `tokio::net`
+  rather than pulling in axum/hyper-server for a single endpoint —
+  reuses the existing `DaemonState::snapshot()` aggregation.
 - **Selective sync (Phase 5, item 1)**: per-mount `ignore_patterns`
   config field filters glob-matched paths out of indexing, FUSE
   `create`/`mkdir`, and upload events. Patterns use `globset` semantics

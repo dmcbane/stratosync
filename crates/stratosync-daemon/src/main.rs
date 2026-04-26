@@ -9,6 +9,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 mod cache;
 mod config_io;
 mod fuse;
+mod metrics;
 mod server;
 mod state;
 mod sync;
@@ -238,11 +239,25 @@ async fn main() -> Result<()> {
     let socket_path = cfg.daemon.socket.clone().unwrap_or_else(default_runtime_socket);
     let daemon_state = Arc::new(DaemonState::new(mount_handles));
     let server_socket = socket_path.clone();
+    let server_state = Arc::clone(&daemon_state);
     tokio::spawn(async move {
-        if let Err(e) = server::serve(server_socket, daemon_state).await {
+        if let Err(e) = server::serve(server_socket, server_state).await {
             error!("IPC server exited: {e}");
         }
     });
+
+    // Optional Prometheus metrics endpoint — opt-in via `[daemon.metrics]
+    // enabled = true`. Failure to bind is logged but doesn't take down the
+    // daemon (operator's port choice is their problem to fix).
+    if cfg.daemon.metrics.enabled {
+        let metrics_addr  = cfg.daemon.metrics.listen_addr.clone();
+        let metrics_state = Arc::clone(&daemon_state);
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve(metrics_addr, metrics_state).await {
+                error!("metrics endpoint exited: {e}");
+            }
+        });
+    }
 
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal — unmounting");

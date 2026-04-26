@@ -28,6 +28,10 @@ upload_close_debounce_ms = 500    # wait 0.5s after close
 text_conflict_strategy   = "keep_both"    # or "merge"
 text_extensions          = ["md", "txt", "rs", "py", "toml", "yaml", "json"]
 
+[daemon.metrics]
+enabled     = false                # opt-in; serve GET /metrics when true
+listen_addr = "127.0.0.1:9090"     # host:port for the Prometheus endpoint
+
 # ─────────────────────────────────────────────
 # Mount configurations — one [[mount]] per sync target
 # ─────────────────────────────────────────────
@@ -91,6 +95,45 @@ enabled     = false       # disabled by default
 [mount.rclone]
 extra_flags = ["--s3-acl", "private"]
 ```
+
+---
+
+## Metrics endpoint (`[daemon.metrics]`)
+
+Optional Prometheus-compatible HTTP endpoint. Off by default — opt in
+when you actually want a scraper to point at the daemon.
+
+```toml
+[daemon.metrics]
+enabled     = true
+listen_addr = "127.0.0.1:9090"
+```
+
+Exposed metrics (all gauges; one series per mount unless noted):
+
+| Name | Description |
+|------|-------------|
+| `stratosync_build_info{version}` | Always 1; `version` label carries the daemon version. |
+| `stratosync_daemon_uptime_seconds` | Seconds since daemon start. |
+| `stratosync_daemon_pid` | Process ID. |
+| `stratosync_mounts_total` | Number of configured mounts. |
+| `stratosync_mount_cache_used_bytes{mount}` | Bytes in the local cache. |
+| `stratosync_mount_cache_quota_bytes{mount}` | Configured cache quota. |
+| `stratosync_mount_pinned_files{mount}` | Files pinned for offline use. |
+| `stratosync_mount_upload_queue_pending{mount}` | Files waiting to upload. |
+| `stratosync_mount_upload_queue_in_flight{mount}` | Files currently uploading. |
+| `stratosync_mount_hydration_active{mount}` | Files currently downloading. |
+| `stratosync_mount_hydration_waiters{mount}` | `open()` callers blocked on a hydration. |
+| `stratosync_mount_conflicts{mount}` | Conflict files on this mount. |
+| `stratosync_mount_poller_consecutive_failures{mount}` | Poll failures since last success. |
+| `stratosync_mount_poller_interval_seconds{mount}` | Current poll interval (may exceed configured value during backoff). |
+| `stratosync_mount_poller_last_poll_timestamp_seconds{mount}` | Unix seconds of last successful poll; absent until the first poll. |
+
+The endpoint is hand-rolled HTTP/1.1 on `tokio::net` — no axum/hyper
+dependency added. `GET /metrics` returns the exposition format; any
+other path returns 404. Bind to `127.0.0.1` unless you've put the daemon
+behind firewall rules; the metrics include path counts that can leak
+information about your file structure to anyone scraping.
 
 ---
 

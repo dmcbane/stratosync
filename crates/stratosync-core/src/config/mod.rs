@@ -72,6 +72,7 @@ pub struct DaemonConfig {
     pub webdav_sidecar: bool,
     pub fuse:           FuseConfig,
     pub sync:           SyncConfig,
+    pub metrics:        MetricsConfig,
 }
 
 impl Default for DaemonConfig {
@@ -84,6 +85,28 @@ impl Default for DaemonConfig {
             webdav_sidecar: false,
             fuse:           FuseConfig::default(),
             sync:           SyncConfig::default(),
+            metrics:        MetricsConfig::default(),
+        }
+    }
+}
+
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// When true, the daemon serves a Prometheus-compatible text endpoint
+    /// at `GET /metrics` on `listen_addr`. Default off — opt-in only.
+    pub enabled:     bool,
+    /// `host:port` to bind. Default localhost:9090.
+    pub listen_addr: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled:     false,
+            listen_addr: "127.0.0.1:9090".into(),
         }
     }
 }
