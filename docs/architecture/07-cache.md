@@ -80,39 +80,88 @@ Each mount has a configurable `cache_quota` (default: 5 GiB). The CacheManager m
 ```rust
 pub struct CacheManager {
     mount_id:    u32,
-    cache_dir:   PathBuf,
-    quota_bytes: u64,
+    quota:       u64,
+    low_mark:    f64,    // evict down to this fraction of quota (default 0.80)
+    high_mark:   f64,    // start evicting at this fraction       (default 0.90)
     db:          Arc<StateDb>,
 }
 
 impl CacheManager {
-    /// Called after each successful hydration.
-    pub async fn on_file_cached(&self, inode: u64, size: u64) {
-        self.db.update_cache_size(inode, size).await;
-        self.db.touch_lru(inode).await;
-        self.maybe_evict().await;
+    /// Called after each successful hydration. Updates the LRU position
+    /// for the new entry. Does **not** trigger eviction inline — only
+    /// the 60-second ticker runs `maybe_evict`. Inline eviction here
+    /// used to amplify any eviction-loop dysfunction into a multi-second
+    /// FUSE-mutex storm.
+    pub async fn on_file_cached(&self, inode: u64, _size: u64) {
+        let _ = self.db.touch_lru(inode).await;
     }
 
-    /// Evict until total cache usage is below 90% of quota.
-    async fn maybe_evict(&self) {
-        let total = self.db.total_cache_size(self.mount_id).await;
-        if total < self.quota_bytes * 9 / 10 {
-            return;
-        }
-        let target = self.quota_bytes * 8 / 10;  // evict down to 80%
-        let candidates = self.db.lru_eviction_candidates(self.mount_id).await;
+    /// Walk LRU candidates in 1000-row batches until usage drops below
+    /// `low_mark * quota` or no more candidates remain. Re-querying each
+    /// batch is cheap because `set_evicted` removes the row from
+    /// `cache_lru`, so the same `ORDER BY last_access ASC LIMIT 1000`
+    /// returns the next-oldest batch on the next iteration.
+    async fn maybe_evict(&self) -> Result<()> {
+        let used = self.db.total_cache_bytes(self.mount_id).await?;
+        let high = (self.quota as f64 * self.high_mark) as u64;
+        if used <= high { return Ok(()); }
+
+        let target  = (self.quota as f64 * self.low_mark) as u64;
+        let to_free = used.saturating_sub(target);
         let mut freed = 0u64;
-        for entry in candidates {
-            if total - freed <= target { break; }
-            if let Err(e) = self.evict_entry(&entry).await {
-                warn!("Failed to evict {}: {}", entry.cache_path, e);
-            } else {
-                freed += entry.cache_size;
+
+        loop {
+            if freed >= to_free { break; }
+            let candidates = self.db.lru_eviction_candidates(
+                self.mount_id, 1000,
+            ).await?;
+            if candidates.is_empty() { break; }
+
+            let mut pass_freed = 0u64;
+            for c in &candidates {
+                if freed + pass_freed >= to_free { break; }
+                pass_freed += self.evict_one(c).await?;
             }
+            freed += pass_freed;
+            // Bail if a whole batch made no progress (status churn);
+            // the next ticker tick will retry.
+            if pass_freed == 0 { break; }
         }
+        Ok(())
     }
 
-    async fn evict_entry(&self, entry: &CacheEntry) -> Result<()> {
+    /// Evict one entry. Returns the bytes freed (0 if skipped).
+    async fn evict_one(&self, c: &EvictionCandidate) -> Result<u64> {
+        // Re-check status — a write may have landed since the query.
+        let cur = self.db.get_by_inode(c.inode).await?;
+        if cur.map(|e| e.status) != Some(SyncStatus::Cached) { return Ok(0); }
+
+        match tokio::fs::remove_file(&c.cache_path).await {
+            Ok(()) => {
+                self.db.set_evicted(c.inode).await?;
+                Ok(c.cache_size)
+            }
+            // Phantom row: cache file already gone (manual rm, prior crash,
+            // out-of-band cleanup). Treat as success — the disk space is
+            // already freed; just reconcile the DB. Without this branch,
+            // phantoms loop forever: the same row gets re-queried, ENOENTs
+            // again, and pass_freed stays zero so the bail-out fires.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.db.set_evicted(c.inode).await?;
+                Ok(c.cache_size)
+            }
+            Err(_) => Ok(0),  // skip this pass, retry next tick
+        }
+    }
+}
+```
+
+**Why paginated.** A single `LIMIT 200` query stops after 200 rows; with many small files (e.g. screenshots averaging ~200 KiB) that frees only ~40 MiB per pass × 60 s ticker ≈ 2.4 GiB/h theoretical max, easily out-paced by hydration on any active mount. Paginating until usage drops to `low_mark` lets a single tick close arbitrarily large quota gaps in seconds rather than hours.
+
+**Why ENOENT-as-success.** Cache files vanish out-of-band more often than expected: users rm to fight over-quota, the daemon crashes mid-eviction with the file removed but `set_evicted` not yet called, etc. Pre-fix, every such phantom row sat permanently in `total_cache_bytes`, was returned forever as a candidate, and on a mount with many phantoms (one observed at 1000+ in a single batch) blocked all eviction progress.
+
+```rust
+async fn evict_entry(&self, entry: &CacheEntry) -> Result<()> {
         fs::remove_file(&entry.cache_path).await?;
         self.db.set_evicted(entry.inode).await?;
         Ok(())
@@ -215,9 +264,50 @@ reports the pinned count per mount.
 
 ## Cache Integrity Checks
 
-On daemon start, we validate the cache against the DB:
-1. For every `file_index` row with `status=CACHED`, verify `cache_path` exists and `size` matches.
-2. For any discrepancy, reset `status=REMOTE` and delete the cache file.
-3. Scan the actual cache directory for files not in `file_index` → delete orphans.
+Cache↔DB drift is reconciled in **two complementary places** rather than one
+omnibus startup scan:
 
-This scan runs in the background and doesn't block daemon startup.
+### 1. Startup orphan reconciler (`cache::reconcile`)
+
+Runs once per mount at daemon startup, **before the FUSE mount comes up**
+(so it can't race with reads in the mount). Walks `<cache_dir>` recursively
+and:
+
+- Removes any regular file whose path isn't present in
+  `file_index.cache_path` for this mount. These accumulate when a cache
+  file is created out-of-band, the daemon crashes mid-cleanup, or a path
+  renames without DB tracking — eviction can't reach them because it
+  walks the LRU view of the DB.
+- Unconditionally wipes every regular file in `.meta/partial/`. These
+  are hydration temps that `do_hydrate` writes to and renames onto the
+  final `cache_path` on the success path; if they exist at startup they
+  were never renamed, so they're orphan by construction. (One observed
+  mount had **6 stale partials totalling 14 GiB on disk** — partial
+  downloads of a big file that kept being killed mid-transfer.)
+- Skips `.bases/` (BaseStore-managed; has its own GC in
+  `cache::evict_stale_bases`) and the rest of `.meta/` (daemon scratch).
+
+The reserved-directory check matches direct children of the cache root
+only — a user folder happening to be named `.bases` deep in their synced
+tree is treated normally.
+
+### 2. Inline ENOENT reconciliation in eviction
+
+When `maybe_evict` tries to remove a candidate's `cache_path` and gets
+`ENOENT`, the row was a "phantom" (DB row pointing at a missing file —
+typically left by a prior crash or manual cleanup). We treat that as a
+successful eviction: the disk space is already freed, so `set_evicted`
+just clears the stale DB row. See `evict_one` above.
+
+The two passes cover different cases:
+
+- **Reconciler** finds files that exist on disk with no DB row at all.
+  Eviction can never see these — there's no DB row to walk through, no
+  LRU position to track.
+- **Eviction's ENOENT branch** handles DB rows that point at missing
+  files. Eviction *would* find them (they're cached-status with a
+  cache_lru row) but can't free anything; pre-fix the row leaked
+  forever in `total_cache_bytes`.
+
+Together they ensure the DB-tracked cache total and the disk-resident
+cache stay in sync regardless of how drift was introduced.
