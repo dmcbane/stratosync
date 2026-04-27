@@ -7,7 +7,6 @@
         ],
         "Description": "Sync-status emblem overlays for stratosync-managed files in Dolphin and Konqueror.",
         "Description[en_US]": "Sync-status emblem overlays for stratosync-managed files in Dolphin and Konqueror.",
-        "Id": "stratosyncoverlay",
         "License": "MIT or Apache-2.0",
         "Name": "Stratosync Sync Status Overlays",
         "Name[en_US]": "Stratosync Sync Status Overlays",
