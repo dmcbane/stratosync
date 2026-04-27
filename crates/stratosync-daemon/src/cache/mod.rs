@@ -83,40 +83,88 @@ impl CacheManager {
             "starting eviction"
         );
 
-        let candidates = self.db.lru_eviction_candidates(self.mount_id, 200).await?;
-        let mut freed  = 0u64;
+        // Walk candidates in batches until we've freed enough or run out.
+        //
+        // Why batched and not a single query: the candidate list could be
+        // 100K+ rows on big mounts; we'd rather not load them all into
+        // memory at once. Re-querying for each batch is cheap because
+        // `set_evicted()` removes rows from `cache_lru`, so the same
+        // ORDER BY last_access ASC LIMIT N gives us the next-oldest
+        // candidates each iteration.
+        //
+        // Pre-fix this loop ran exactly once with LIMIT 200 — for a mount
+        // with many small files (e.g. screenshots, GiB-scale histories of
+        // ~191 KB items) that's ~38 MB freed per pass × a 60 s loop, which
+        // can't keep up with even modest hydration rates. The cache stayed
+        // permanently over quota.
+        const BATCH: usize = 1000;
 
-        for c in candidates {
+        let mut freed         = 0u64;
+        let mut total_skipped = 0usize;
+
+        loop {
             if freed >= to_free { break; }
 
-            // Double-check status before evicting (a write may have happened
-            // since the query)
-            let current = self.db.get_by_inode(c.inode).await?;
-            let status  = current.as_ref().map(|e| e.status);
+            let candidates = self.db
+                .lru_eviction_candidates(self.mount_id, BATCH)
+                .await?;
+            if candidates.is_empty() { break; }
 
-            match status {
-                Some(SyncStatus::Cached) => {
-                    match tokio::fs::remove_file(&c.cache_path).await {
-                        Ok(()) => {
-                            self.db.set_evicted(c.inode).await?;
-                            freed += c.cache_size;
-                            debug!(inode = c.inode, bytes = c.cache_size, "evicted");
-                        }
-                        Err(e) => {
-                            warn!(inode = c.inode, path = ?c.cache_path, "evict remove error: {e}");
+            let mut pass_freed   = 0u64;
+            let mut pass_skipped = 0usize;
+
+            for c in &candidates {
+                if freed + pass_freed >= to_free { break; }
+
+                // Double-check status before evicting — a write may have
+                // landed since the query made the candidate visible.
+                let current = self.db.get_by_inode(c.inode).await?;
+                let status  = current.as_ref().map(|e| e.status);
+
+                match status {
+                    Some(SyncStatus::Cached) => {
+                        match tokio::fs::remove_file(&c.cache_path).await {
+                            Ok(()) => {
+                                self.db.set_evicted(c.inode).await?;
+                                pass_freed += c.cache_size;
+                                debug!(inode = c.inode, bytes = c.cache_size, "evicted");
+                            }
+                            Err(e) => {
+                                warn!(inode = c.inode, path = ?c.cache_path,
+                                      "evict remove error: {e}");
+                                pass_skipped += 1;
+                            }
                         }
                     }
+                    _ => {
+                        debug!(inode = c.inode, "skip eviction, status changed");
+                        pass_skipped += 1;
+                    }
                 }
-                _ => {
-                    // Skip: file became dirty/uploading between query and now
-                    debug!(inode = c.inode, "skip eviction, status changed");
-                }
+            }
+
+            freed         += pass_freed;
+            total_skipped += pass_skipped;
+
+            // Bail if we made no progress this pass — likely all the
+            // candidates we got back are "skipped" (status churned), and
+            // re-querying would just return the same ones. Better to wait
+            // for the next 60 s tick than spin.
+            if pass_freed == 0 {
+                warn!(
+                    mount_id = self.mount_id,
+                    skipped  = pass_skipped,
+                    "eviction made no progress this pass; bailing"
+                );
+                break;
             }
         }
 
         info!(
-            mount_id  = self.mount_id,
-            freed_mb  = freed / 1_048_576,
+            mount_id   = self.mount_id,
+            freed_mb   = freed / 1_048_576,
+            to_free_mb = to_free / 1_048_576,
+            skipped    = total_skipped,
             "eviction complete"
         );
         Ok(())
@@ -198,4 +246,129 @@ async fn evict_stale_bases(
         info!(mount_id, count = removed, "evicted stale base versions");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+    use stratosync_core::{
+        state::NewFileEntry,
+        types::{FileKind, SyncStatus},
+    };
+
+    /// Seed `n` cached files into the DB with on-disk content of `bytes_each`.
+    /// Returns the cache root and the total bytes seeded.
+    async fn seed_cached_files(
+        db:         &Arc<StateDb>,
+        mount_id:   u32,
+        root_inode: u64,
+        cache_dir:  &std::path::Path,
+        n:          usize,
+        bytes_each: u64,
+    ) -> u64 {
+        let blob = vec![0u8; bytes_each as usize];
+        let mut total = 0u64;
+        for i in 0..n {
+            let name = format!("f{i}.bin");
+            let cache_path: PathBuf = cache_dir.join(&name);
+            tokio::fs::write(&cache_path, &blob).await.unwrap();
+
+            let inode = db.insert_file(&NewFileEntry {
+                mount_id,
+                parent: root_inode,
+                name: name.clone(),
+                remote_path: format!("/{name}"),
+                kind: FileKind::File,
+                size: bytes_each,
+                mtime: SystemTime::UNIX_EPOCH,
+                etag: Some("e".into()),
+                status: SyncStatus::Cached,
+                cache_path: Some(cache_path.clone()),
+                cache_size: Some(bytes_each),
+            }).await.unwrap();
+
+            db.touch_lru(inode).await.unwrap();
+            total += bytes_each;
+        }
+        total
+    }
+
+    /// Common DB+mount setup used by the eviction tests.
+    async fn make_mount(quota: u64) -> (Arc<StateDb>, u32, u64, tempfile::TempDir) {
+        let db = Arc::new(StateDb::in_memory().unwrap());
+        db.migrate().await.unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mount_id = db
+            .upsert_mount(
+                "test", "mock:/", "/mnt/test",
+                cache_dir.path().to_str().unwrap(),
+                quota, 60,
+            ).await.unwrap();
+        let root = db.insert_root(&NewFileEntry {
+            mount_id, parent: 0,
+            name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Cached,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+        (db, mount_id, root, cache_dir)
+    }
+
+    /// Regression test for the per-pass `LIMIT 200` cap.
+    ///
+    /// Pre-fix, `lru_eviction_candidates(mount_id, 200)` returned at most
+    /// 200 rows per pass — for many small files that's a tiny dent in the
+    /// overage and the cache stayed permanently over quota.
+    ///
+    /// Seed 1500 × 10 KB = 15 MB into a 5 MB-quota mount. high_mark = 4.5 MB,
+    /// low_mark = 4 MB. Need to free ~11 MB. The OLD code would have freed
+    /// 200 × 10 KB = 2 MB and returned. The NEW code paginates and keeps
+    /// going until under low_mark.
+    #[tokio::test]
+    async fn maybe_evict_converges_with_many_small_files() {
+        let quota: u64 = 5 * 1024 * 1024;
+        let (db, mount_id, root, _cache_dir_guard) = make_mount(quota).await;
+        let cache_dir = _cache_dir_guard.path().to_path_buf();
+
+        let total = seed_cached_files(&db, mount_id, root, &cache_dir, 1500, 10 * 1024).await;
+        // 1500 files × 10 KiB each = 15_360_000 B, well above quota (5 MiB).
+        assert!(total > quota * 2, "seeded {total} below 2× quota {quota}");
+        assert_eq!(db.total_cache_bytes(mount_id).await.unwrap(), total);
+
+        let cm = CacheManager::new(mount_id, Arc::clone(&db), quota);
+        cm.maybe_evict().await.unwrap();
+
+        let after = db.total_cache_bytes(mount_id).await.unwrap();
+        let low_mark = (quota as f64 * 0.80) as u64;
+
+        // Must be at-or-below low_mark — that's the convergence guarantee.
+        assert!(
+            after <= low_mark,
+            "expected cache <= low_mark={low_mark}, got {after}",
+        );
+        // Must not have over-freed: we only need to hit low_mark, not 0.
+        // Allow a one-batch overshoot (1000 × 10 KB = 10 MB worst case).
+        assert!(after > 0, "evicted everything; expected partial eviction");
+    }
+
+    /// Eviction is a no-op when usage is below the high-water mark.
+    #[tokio::test]
+    async fn maybe_evict_noop_when_under_high_mark() {
+        let quota: u64 = 10 * 1024 * 1024;
+        let (db, mount_id, root, _cache_dir_guard) = make_mount(quota).await;
+        let cache_dir = _cache_dir_guard.path().to_path_buf();
+
+        // 50 × 10 KB = 500 KB << 9 MB high mark.
+        seed_cached_files(&db, mount_id, root, &cache_dir, 50, 10 * 1024).await;
+        let before = db.total_cache_bytes(mount_id).await.unwrap();
+
+        let cm = CacheManager::new(mount_id, Arc::clone(&db), quota);
+        cm.maybe_evict().await.unwrap();
+
+        let after = db.total_cache_bytes(mount_id).await.unwrap();
+        assert_eq!(after, before, "should not evict when under high mark");
+    }
 }

@@ -105,6 +105,19 @@ All notable changes to this project will be documented in this file.
   `list()` calls during traversal.
 
 ### Fixed
+- **Cache eviction never converged when far over quota.** `maybe_evict()`
+  queried `lru_eviction_candidates(mount_id, 200)` once per pass and stopped
+  after walking those 200 rows. With many small files (typical screenshots,
+  text docs) freeing 200 × ~191 KB ≈ 38 MB per pass — combined with the
+  60 s loop interval — was ~2.3 GB/hour theoretical max, easily out-paced
+  by hydration. The cache stayed permanently over quota, sometimes by a
+  large multiple (one live mount observed at 167 % full, 18 GB on a
+  10.7 GB quota). The eviction code now paginates: re-queries the next
+  1000-candidate batch each iteration (cheap because `set_evicted()` removes
+  rows from `cache_lru`), bails on no-progress to avoid spinning, and keeps
+  going until usage is below the low-water mark. Added two regression tests
+  covering the convergence path on a many-small-files mount and the
+  no-op-when-under-high-mark fast path.
 - Conflict sibling lookup used the wrong column name (`parent` vs
   `parent_inode`), causing false negatives in the conflicts cleanup
   walker.
