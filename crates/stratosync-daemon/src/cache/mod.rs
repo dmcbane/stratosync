@@ -56,13 +56,26 @@ impl CacheManager {
         }
     }
 
-    /// Called immediately after a successful hydration to check quota.
+    /// Called immediately after a successful hydration. Touches the LRU
+    /// position for the new entry; does **not** trigger eviction inline.
+    ///
+    /// We used to call `maybe_evict()` here too — the intent was "be
+    /// aggressive about quota enforcement after every cache write." In
+    /// practice that amplified any eviction-loop bug: when the eviction
+    /// loop was misbehaving (see fix-cache-eviction-convergence and
+    /// fix-cache-phantom-rows), every successful hydration triggered
+    /// another expensive scan, each call held the StateDb mutex for many
+    /// hundreds of acquisitions, and FUSE readdir/getattr ops piled up
+    /// behind it. Live observed: ~17 s tail latency on every `ls` of a
+    /// stratosync directory while the daemon was over quota.
+    ///
+    /// Mitigation: only the 60 s ticker drives eviction now. Worst-case
+    /// quota lag is one tick (~60 s), which is acceptable — the high-
+    /// water mark is 90 %, so there's headroom built in. Hydrations
+    /// stay fast and the eviction loop's blast radius is bounded.
     pub async fn on_file_cached(&self, inode: u64, _size: u64) {
         if let Err(e) = self.db.touch_lru(inode).await {
             warn!(inode, "touch_lru failed, eviction order may be wrong: {e}");
-        }
-        if let Err(e) = self.maybe_evict().await {
-            warn!("post-hydrate eviction error: {e}");
         }
     }
 
@@ -432,6 +445,52 @@ mod tests {
             after <= (quota as f64 * 0.80) as u64,
             "expected total <= 80% of quota after phantom reconciliation, \
              got before={before} after={after}",
+        );
+    }
+
+    /// `on_file_cached` must NOT trigger eviction inline — that path
+    /// caused multi-second mutex storms when eviction was misbehaving
+    /// (see fix-cache-eviction-convergence / fix-cache-phantom-rows).
+    /// Only the 60 s ticker drives eviction now.
+    ///
+    /// Construct a mount that's wildly over quota and verify
+    /// `on_file_cached` returns *without* shrinking the DB total —
+    /// the only side effect should be a `touch_lru` for the new entry.
+    #[tokio::test]
+    async fn on_file_cached_does_not_trigger_eviction() {
+        let quota: u64 = 1024 * 1024;     // 1 MiB
+        let (db, mount_id, root, _cache_dir_guard) = make_mount(quota).await;
+        let cache_dir = _cache_dir_guard.path().to_path_buf();
+
+        // Seed 100 × 100 KiB = 10 MiB ≫ quota.
+        let total = seed_cached_files(&db, mount_id, root, &cache_dir, 100, 100 * 1024).await;
+        assert!(total > quota * 5);
+        let before = db.total_cache_bytes(mount_id).await.unwrap();
+
+        // Now create one more inode and call on_file_cached on it. If
+        // eviction were still triggered inline, it would shrink the DB
+        // total dramatically.
+        let extra_path = cache_dir.join("extra.bin");
+        tokio::fs::write(&extra_path, vec![0u8; 100 * 1024]).await.unwrap();
+        let extra_inode = db.insert_file(&NewFileEntry {
+            mount_id, parent: root,
+            name: "extra.bin".into(), remote_path: "/extra.bin".into(),
+            kind: FileKind::File, size: 100 * 1024,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Cached,
+            cache_path: Some(extra_path),
+            cache_size: Some(100 * 1024),
+        }).await.unwrap();
+
+        let cm = CacheManager::new(mount_id, Arc::clone(&db), quota);
+        cm.on_file_cached(extra_inode, 100 * 1024).await;
+
+        // Only delta should be the +100 KiB just-cached entry; eviction
+        // must NOT have run.
+        let after = db.total_cache_bytes(mount_id).await.unwrap();
+        assert_eq!(
+            after, before + 100 * 1024,
+            "on_file_cached should not trigger eviction (before={before} after={after})",
         );
     }
 

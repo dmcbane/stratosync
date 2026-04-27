@@ -104,6 +104,20 @@ All notable changes to this project will be documented in this file.
   after a full recursive poll, eliminating per-directory backend
   `list()` calls during traversal.
 
+### Changed
+- **`on_file_cached` no longer triggers eviction inline.** Hydrations
+  used to call `maybe_evict()` synchronously to be aggressive about
+  quota enforcement. In practice that turned every successful
+  hydration into a multi-second StateDb-mutex storm whenever the
+  eviction loop was misbehaving — observed live at ~17 s tail latency
+  on every `ls` while the mount was over quota. Eviction is now driven
+  exclusively by the 60 s ticker; worst-case quota lag is one tick,
+  acceptable given the 90 % high-water mark headroom. Hydrations stay
+  fast and the eviction loop's blast radius is bounded. New regression
+  test (`on_file_cached_does_not_trigger_eviction`) seeds a mount that
+  is 10× over quota and asserts that `on_file_cached` only updates the
+  LRU position without running an eviction pass.
+
 ### Fixed
 - **OneDrive delta polling halted permanently after one nameless item.**
   Microsoft Graph occasionally returns `driveItem`s in a delta response
