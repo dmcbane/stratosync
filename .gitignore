@@ -6,3 +6,7 @@ Cargo.lock
 .env
 *.log
 /config.toml
+
+# Python bytecode from contrib/file-managers/common/test_*.py runs
+__pycache__/
+*.pyc
