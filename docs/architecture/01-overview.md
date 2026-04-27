@@ -12,9 +12,9 @@
 
 ### Non-Goals (for now)
 - Real-time collaborative editing (CRDTs, OT)
-- End-to-end encryption of content (rclone provides optional crypt remote)
+- End-to-end encryption of content (rclone provides optional crypt remote;
+  encrypted local cache is on the v0.13.0 roadmap separately)
 - P2P sync between local machines (use Syncthing for that)
-- GUI / tray icon (follow-on work)
 
 ---
 
@@ -42,32 +42,38 @@
 │                             │  async channels (tokio)         │
 │  ┌──────────────────────────▼──────────────────────────────┐ │
 │  │  sync_engine  (src/sync/)                               │ │
-│  │  - HydrationQueue: prioritized pending downloads        │ │
-│  │  - UploadQueue:    debounced, ordered pending uploads   │ │
-│  │  - DeltaPoller:    polls remote for changes             │ │
-│  │  - ConflictResolver                                     │ │
+│  │  - HydrationQueue: foreground/background, range-read    │ │
+│  │  - UploadQueue:    deadline-based debounce + bw window  │ │
+│  │  - RemotePoller:   delta API or full listing per backend│ │
+│  │  - ConflictResolver: 3-way merge or .conflict siblings  │ │
+│  │  - VersionCapture: pre-replace / post-upload snapshots  │ │
 │  └──────┬───────────────────────────┬───────────────────────┘ │
 │         │                           │                          │
 │  ┌──────▼──────────┐   ┌───────────▼──────────────────────┐  │
 │  │  state_db       │   │  cache_manager  (src/cache/)      │  │
-│  │  (src/state/)   │   │  - Local cache dir (~/.cache/     │  │
-│  │  SQLite WAL     │   │    stratosync/)                   │  │
-│  │  file_index     │   │  - LRU eviction with quota        │  │
-│  │  sync_queue     │   │  - Sparse/partial file support    │  │
+│  │  (per-mount     │   │  - Cache dir per mount            │  │
+│  │   SQLite WAL)   │   │    (~/.cache/stratosync/<name>/)  │  │
+│  │  file_index     │   │  - LRU eviction (pin-aware)       │  │
+│  │  sync_queue     │   │  - .bases/objects/  content-      │  │
+│  │  base_versions  │   │    addressed BaseStore (3-way     │  │
+│  │  version_history│   │    merge + version history)       │  │
+│  │  delete_tomb…   │   │  - Range-read fast path           │  │
+│  │  change_tokens  │   │    (rclone cat --offset/--count)  │  │
 │  │  xattr_store    │   └──────────────────────────────────┘  │
 │  └──────┬──────────┘                                          │
 │         │                                                      │
 │  ┌──────▼───────────────────────────────────────────────────┐ │
 │  │  backend  (src/backend/)                                 │ │
-│  │  rclone subprocess adapter                               │ │
-│  │  - lsjson, copy, moveto, delete, about                   │ │
-│  │  - streaming stdin/stdout for large transfers            │ │
+│  │  - RcloneBackend: command-mode subprocess                │ │
+│  │  - WebDavSidecarBackend: long-running rclone serve webdav│ │
+│  │  - DeltaProvider: GoogleDriveDelta, OneDriveDelta        │ │
 │  └──────────────────────────────────────────────────────────┘ │
 │                                                               │
-│  ┌───────────────────┐   ┌──────────────────────────────┐    │
-│  │  inotify_watcher  │   │  config  (src/config/)        │    │
-│  │  (notify crate)   │   │  TOML, per-mount profiles     │    │
-│  └───────────────────┘   └──────────────────────────────┘    │
+│  ┌──────────────────┐  ┌─────────────────┐ ┌──────────────┐  │
+│  │ inotify_watcher  │  │  metrics        │ │ ipc_socket   │  │
+│  │ (selective-sync- │  │  /metrics HTTP  │ │ (dashboard,  │  │
+│  │  filtered)       │  │  (opt-in)       │ │  CLI status) │  │
+│  └──────────────────┘  └─────────────────┘ └──────────────┘  │
 └──────────────────────────────────────────────────────────────┘
                        │  rclone subprocess
 ┌──────────────────────▼───────────────────────────────────────┐
@@ -155,12 +161,16 @@ The key design rule: **FUSE threads never do I/O directly**. They enqueue work a
 
 | Failure | Detection | Recovery |
 |---------|-----------|----------|
-| Daemon crash during upload | WAL entry with `status=UPLOADING` on restart | Re-upload from cache |
-| Daemon crash during hydration | WAL entry with `status=HYDRATING` on restart | Delete partial file, re-hydrate on next open |
-| Remote ETag conflict on upload | rclone returns non-zero / HTTP 412 | ConflictResolver: create `.conflict` sibling |
-| Cache disk full | `ENOSPC` from cache write | Evict LRU entries, retry; if still full, return `ENOSPC` to user |
-| rclone binary missing | backend::spawn returns `ENOENT` | Daemon refuses to start; log actionable error |
-| Network outage | rclone timeout/error | Exponential backoff; queue persists across restarts |
+| Daemon crash during upload | `status=UPLOADING` row on restart | Reset to `Dirty`, re-upload from cache |
+| Daemon crash during hydration | `status=HYDRATING` row on restart | Delete partial file, reset to `Remote`; re-hydrate on next open |
+| Remote ETag conflict on upload | Pre/post-upload ETag mismatch | ConflictResolver: 3-way merge for text (when enabled), else `.conflict.*` sibling under `.stratosync-conflicts/` |
+| Cache disk full | `ENOSPC` from cache write | LRU evict; if still full, return `ENOSPC` to user |
+| rclone binary missing | `backend::which_rclone()` returns `ENOENT` | Daemon refuses to start; log actionable error |
+| Network outage / 5xx | rclone timeout/error | Exponential backoff (3 fails → double interval, cap 10 min); queue persists across restarts |
+| GDrive 403 rate-limit | HTTP 403 with `rateLimitExceeded` in body | Mapped to `Transient`, backoff applied (not `PermissionDenied`) |
+| OAuth token expired | HTTP 401 from delta API | Force-refresh via `rclone about`, retry once |
+| Change token invalidated (HTTP 410) | Delta API returns `TokenExpired` | Fall back to one full listing, obtain fresh token, resume delta mode |
+| Locally-deleted file resurrects from poller | Tombstone in `delete_tombstones` blocks the upsert (5 min) | None needed; tombstone expires after the remote delete confirms |
 
 ---
 

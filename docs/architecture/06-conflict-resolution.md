@@ -55,7 +55,10 @@ Steps:
    conflict_name = "{stem}.conflict.{ts}.{hash}.{ext}"
    // → "report.conflict.20250315T142301Z.a3f2e1b9.pdf"
 
-   conflict_remote = parent(remote_path) + "/" + conflict_name
+   conflict_remote = ".stratosync-conflicts/" + parent(remote_path)
+                   + "/" + conflict_name
+   // Conflicts live under a dedicated remote prefix, NOT alongside the
+   // canonical file. Keeps the user-visible namespace clean.
 
 3. UPLOAD the local (conflicting) version under the conflict name
    backend.upload(local_path, conflict_remote, if_match=None)
@@ -73,6 +76,37 @@ Steps:
    - set xattr user.stratosync.has_conflict = "1" on the parent directory
      (allows file manager integration to show conflict badge)
 ```
+
+---
+
+## Conflict-namespace isolation (`.stratosync-conflicts/`)
+
+Conflict siblings live under a dedicated remote prefix, mirroring the
+canonical directory tree:
+
+```
+gdrive:/Documents/report.pdf                              # canonical
+gdrive:/.stratosync-conflicts/Documents/report.conflict.20260403T142301Z.a3f2e1b9.pdf
+```
+
+This is a deliberate departure from the v0.11.0 behavior, where conflict
+files lived next to the canonical version. Reasons:
+
+- **Clean user-visible namespace.** A directory full of `.conflict.*` files
+  is noisy; isolation hides them by default but keeps them recoverable.
+- **Bulk cleanup is trivial.** `stratosync conflicts cleanup` just walks
+  the prefix; it doesn't have to scan the whole tree.
+- **Round-trip safety.** The poller, watcher, and upload queue all filter
+  the conflict prefix at every ingress point, so a conflict file isn't
+  re-imported as regular content or re-uploaded as a new conflict-of-a-
+  conflict.
+
+A startup tree walk migrates any pre-existing conflict siblings (from older
+deployments) into the new namespace.
+
+The `.stratosync-conflicts` name is a reserved filename — `validate_filename`
+in the FUSE layer rejects it on `create`/`mkdir` so user code can't collide
+with the prefix.
 
 ---
 
@@ -185,9 +219,16 @@ $ stratosync conflicts keep-local  ~/GoogleDrive/Documents/report.pdf
 $ stratosync conflicts keep-remote ~/GoogleDrive/Documents/report.pdf
 $ stratosync conflicts merge       ~/GoogleDrive/Documents/report.pdf
 $ stratosync conflicts diff        ~/GoogleDrive/Documents/report.pdf
+$ stratosync conflicts cleanup [--dry-run]
 ```
 
 - **keep-local**: uploads the local cached version, deletes the `.conflict.*` sibling
 - **keep-remote**: downloads the remote version, deletes the `.conflict.*` sibling
-- **merge**: attempts 3-way merge via `git merge-file` using the base version store; on conflict markers, writes them to the file for manual editing
+- **merge**: attempts 3-way merge via `git merge-file` using the base version
+  store; on conflict markers, writes them to the file for manual editing
 - **diff**: shows a unified diff between local and remote versions
+- **cleanup**: walks `.stratosync-conflicts/` and drops siblings whose content
+  is byte-equal to the canonical file (the common case after a transient
+  false-positive). Has a stat-based fast path before the byte-compare and
+  shows live per-entry progress. `--dry-run` reports what would be removed
+  without modifying anything.

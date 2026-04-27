@@ -20,20 +20,26 @@ pub trait Backend: Send + Sync + 'static {
 
     // Data transfer
     async fn download(&self, remote: &str, local: &Path) -> Result<()>;
-    async fn download_range(&self, remote: &str, local: &Path, offset: u64, len: u64) -> Result<()>;
-    async fn upload(&self, local: &Path, remote: &str, if_match: Option<&str>) -> Result<RemoteMetadata>;
+    async fn download_range(
+        &self, remote: &str, local: &Path, offset: u64, len: u64,
+    ) -> Result<()>;   // default impl returns SyncError::NotSupported
+    async fn upload(&self, local: &Path, remote: &str, if_match: Option<&str>)
+        -> Result<RemoteMetadata>;
 
     // Mutations
     async fn mkdir(&self, path: &str) -> Result<()>;
     async fn delete(&self, path: &str) -> Result<()>;
     async fn rename(&self, from: &str, to: &str) -> Result<()>;
+    async fn rmdir(&self, path: &str) -> Result<()>;
 
     // Quota
     async fn about(&self) -> Result<RemoteAbout>;
 
     // Delta / change detection
-    async fn changes_since(&self, token: &str) -> Result<(Vec<RemoteChange>, String)>;
     fn supports_delta(&self) -> bool;
+    async fn get_start_token(&self) -> Result<String>;          // default: error
+    async fn changes_since(&self, token: &str)
+        -> Result<(Vec<RemoteChange>, String)>;
 }
 
 pub struct RemoteMetadata {
@@ -54,16 +60,46 @@ pub struct RemoteMetadata {
 
 The concrete implementation drives rclone via subprocess.
 
-### Process lifecycle
+### Backend variants
 
-We maintain **two rclone modes**:
+Two concrete `Backend` implementations are shipped:
 
-| Mode | Use | How |
-|------|-----|-----|
-| **Command mode** | One-shot ops: stat, list, mkdir, delete, rename | `tokio::process::Command` per call |
-| **Serve mode** | Bulk transfers (download/upload) | Long-running `rclone serve webdav` or `rclone rcat` |
+| Implementation | Use | How |
+|----------------|-----|-----|
+| **`RcloneBackend`** (default) | All operations | `tokio::process::Command` per call |
+| **`WebDavSidecarBackend`** (opt-in) | All operations | One long-running `rclone serve webdav` per mount, plain HTTP/WebDAV via `reqwest` |
 
-For the MVP, we use command mode exclusively. Serve mode is a Phase 2 optimization that reduces per-transfer startup overhead from ~30ms to ~1ms.
+Set `[daemon] webdav_sidecar = true` to enable the sidecar. The daemon spawns
+one `rclone serve webdav` subprocess per mount on a port computed from the
+mount ID (so multiple mounts don't collide), and routes all `Backend` calls
+through HTTP/WebDAV verbs (GET, PUT, PROPFIND, MKCOL, DELETE, MOVE).
+
+The sidecar eliminates per-operation rclone subprocess startup (~30 ms cold
+start) and gives clean HTTP `Range:` support for `download_range`. Trade-off:
+one extra long-running process per mount, plus the rclone `serve webdav`
+implementation's quirks. RcloneBackend remains the conservative default.
+
+The `Backend` trait abstracts over both — every consumer (FUSE layer, sync
+engine, CLI) sees the same async interface. Selecting the variant is a
+daemon-level concern.
+
+### Delta providers
+
+Delta-API support is layered on top of `RcloneBackend` via the
+`DeltaProvider` trait. `init_delta()` is called once at startup and
+constructs a provider based on the rclone remote type:
+
+| `type =` | DeltaProvider |
+|----------|---------------|
+| `drive` | `GoogleDriveDelta` (`pageToken` against the Changes API) |
+| `onedrive` | `OneDriveDelta` (`/delta` endpoint, full-path responses) |
+| anything else | none — `supports_delta()` returns `false` |
+
+Both providers handle their own OAuth refresh: GoogleDriveDelta force-refreshes
+via `rclone about` + `rclone config show` when it sees HTTP 401;
+OneDriveDelta hits Microsoft's token endpoint directly.
+
+GDrive shared drives are not yet supported — see [ROADMAP.md](../ROADMAP.md).
 
 ### rclone invocation patterns
 
@@ -174,18 +210,6 @@ checkers = 8             # max concurrent stat checks
 ```
 
 ---
-
-## Phase 2: rclone serve mode
-
-For high-throughput scenarios, replace command-per-operation with a long-running rclone WebDAV server:
-
-```bash
-rclone serve webdav "gdrive:/" --addr 127.0.0.1:19283 --read-only
-```
-
-Then use a simple HTTP client (reqwest) to talk WebDAV internally. This eliminates subprocess startup overhead and enables HTTP range requests for partial hydration.
-
-This is architecturally isolated to the `RcloneBackend` implementation — the `Backend` trait doesn't change.
 
 ---
 

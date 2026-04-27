@@ -7,6 +7,8 @@
 └── {mount_name}/              # one dir per configured mount
     ├── .meta/                 # internal metadata (not exposed via FUSE)
     │   └── partial/           # incomplete hydrations (deleted on restart)
+    ├── .bases/                # content-addressed object store (BaseStore)
+    │   └── objects/{ab}/{cd…} # SHA-256 blobs, git-style fan-out
     └── {mirrored structure}   # mirrors the remote path tree
         ├── Documents/
         │   ├── report.pdf     # hydrated file
@@ -16,7 +18,10 @@
                 └── IMG_001.jpg
 ```
 
-Cache files are regular files on the underlying filesystem. Their paths mirror the remote structure, making it easy to debug and inspect without database access.
+Cache files are regular files on the underlying filesystem. Their paths
+mirror the remote structure, making it easy to debug and inspect without
+database access. The `.bases/` directory is a separate content-addressed
+store — see [BaseStore](#basestore-content-addressed-blobs) below.
 
 ---
 
@@ -126,39 +131,85 @@ impl CacheManager {
 
 ---
 
-## Partial / Range Hydration (Phase 2)
+## Range-Read Fast Path
 
-For large files (video, disk images), downloading the entire file before returning `open()` is unacceptable. Phase 2 adds range-based partial hydration:
+Downloading an entire large file before `open()` returns is unacceptable for
+media. Stratosync handles this with a **range-read fast path** during the
+in-flight hydration window: when an `open()` returns immediately and the
+caller starts `read()`-ing before the full background download completes,
+each `read(offset, size)` call invokes `Backend::download_range(remote,
+offset, size)` to fetch just the requested bytes and serve them
+synchronously, while the full hydration continues in the background.
 
-```rust
-// Sparse file with a range map
-struct SparseCache {
-    fd:        File,
-    ranges:    RangeSet<u64>,   // hydrated byte ranges
-    total_size: u64,
-}
-```
+`download_range` is implemented by:
 
-The FUSE `read(offset, size)` handler checks if `[offset, offset+size)` is in `ranges`. If not, it requests that range from the backend before serving the read.
+- `RcloneBackend` → `rclone cat --offset N --count M` to a temp file.
+- `WebDavSidecarBackend` → HTTP `GET` with a `Range:` header.
 
-For sequential reads (e.g., media player seeking through a video), we prefetch ahead of the current read position.
+Backends that don't support it inherit the default trait impl (returns
+`SyncError::NotSupported`), and the FUSE layer falls back to blocking
+the FUSE caller on the full hydration's oneshot.
 
-This requires backends to support range downloads (`rclone cat --offset N --count M` or HTTP Range requests via the serve-webdav mode).
+The range-read fast path is what lets `vlc ~/Drive/movie.mkv` start playing
+within a second instead of after the full download.
+
+---
+
+## Readdir Prefetch
+
+When a directory is listed for the first time (its `dir_listed` flips from
+NULL), small files in that directory are queued for background hydration.
+Threshold is configurable via `[daemon.sync] prefetch_threshold` (default
+1 MB; set `"0"` to disable).
+
+Prefetch jobs run at `Background` priority — a foreground `open()` for the
+same inode upgrades the in-flight hydration. The intent is to make "open
+the folder, double-click the document" feel local even on a high-latency
+remote.
+
+---
+
+## BaseStore (content-addressed blobs)
+
+`<cache_dir>/.bases/objects/<sha256[..2]>/<sha256[2..]>` is a content-
+addressed blob store, layout borrowed from git. It serves two consumers:
+
+- **3-way merge bases** — the `base_versions` table keeps one
+  `(inode, mount_id) → object_hash` row per file, used as the common
+  ancestor for `git merge-file`.
+- **File version history** — the `version_history` table stores N
+  recent snapshots per file (per `version_retention`), captured before
+  poll-driven cache replaces and after successful uploads.
+
+Both consumers reference the same blob layout, so identical content (e.g.
+an `after_upload` snapshot of an unchanged file) deduplicates to a single
+blob. A blob is **only** removed from disk when no `base_versions` *and*
+no `version_history` row references it. This cross-table refcount avoids
+deleting a blob still serving as a merge base just because it scrolled out
+of the version-retention window, and vice versa.
+
+Stale `base_versions` rows are evicted by the cache manager on a 6-hour
+cycle based on `[daemon.sync] base_retention_days` (default 30).
 
 ---
 
 ## Pinning
 
-Files can be pinned to prevent eviction and ensure they're always available offline:
+Files can be pinned to prevent eviction and ensure they're always available
+offline:
 
 ```bash
 stratosync pin ~/GoogleDrive/ImportantDoc.pdf
-stratosync pin ~/GoogleDrive/WorkDocs/   # pin an entire directory
+stratosync pin ~/GoogleDrive/WorkDocs/   # pin an entire directory, recursive
+stratosync unpin ~/GoogleDrive/ImportantDoc.pdf
 ```
 
-Pinned files have `cache_lru.pinned = 1`. They are eagerly hydrated when pinned (downloaded in background immediately).
+Pinned files have `cache_lru.pinned = 1`. They are eagerly hydrated when
+pinned (downloaded in background immediately, so pinning a directory of 50
+small files completes in parallel).
 
-Pin state persists across daemon restarts in the DB.
+Pin state persists across daemon restarts in the DB. `stratosync status`
+reports the pinned count per mount.
 
 ---
 

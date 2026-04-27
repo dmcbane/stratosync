@@ -4,13 +4,23 @@
 
 The sync engine is the coordination center of the daemon. It owns:
 
-- **HydrationQueue** — ordered downloads from remote to cache
-- **UploadQueue** — debounced, ETag-checked uploads from cache to remote  
-- **RemotePoller** — detects remote changes (polling or delta API)
-- **ConflictResolver** — handles ETag mismatches and concurrent edits
-- **MutationSerializer** — ensures remote operations are ordered correctly
+- **HydrationQueue** — ordered downloads from remote to cache, with a
+  range-read fast path for in-flight hydrations
+- **UploadQueue** — deadline-based debounced uploads with optimistic-lock
+  ETag check, optional bandwidth-window gating, and post-upload version
+  capture
+- **RemotePoller** — detects remote changes via delta API (Google Drive
+  `pageToken`, OneDrive `/delta`) or full recursive listing; preserves
+  selectively-ignored entries so they aren't swept by the stale-entry pass
+- **ConflictResolver** — handles ETag mismatches via 3-way text merge
+  (when enabled) or `.conflict.*` siblings under `.stratosync-conflicts/`
+- **VersionCapture** — content-addressed snapshots before a poller-driven
+  cache replace and after each successful upload
+- **MutationSerializer** — per-directory locks ensure remote operations
+  (rename, delete, mkdir) are ordered correctly
 
-All sync_engine components are async Tokio tasks communicating via channels.
+All sync_engine components are async Tokio tasks communicating via channels
+or shared state guarded by `Arc<Mutex<…>>`.
 
 ---
 
@@ -95,38 +105,61 @@ When a foreground hydration request arrives for an inode already being hydrated 
 
 ## UploadQueue
 
-Upload events are debounced to avoid thrashing on apps that write files in many small chunks (e.g., text editors saving every few seconds).
+Upload events are debounced to avoid thrashing on apps that write files in
+many small chunks (e.g., text editors saving every few seconds).
+
+The current design is **deadline-based**: every pending upload carries a
+single `due_at` instant. There are no per-inode tokio sleep tasks, no abort
+mechanism, no oneshot channels. The dispatcher loop wakes on the earliest
+deadline. (The pre-v0.8.0 design used abort-and-respawn — multiple sleep
+tasks raced to fire and silently dropped uploads under bursty writes.)
 
 ```rust
 struct UploadQueue {
-    pending: HashMap<u64, UploadJob>,   // inode → job
-    timers:  JoinSet<u64>,              // tokio::time::sleep tasks
+    // (inode → pending state). Single source of truth.
+    pending: Mutex<HashMap<u64, PendingUpload>>,
+    upload_window:     Option<UploadWindow>,   // bandwidth schedule
+    version_retention: u32,
 }
 
-struct UploadJob {
-    inode:       u64,
+struct PendingUpload {
     cache_path:  PathBuf,
     remote_path: String,
-    known_etag:  Option<String>,   // ETag we last synced; used for optimistic lock
-    enqueued_at: Instant,
+    known_etag:  Option<String>,
+    due_at:      Instant,
+    immediate:   bool,   // set by fsync; never downgraded by a later Write
     attempt:     u32,
 }
 ```
 
-**Debounce logic**:
-- On first `write()`: insert job with `due_at = now + DEBOUNCE_WINDOW` (default 2s).
-- On subsequent `write()` for same inode: reset `due_at`.
-- On `fsync()`: set `due_at = now` (immediate).
-- On `close()`: set `due_at = now + SHORT_WINDOW` (0.5s).
+**Event handling**:
+
+| Event | Effect |
+|-------|--------|
+| `Write(inode)` (first or subsequent) | Insert/replace `due_at = now + UPLOAD_DEBOUNCE_MS` (default 2000 ms). |
+| `Close(inode)` | `due_at = max(due_at, now + UPLOAD_CLOSE_DEBOUNCE_MS)` (default 500 ms). |
+| `Fsync(inode)` | `due_at = now`, `immediate = true`. |
+| Successful upload | Remove from `pending`. |
+| Failed upload (transient) | Re-insert with exponential `due_at` backoff. |
+
+**Bandwidth window gating**. When `upload_window` is configured, the
+dispatcher computes `effective_due_at(p) = max(p.due_at, now + secs_until_open)`
+for non-immediate jobs, so they sleep until the window opens rather than
+spinning. `immediate = true` jobs always dispatch — `fsync()` was an explicit
+durability request and shouldn't be overridden by a coarse bandwidth policy.
 
 **Upload execution**:
+
 ```
-1. Read known_etag from DB
-2. Call backend::get_etag(remote_path)
-3. If remote_etag != known_etag → CONFLICT path
-4. Call backend::upload(cache_path, remote_path, if_match=known_etag)
-5. If HTTP 412 Precondition Failed → CONFLICT path
-6. On success: update DB with new etag, status=CACHED
+1. Read known_etag from DB.
+2. Pre-check: backend::stat() — if remote_etag != known_etag → CONFLICT path.
+3. Upload via backend::upload(cache_path, remote_path, if_match=known_etag).
+4. Post-check: backend::stat() — if remote_etag changed during upload
+   to something other than what we just wrote → CONFLICT path.
+5. On success: update DB (etag, status=Cached), capture the just-uploaded
+   content as an after_upload version snapshot (if version_retention > 0
+   and size <= base_max_file_size), trim history to N entries, then
+   release the in_flight slot.
 ```
 
 ---
@@ -138,24 +171,28 @@ The poller is responsible for detecting changes made on the remote by other clie
 ### Strategy per backend type
 
 ```
-Google Drive  →  Changes API (pageToken, poll interval 30s)
-OneDrive      →  Delta API (/delta endpoint, poll interval 30s)
-SharePoint    →  Delta API
-Nextcloud     →  PROPFIND with etag, poll interval 60s
-S3            →  ListObjectsV2 with ETag compare, poll interval 120s
-WebDAV        →  PROPFIND with Last-Modified/ETag, poll interval 60s
-SFTP          →  recursive stat scan, poll interval 300s
+Google Drive  →  Changes API via pageToken (DeltaProvider: GoogleDriveDelta)
+OneDrive      →  /delta endpoint        (DeltaProvider: OneDriveDelta)
+Nextcloud     →  PROPFIND with etag     (full listing diff)
+S3            →  ListObjectsV2          (full listing diff)
+WebDAV        →  PROPFIND               (full listing diff)
+SFTP          →  recursive stat scan    (full listing diff)
 ```
 
-rclone exposes `lsjson --recursive --hash` for most backends. We diff the result against our `file_index` to detect changes.
+The poller calls `backend.supports_delta()` at startup. When delta is available,
+each cycle queries `changes_since(token)`; the backend returns a list of
+`Added | Modified | Deleted` events plus the next token. When delta is *not*
+available, the poller falls back to `lsjson --recursive --hash` and diffs the
+result against an in-memory snapshot of `file_index` (only changed entries
+trigger DB writes — idle polls of large mounts are nearly free).
+
+A persistent `change_tokens` table stores the per-mount delta token so the
+daemon resumes incrementally after a restart. If the backend rejects a token
+(HTTP 410, mapped to `SyncError::TokenExpired`), the poller falls back to one
+full listing, obtains a fresh start token, and resumes delta mode on the next
+cycle.
 
 ```rust
-async fn poll_once(backend: &Backend, db: &StateDb) -> Vec<RemoteChange> {
-    let remote_listing = backend.lsjson_recursive().await?;
-    let local_index    = db.snapshot_remote_metadata().await?;
-    diff_listings(local_index, remote_listing)
-}
-
 enum RemoteChange {
     Added    { path: String, metadata: RemoteMetadata },
     Modified { path: String, old_etag: String, new_etag: String },
@@ -164,13 +201,36 @@ enum RemoteChange {
 }
 ```
 
-For Google Drive and OneDrive, we maintain a `change_token` (pageToken / deltaLink) in the DB to avoid full re-scans.
+### Selective-sync filtering and the stale-entry sweep
+
+Both `poll_once` (full-listing) and `poll_once_delta` (delta) check each
+incoming entry against the per-mount `Arc<GlobSet>` of `ignore_patterns`.
+
+The full-listing path has a subtlety: phase 3 of `poll_once` runs
+`delete_stale_entries`, which removes any DB entry whose generation wasn't
+bumped this poll. A naïve "skip ignored entries" implementation would cause
+already-indexed entries that *newly* match a pattern to be **deleted** from
+the DB and their cache files **wiped**. The poller instead pushes those
+inodes into `unchanged_inodes` so their generation gets bumped — they're
+treated as "leave alone, just don't update". Net effect: ignore patterns
+prevent *new* indexing; they never retroactively unindex (mirroring
+gitignore's behavior).
+
+The delta path is simpler — there's no generation sweep, so a `continue`
+in the `Added | Modified` arm is correct. `Deleted` arms always apply
+(deleting an entry that was never indexed is a no-op).
+
+The poller also caps remote listings at 500 000 entries (DoS protection)
+and emits a one-time hint suggesting `ignore_patterns` when the limit is
+hit.
 
 ### Applying remote changes to open files
 
 If a file is currently `DIRTY` or `UPLOADING` when a remote change arrives:
 - If `new_etag != known_etag` AND local has unsaved writes → **CONFLICT**
-- If local file is clean (status = CACHED) → evict from cache, set status = STALE
+- If local file is clean (status = CACHED) → capture a `before_poll` version
+  snapshot of the cached content (if `version_retention > 0`), then evict
+  from cache and set status = STALE
 
 ---
 
@@ -242,12 +302,75 @@ Mutations are queued and executed in order, preventing the pathological case whe
 
 ---
 
+## VersionCapture
+
+When `version_retention > 0`, the sync engine records snapshots of file
+content at the two moments where data could otherwise be lost:
+
+- **`before_poll`** — invoked from the poller just before invalidating a
+  cached local file because the remote ETag changed. The *outgoing* local
+  content gets snapshotted.
+- **`after_upload`** — invoked from the upload queue after a successful
+  upload. The *just-uploaded* content gets snapshotted, so a regretted
+  edit can be rolled back.
+
+Snapshots are stored content-addressed in the same `BaseStore` used for the
+3-way merge feature (`<cache_dir>/.bases/objects/<sha256[..2]>/<sha256[2..]>`).
+A `version_history` row records `(inode, mount_id, object_hash, recorded_at,
+file_size, etag, source)`.
+
+Files larger than `[daemon.sync] base_max_file_size` (default 10 MiB) are
+skipped — the version cache is for documents and source code, not media
+archives.
+
+After each insert, the engine prunes `version_history` to the most recent
+`version_retention` rows for that inode. Orphaned blobs (no `base_versions`
+*and* no `version_history` references) are deleted from disk via
+`BaseStore::remove_object`. The cross-table refcount avoids deleting a blob
+that's still serving as a 3-way-merge base.
+
+Restoration is CLI-driven: `stratosync versions restore <path> --index N`
+copies the blob over the cache file and marks the entry `Dirty`, so the
+next sync uploads the restored content as the new canonical version. The
+restored version itself becomes a new `after_upload` history entry on that
+upload — there is no "in-place rewind" of history.
+
+---
+
+## Bandwidth window
+
+When `upload_window` is configured for a mount, the upload dispatcher checks
+`UploadWindow::contains_minute(now_local)` before firing each non-immediate
+job. Outside the window the loop sleeps until
+`secs_until_open(now_local)` rather than busy-checking, so a closed window
+costs no CPU.
+
+Important properties:
+
+- **Windows are local-time wall-clock** (via `chrono::Local`). Users
+  express schedules in terms they actually live by.
+- **In-flight uploads are not interrupted** when the window closes —
+  cancelling mid-upload risks corrupted partial state on the remote;
+  letting them finish is safer and the bandwidth difference is small.
+- **`fsync()` always bypasses** (`PendingUpload::immediate = true`).
+- **Polling, hydration, and pinning are not gated** — only uploads are.
+- The degenerate `"HH:MM-HH:MM"` (start == end) is treated as
+  always-open, not always-closed (less surprising for typos).
+
+---
+
 ## Sync on Startup
 
 At daemon start:
 1. Load all `DIRTY` and `UPLOADING` entries from DB → re-queue uploads.
 2. Load all `HYDRATING` entries → delete partial cache files, reset to `REMOTE`.
-3. Run one full remote poll to detect offline changes.
-4. Resume normal operation.
+3. Migrate any pre-existing conflict siblings into the
+   `.stratosync-conflicts/` namespace (one-time tree walk).
+4. Validate `ignore_patterns` and build the per-mount `GlobSet`. Bad
+   patterns abort startup with a clear error.
+5. Run one full remote poll to detect offline changes (delta token is
+   used when present; otherwise a full listing).
+6. Resume normal operation.
 
-This ensures the daemon converges after any crash without requiring user intervention.
+This ensures the daemon converges after any crash without requiring user
+intervention.

@@ -98,9 +98,20 @@ struct OpenFile {
 
 ### `read(fh, offset, size) → Vec<u8>`
 
-`pread(cache_fd, size, offset)`. No daemon logic needed if hydrated.
+For a fully-hydrated file: `pread(cache_fd, size, offset)`. No daemon logic
+needed.
 
-For large files with partial-hydration (future work), check if the byte range is in the range map; if not, trigger a range-hydration request.
+For an inode whose hydration is still in flight (`status=Hydrating`), the
+**range-read fast path** kicks in: if the backend supports
+`download_range()` (RcloneBackend translates to `rclone cat --offset/--count`,
+WebDavSidecarBackend uses an HTTP `Range:` header), the requested byte range
+is fetched immediately and served to the FUSE caller while the full background
+hydration continues. Backends without range support fall back to blocking on
+the oneshot until the full download completes.
+
+This makes media playback usable (`vlc ~/Drive/movie.mkv` doesn't wait for the
+whole file) without losing the simple "the file is in cache" model for
+already-hydrated reads.
 
 ### `write(fh, offset, data) → u32`
 
@@ -123,11 +134,27 @@ This makes `fsync` semantically equivalent to "I want this on the remote right n
 ### `mkdir` / `create` / `unlink` / `rmdir` / `rename`
 
 All mutating operations:
-1. Apply locally (update DB, create/delete cache entries).
-2. Enqueue a remote mutation operation to sync_engine.
-3. Mutations are serialized through a per-directory lock to prevent ordering races.
+1. **Filename validation** — `validate_filename()` rejects `..`, `/`, and null
+   bytes; the conflict-namespace prefix `.stratosync-conflicts` is also
+   reserved (the daemon owns it).
+2. **Selective-sync gate** — for `create` and `mkdir`, the per-mount
+   `Arc<GlobSet>` is matched against the would-be remote path. A match
+   returns `EPERM` so applications see a clear error rather than silently
+   writing into an untracked file.
+3. Apply locally (update DB, create/delete cache entries).
+4. Enqueue a remote mutation operation to sync_engine.
+5. Mutations are serialized through a per-directory lock to prevent
+   ordering races.
 
-`rename` is the most complex — if cross-directory, requires an atomic remote rename. rclone exposes `moveto` for this. If the remote doesn't support server-side move (e.g. some WebDAV implementations), fall back to copy+delete.
+`rename` is the most complex — if cross-directory, requires an atomic remote
+rename. rclone exposes `moveto` for this. If the remote doesn't support
+server-side move (e.g. some WebDAV implementations), fall back to copy+delete.
+
+`unlink` on a file that hasn't yet been uploaded (status `Dirty`, no remote
+copy) skips the remote delete entirely. Otherwise the local DB row is removed
+synchronously, a `delete_tombstone` is inserted to block the poller from
+re-importing it before the async remote delete completes (5-minute TTL safety
+net), and the rclone delete runs on a background tokio task.
 
 ### `getxattr` / `listxattr` (read-only)
 
@@ -153,6 +180,38 @@ getfattr -n user.stratosync.remote_path ~/Cloud/doc.pdf
 static FILE_HANDLES: DashMap<u64, Arc<Mutex<OpenFile>>> = ...;
 static NEXT_FH: AtomicU64 = AtomicU64::new(1);
 ```
+
+---
+
+## Readdir prefetch
+
+When a directory is listed for the first time (`dir_listed` flips from NULL),
+small files in that directory are queued for background hydration so the next
+`open()` is instant. The threshold is configurable:
+
+```toml
+[daemon.sync]
+prefetch_threshold = "1 MB"   # files at or below this size; "0" disables
+```
+
+Prefetch is fire-and-forget at `Background` priority — a foreground `open()`
+on the same inode upgrades the in-flight hydration. The intent is to make
+"open the folder, double-click the document" feel local on a remote that
+otherwise costs a roundtrip per file.
+
+---
+
+## Pinning
+
+`stratosync pin <path>` flips `cache_lru.pinned = 1` for the inode (recursive
+for directories). Pinned files:
+
+1. Are **eagerly hydrated** when first pinned (background, range-read-aware).
+2. Are **excluded from LRU eviction** — `WHERE status = 'cached' AND pinned = 0`.
+3. Survive daemon restarts (state lives in the DB, not in memory).
+
+`unpin` clears the bit but does not delete the cache file; the file becomes
+an ordinary eviction candidate again.
 
 ## Timeout Tuning
 
