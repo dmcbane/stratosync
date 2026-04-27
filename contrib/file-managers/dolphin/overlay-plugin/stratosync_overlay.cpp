@@ -1,17 +1,19 @@
 /*
  * Stratosync KOverlayIconPlugin implementation.
  *
- * Reads the `user.stratosync.status` xattr the FUSE layer exposes on every
- * managed file and maps to the same freedesktop emblem names that the
- * Nautilus/Nemo/Caja Python extensions use. Emblem icon names are kept in
- * sync with stratosync_fm_common.py — see that file's EMBLEM_MAP for the
- * canonical list.
+ * See header for the threading rationale. Emblem icon names mirror
+ * stratosync_fm_common.py's EMBLEM_MAP exactly so a sync-status change
+ * looks identical across desktops.
  */
 #include "stratosync_overlay.h"
 
 #include <QFile>
+#include <QMutexLocker>
 #include <QString>
+#include <QStringList>
+#include <QThreadPool>
 #include <QUrl>
+#include <QtConcurrent/QtConcurrent>
 
 #include <sys/types.h>
 #include <sys/xattr.h>
@@ -34,16 +36,16 @@ QString readStatus(const QString &path) {
     return QString::fromUtf8(buf, static_cast<int>(n));
 }
 
-QString emblemFor(const QString &status) {
+QStringList emblemsFor(const QString &status) {
     // Mirror stratosync_fm_common.EMBLEM_MAP exactly.
-    if (status == QStringLiteral("cached"))    return QStringLiteral("emblem-default");
-    if (status == QStringLiteral("dirty"))     return QStringLiteral("emblem-synchronizing");
-    if (status == QStringLiteral("uploading")) return QStringLiteral("emblem-synchronizing");
-    if (status == QStringLiteral("hydrating")) return QStringLiteral("emblem-downloads");
-    if (status == QStringLiteral("remote"))    return QStringLiteral("emblem-web");
-    if (status == QStringLiteral("conflict"))  return QStringLiteral("emblem-important");
-    if (status == QStringLiteral("stale"))     return QStringLiteral("emblem-generic");
-    return QString();
+    if (status == QStringLiteral("cached"))    return {QStringLiteral("emblem-default")};
+    if (status == QStringLiteral("dirty"))     return {QStringLiteral("emblem-synchronizing")};
+    if (status == QStringLiteral("uploading")) return {QStringLiteral("emblem-synchronizing")};
+    if (status == QStringLiteral("hydrating")) return {QStringLiteral("emblem-downloads")};
+    if (status == QStringLiteral("remote"))    return {QStringLiteral("emblem-web")};
+    if (status == QStringLiteral("conflict"))  return {QStringLiteral("emblem-important")};
+    if (status == QStringLiteral("stale"))     return {QStringLiteral("emblem-generic")};
+    return {};
 }
 
 }  // namespace
@@ -52,19 +54,56 @@ StratosyncOverlayPlugin::StratosyncOverlayPlugin(QObject *parent)
     : KOverlayIconPlugin(parent) {}
 
 QStringList StratosyncOverlayPlugin::getOverlays(const QUrl &item) {
+    // Reject anything we can't getxattr() on. Network URLs, trash:/, etc.
     if (!item.isLocalFile()) {
         return {};
     }
     const QString path = item.toLocalFile();
+    if (path.isEmpty()) {
+        return {};
+    }
+
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_inFlight.contains(path)) {
+            // A worker is already computing the answer for this path; it
+            // will emit overlaysChanged() shortly.
+            return {};
+        }
+        m_inFlight.insert(path);
+    }
+
+    // Run the xattr read off the GUI thread. ENODATA on non-stratosync
+    // paths is a few µs even via FUSE, but a slow or stuck daemon must
+    // never freeze Dolphin — that's the whole point of this dispatch.
+    (void) QtConcurrent::run(QThreadPool::globalInstance(),
+                             [this, item]() { computeAndEmit(item); });
+
+    return {};
+}
+
+void StratosyncOverlayPlugin::computeAndEmit(const QUrl &item) {
+    // Runs on a QThreadPool worker.
+    const QString path = item.toLocalFile();
     const QString status = readStatus(path);
-    if (status.isEmpty()) {
-        return {};
+    const QStringList overlays = emblemsFor(status);
+
+    {
+        QMutexLocker lock(&m_mutex);
+        m_inFlight.remove(path);
     }
-    const QString emblem = emblemFor(status);
-    if (emblem.isEmpty()) {
-        return {};
+
+    if (overlays.isEmpty()) {
+        // Either the path isn't stratosync-managed (no xattr) or its
+        // status isn't one we know. Don't emit — Dolphin's initial
+        // empty response already covers "no overlays".
+        return;
     }
-    return {emblem};
+
+    // Q_EMIT from a worker thread is safe: KIO's KCoreDirLister connects
+    // to overlaysChanged() with Qt::AutoConnection, which becomes a
+    // queued connection across threads.
+    Q_EMIT overlaysChanged(item, overlays);
 }
 
 #include "moc_stratosync_overlay.cpp"

@@ -1,17 +1,24 @@
 /*
  * Stratosync KOverlayIconPlugin — sync-status emblems for Dolphin/Konqueror.
  *
- * This is a Qt6/KF6 plugin loaded by KIO when Dolphin lists files. For each
- * URL it sees, it returns a list of standard freedesktop emblem icon names
- * (matching the Nautilus/Nemo/Caja Python extensions) based on the
- * `user.stratosync.status` xattr the FUSE layer exposes.
+ * KOverlayIconPlugin::getOverlays() is called from Dolphin's GUI thread
+ * once per file when a directory is listed. Doing the xattr read inline
+ * means an unresponsive FUSE daemon (or any backend hiccup) directly
+ * freezes the UI — a directory with 5000 entries × any per-file slowness
+ * is a hung Dolphin.
  *
- * Emblem names mirror the GTK extensions exactly so a status change looks
- * identical across desktops.
+ * Strategy: return empty from getOverlays() immediately, dispatch the
+ * actual read to QThreadPool::globalInstance(), and emit overlaysChanged()
+ * from the worker once the result is in. KIO connects to the signal via
+ * Qt::AutoConnection, so cross-thread emit is handled correctly. Repeated
+ * calls for the same in-flight path are deduped via a small in-memory set.
  */
 #pragma once
 
 #include <KOverlayIconPlugin>
+#include <QMutex>
+#include <QSet>
+#include <QString>
 
 class StratosyncOverlayPlugin : public KOverlayIconPlugin {
     Q_OBJECT
@@ -20,8 +27,13 @@ class StratosyncOverlayPlugin : public KOverlayIconPlugin {
 public:
     explicit StratosyncOverlayPlugin(QObject *parent = nullptr);
 
-    // Called synchronously by Dolphin per file. Must be cheap — we read
-    // a single xattr (handled by the FUSE layer's in-memory state DB) and
-    // map to an emblem name. Non-stratosync paths return empty.
+    // Returns empty immediately. Schedules the xattr read on a worker
+    // thread, then emits overlaysChanged() with the result.
     QStringList getOverlays(const QUrl &item) override;
+
+private:
+    void computeAndEmit(const QUrl &item);
+
+    QMutex        m_mutex;       // guards m_inFlight only
+    QSet<QString> m_inFlight;    // paths currently being computed
 };

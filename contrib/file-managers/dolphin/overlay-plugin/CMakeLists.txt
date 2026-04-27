@@ -32,7 +32,7 @@ include(KDEInstallDirs)
 include(KDECompilerSettings NO_POLICY_SCOPE)
 include(KDECMakeSettings)
 
-find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Gui)
+find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Concurrent Gui)
 find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS KIO)
 
 add_library(stratosyncoverlay MODULE
@@ -47,6 +47,7 @@ target_compile_definitions(stratosyncoverlay PRIVATE
 
 target_link_libraries(stratosyncoverlay PRIVATE
     Qt6::Core
+    Qt6::Concurrent
     Qt6::Gui
     KF6::KIOCore
     KF6::KIOGui
