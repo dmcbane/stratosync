@@ -1,7 +1,7 @@
 /// SQLite state database — the daemon's persistent store.
 ///
 /// See docs/architecture/04-state-db.md for full schema documentation.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -519,6 +519,24 @@ impl StateDb {
             |r| r.get(0),
         )?;
         Ok(total as u64)
+    }
+
+    /// All `cache_path` values currently recorded for this mount. Used by
+    /// the startup orphan reconciler to compare against what's actually
+    /// on disk: anything on disk that isn't in this set has no DB row to
+    /// reach it, can never be evicted, and is leaking disk space.
+    pub async fn all_cache_paths(&self, mount_id: u32) -> Result<HashSet<PathBuf>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT cache_path FROM file_index
+             WHERE mount_id = ?1 AND cache_path IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![mount_id], |r| {
+            r.get::<_, String>(0).map(PathBuf::from)
+        })?;
+        let mut set = HashSet::new();
+        for r in rows { set.insert(r?); }
+        Ok(set)
     }
 
     pub async fn lru_eviction_candidates(

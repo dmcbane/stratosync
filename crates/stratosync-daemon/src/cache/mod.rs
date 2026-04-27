@@ -2,6 +2,8 @@
 /// CacheManager — enforces the per-mount cache quota via LRU eviction.
 ///
 /// See docs/architecture/07-cache.md for design.
+pub mod reconcile;
+
 use std::sync::Arc;
 
 use anyhow::Result;

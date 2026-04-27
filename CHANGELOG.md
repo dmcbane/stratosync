@@ -105,6 +105,23 @@ All notable changes to this project will be documented in this file.
   `list()` calls during traversal.
 
 ### Fixed
+- **Stale partial hydrations leaked disk space indefinitely.** Files
+  under `<cache_dir>/.meta/partial/` are temp blobs that `do_hydrate`
+  creates, fills via `backend.download()`, then renames onto their
+  final `cache_path` on the success path. Any interruption — daemon
+  crash, `kill -9`, rename failure, retry from scratch — left the
+  temp file behind, and there was no startup wipe. One observed mount
+  had **6 partial files totalling ~14 GiB on disk** with no DB row to
+  reach them; eviction couldn't see them at all. New startup
+  reconciler in `cache::reconcile` walks the per-mount cache dir and
+  (a) removes regular files whose path isn't in `file_index.cache_path`,
+  (b) unconditionally wipes everything in `.meta/partial/` (orphan by
+  construction). Skips `.bases/` (BaseStore-managed) and the rest of
+  `.meta/` (daemon scratch). Runs once per mount before the FUSE
+  mount comes up so it can't race with active reads. 4 unit tests
+  cover the orphan-walker, the partial-wipe, the empty-cache no-op,
+  and the missing-dir guard. Live-tested: a daemon at 22 GiB disk /
+  8 GiB DB-tracked dropped to 8 GiB disk after a single restart.
 - **Cache eviction stalled forever on phantom DB rows.** When a `cached`
   row pointed at a `cache_path` that no longer existed on disk (manual
   `rm`, prior crash mid-eviction, any out-of-band cleanup),
