@@ -105,6 +105,21 @@ All notable changes to this project will be documented in this file.
   `list()` calls during traversal.
 
 ### Fixed
+- **OneDrive delta polling halted permanently after one nameless item.**
+  Microsoft Graph occasionally returns `driveItem`s in a delta response
+  without a `name` field — observed live on a real account, where one
+  page contained a stub with `id` + `createdDateTime` +
+  `parentReference` and no name. The receiver had `name: String`
+  (required) on `OneDriveItem`, so serde failed the *entire page*.
+  Every poll then errored, the OneDrive mount eventually halted after
+  consecutive failures, and the user was left without OneDrive sync.
+  Now `name: Option<String>`; nameless items are skipped at the
+  per-item loop (path resolution needs the name anyway). Also improved
+  the parse-error path to capture and log a 512-char body snippet —
+  without that, the upstream `error decoding response body` was opaque
+  and required code patches to diagnose. Live-verified: zero
+  parse-error WARNs over 2+ poll cycles where pre-fix every poll
+  failed.
 - **Stale partial hydrations leaked disk space indefinitely.** Files
   under `<cache_dir>/.meta/partial/` are temp blobs that `do_hydrate`
   creates, fills via `backend.download()`, then renames onto their
