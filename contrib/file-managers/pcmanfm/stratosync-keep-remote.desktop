@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Action
+Name=Resolve conflict — keep remote version
+Tooltip=Download remote version, discard local changes
+Icon=document-revert
+Profiles=stratosync_keep_remote
+
+[X-Action-Profile stratosync_keep_remote]
+Name=Default
+MimeTypes=*;
+SelectionCount=>0
+Exec=stratosync-fm-action keep-remote %F

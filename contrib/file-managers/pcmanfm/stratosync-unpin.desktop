@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Action
+Name=Unpin (allow eviction)
+Tooltip=Allow selected items to be evicted from the local cache
+Icon=emblem-remove
+Profiles=stratosync_unpin
+
+[X-Action-Profile stratosync_unpin]
+Name=Default
+MimeTypes=*;
+SelectionCount=>0
+Exec=stratosync-fm-action unpin %F

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 ## [0.12.0] - unreleased
 
 ### Added
+- **Phase 6 declarative slice**: context-menu actions now ship for
+  Dolphin / Konqueror (KDE), Thunar (XFCE), and PCManFM / PCManFM-Qt
+  (LXDE/LXQt). New shared shell wrapper
+  `contrib/file-managers/bin/stratosync-fm-action` checks
+  `user.stratosync.status` is present, dispatches to the right
+  `stratosync` subcommand, surfaces errors via `notify-send`, and
+  detaches via `setsid` so the FM never blocks. Per-FM glue:
+  - **Dolphin / Konqueror** — KIO ServiceMenu `.desktop` under a
+    *Stratosync* submenu. Goes to `usr/share/kio/servicemenus/`.
+  - **PCManFM / PCManFM-Qt** — FreeDesktop file-manager Actions spec,
+    one `.desktop` per item under `usr/share/file-manager/actions/`.
+  - **Thunar** — UCA (Custom Actions) snippet under
+    `share/doc/stratosync/thunar/` for manual merge into the user's
+    `~/.config/Thunar/uca.xml` (auto-merge would clobber user
+    actions). README documents the merge.
+
+  These ship context-menu items only — Dolphin emblem overlays need a
+  C++ `KOverlayIconPlugin` and Thunar/PCManFM have no emblem API at
+  all (tracked as ROADMAP follow-ups).
+
 - **Phase 6 GTK slice**: file-manager integration extended beyond Nautilus.
   New `contrib/file-managers/common/stratosync_fm_common.py` shared helper
   (xattr reading, status→emblem mapping, CLI shell-out, single

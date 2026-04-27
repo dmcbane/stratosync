@@ -1,0 +1,88 @@
+<!--
+  Stratosync custom-action snippet for Thunar.
+
+  Thunar reads a single XML file, ~/.config/Thunar/uca.xml, where each
+  <action> entry becomes a context-menu item. There's no per-application
+  drop-in directory, so we can't safely *replace* an existing uca.xml —
+  users likely have their own actions in there.
+
+  Merge these <action> blocks into the existing <actions>...</actions>
+  root, OR — if no uca.xml exists yet — copy this file to
+  ~/.config/Thunar/uca.xml after wrapping it in <?xml...?> + <actions>.
+
+  See README.md for the merge instructions.
+-->
+
+<action>
+    <icon>emblem-favorite</icon>
+    <name>Stratosync: Pin for offline use</name>
+    <unique-id>stratosync-pin</unique-id>
+    <command>stratosync-fm-action pin %F</command>
+    <description>Pin selected items so they survive cache eviction.</description>
+    <patterns>*</patterns>
+    <startup-notify/>
+    <directories/>
+    <audio-files/>
+    <image-files/>
+    <other-files/>
+    <text-files/>
+    <video-files/>
+</action>
+
+<action>
+    <icon>emblem-remove</icon>
+    <name>Stratosync: Unpin</name>
+    <unique-id>stratosync-unpin</unique-id>
+    <command>stratosync-fm-action unpin %F</command>
+    <description>Allow selected items to be evicted from the local cache.</description>
+    <patterns>*</patterns>
+    <startup-notify/>
+    <directories/>
+    <audio-files/>
+    <image-files/>
+    <other-files/>
+    <text-files/>
+    <video-files/>
+</action>
+
+<action>
+    <icon>document-edit-sign</icon>
+    <name>Stratosync: Resolve conflict — keep my version</name>
+    <unique-id>stratosync-keep-local</unique-id>
+    <command>stratosync-fm-action keep-local %F</command>
+    <description>Upload local version, drop the remote conflict file.</description>
+    <patterns>*</patterns>
+    <startup-notify/>
+    <audio-files/>
+    <image-files/>
+    <other-files/>
+    <text-files/>
+    <video-files/>
+</action>
+
+<action>
+    <icon>document-revert</icon>
+    <name>Stratosync: Resolve conflict — keep remote version</name>
+    <unique-id>stratosync-keep-remote</unique-id>
+    <command>stratosync-fm-action keep-remote %F</command>
+    <description>Download remote version, discard local changes.</description>
+    <patterns>*</patterns>
+    <startup-notify/>
+    <audio-files/>
+    <image-files/>
+    <other-files/>
+    <text-files/>
+    <video-files/>
+</action>
+
+<action>
+    <icon>merge</icon>
+    <name>Stratosync: Resolve conflict — 3-way merge</name>
+    <unique-id>stratosync-merge</unique-id>
+    <command>stratosync-fm-action merge %F</command>
+    <description>Attempt automatic 3-way merge via git merge-file (text only).</description>
+    <patterns>*</patterns>
+    <startup-notify/>
+    <text-files/>
+    <other-files/>
+</action>

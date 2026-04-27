@@ -84,8 +84,13 @@ echo "Build complete."
 mkdir -p "${BIN_DIR}"
 install -m 755 "${REPO_DIR}/${TARGET_DIR}/stratosyncd"  "${BIN_DIR}/stratosyncd"
 install -m 755 "${REPO_DIR}/${TARGET_DIR}/stratosync"   "${BIN_DIR}/stratosync"
-echo "✓ Installed stratosyncd → ${BIN_DIR}/stratosyncd"
-echo "✓ Installed stratosync  → ${BIN_DIR}/stratosync"
+# Shared file-manager action wrapper used by Dolphin / Thunar / PCManFM.
+# Goes to BIN_DIR so it's always on the same PATH as the `stratosync` CLI.
+install -m 755 "${REPO_DIR}/contrib/file-managers/bin/stratosync-fm-action" \
+    "${BIN_DIR}/stratosync-fm-action"
+echo "✓ Installed stratosyncd        → ${BIN_DIR}/stratosyncd"
+echo "✓ Installed stratosync         → ${BIN_DIR}/stratosync"
+echo "✓ Installed stratosync-fm-action → ${BIN_DIR}/stratosync-fm-action"
 
 # ── Shell PATH hint ───────────────────────────────────────────────────────────
 if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
@@ -185,6 +190,40 @@ install_fm_extension() {
 install_fm_extension nautilus Nautilus "4.0 3.0" stratosync_nautilus.py
 install_fm_extension nemo     Nemo     "3.0"     stratosync_nemo.py
 install_fm_extension caja     Caja     "2.0"     stratosync_caja.py
+
+# ── Declarative-action file managers (Dolphin / Thunar / PCManFM) ─────────────
+#
+# These don't load Python plugins — they read .desktop / uca.xml files and
+# call `Exec=` directly. We always copy the files into their XDG paths;
+# they're harmless when the file manager isn't installed.
+
+# Dolphin (KDE) — KIO ServiceMenu
+KDE_SERVICEMENU_DIR="${HOME}/.local/share/kio/servicemenus"
+DOLPHIN_SRC="${REPO_DIR}/contrib/file-managers/dolphin/stratosync.desktop"
+if [[ -f "$DOLPHIN_SRC" ]]; then
+    mkdir -p "${KDE_SERVICEMENU_DIR}"
+    install -m 755 "$DOLPHIN_SRC" "${KDE_SERVICEMENU_DIR}/stratosync.desktop"
+    echo "✓ Dolphin/Konqueror service menu installed (restart Dolphin)"
+fi
+
+# PCManFM / PCManFM-Qt — FreeDesktop file-manager Actions spec
+PCMANFM_ACTIONS_DIR="${HOME}/.local/share/file-manager/actions"
+PCMANFM_SRC_DIR="${REPO_DIR}/contrib/file-managers/pcmanfm"
+if compgen -G "${PCMANFM_SRC_DIR}/stratosync-*.desktop" > /dev/null; then
+    mkdir -p "${PCMANFM_ACTIONS_DIR}"
+    for f in "${PCMANFM_SRC_DIR}"/stratosync-*.desktop; do
+        install -m 644 "$f" "${PCMANFM_ACTIONS_DIR}/$(basename "$f")"
+    done
+    echo "✓ PCManFM/PCManFM-Qt actions installed (restart PCManFM)"
+fi
+
+# Thunar (XFCE) — UCA snippet. We do NOT auto-merge into the user's
+# uca.xml; that file may already contain custom actions and clobbering
+# them would be hostile. Just print a hint.
+if command -v thunar &>/dev/null; then
+    echo "  Thunar detected — see ${REPO_DIR}/contrib/file-managers/thunar/README.md"
+    echo "    for instructions on merging stratosync-uca.xml into ~/.config/Thunar/uca.xml"
+fi
 
 # ── Fuse configuration ────────────────────────────────────────────────────────
 FUSE_CONF="/etc/fuse.conf"

@@ -38,6 +38,7 @@ package() {
     cd stratosync
     install -Dm755 target/release/stratosyncd "$pkgdir/usr/bin/stratosyncd"
     install -Dm755 target/release/stratosync "$pkgdir/usr/bin/stratosync"
+    install -Dm755 contrib/file-managers/bin/stratosync-fm-action "$pkgdir/usr/bin/stratosync-fm-action"
     install -Dm644 contrib/systemd/stratosyncd.service "$pkgdir/usr/lib/systemd/user/stratosyncd.service"
     # File manager extensions (Nautilus / Nemo / Caja). The shared helper
     # is duplicated into each FM's extension directory because each
@@ -49,6 +50,14 @@ package() {
     install -Dm644 contrib/file-managers/nautilus/stratosync_nautilus.py "$pkgdir/usr/share/nautilus-python/extensions/stratosync_nautilus.py"
     install -Dm644 contrib/file-managers/nemo/stratosync_nemo.py         "$pkgdir/usr/share/nemo-python/extensions/stratosync_nemo.py"
     install -Dm644 contrib/file-managers/caja/stratosync_caja.py         "$pkgdir/usr/share/caja-python/extensions/stratosync_caja.py"
+    # Declarative-action file managers (Dolphin / PCManFM). Thunar is
+    # manual-merge — uca.xml shipped under share/doc.
+    install -Dm644 contrib/file-managers/dolphin/stratosync.desktop      "$pkgdir/usr/share/kio/servicemenus/stratosync.desktop"
+    for f in contrib/file-managers/pcmanfm/stratosync-*.desktop; do
+        install -Dm644 "$f" "$pkgdir/usr/share/file-manager/actions/$(basename "$f")"
+    done
+    install -Dm644 contrib/file-managers/thunar/stratosync-uca.xml       "$pkgdir/usr/share/doc/$pkgname/thunar/stratosync-uca.xml"
+    install -Dm644 contrib/file-managers/thunar/README.md                "$pkgdir/usr/share/doc/$pkgname/thunar/README.md"
     install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
     install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
 }

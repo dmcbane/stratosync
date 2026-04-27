@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# stratosync-fm-action — file-manager action dispatcher.
+#
+# This wrapper is what Dolphin (KDE), Thunar (XFCE), and PCManFM (LXDE/LXQt)
+# call from their declarative action files (.desktop / uca.xml). They have
+# no Python extension API — they only know how to run a shell command — so
+# we centralise the "is this path under a stratosync mount? → run the
+# appropriate `stratosync` subcommand" logic here.
+#
+# The GTK extensions (Nautilus / Nemo / Caja) don't use this script; they
+# call the `stratosync` binary directly via stratosync_fm_common.py.
+#
+# Usage:
+#   stratosync-fm-action <action> <path> [<path>…]
+#
+# Actions:
+#   pin           → stratosync pin
+#   unpin         → stratosync unpin
+#   keep-local    → stratosync conflicts keep-local
+#   keep-remote   → stratosync conflicts keep-remote
+#   merge         → stratosync conflicts merge
+#
+# Exit codes:
+#   0  command launched (success or graceful skip on non-stratosync path)
+#   2  unknown action name
+#   3  stratosync CLI not on PATH
+#
+# stderr is also surfaced via notify-send when DISPLAY/WAYLAND_DISPLAY is
+# present, so users get a visible message even when the command was launched
+# from a file manager that hides terminal output.
+
+set -uo pipefail
+
+action="${1-}"
+shift || true
+
+if [[ -z "$action" || $# -eq 0 ]]; then
+    echo "usage: stratosync-fm-action <action> <path> [<path>…]" >&2
+    exit 64
+fi
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+notify() {
+    local urgency="$1"; shift
+    local summary="$1"; shift
+    local body="$*"
+    if [[ -n "${DISPLAY-}${WAYLAND_DISPLAY-}" ]] && command -v notify-send &>/dev/null; then
+        notify-send -u "$urgency" -a "stratosync" "$summary" "$body" &>/dev/null || true
+    fi
+    # Always echo to stderr so users running the FM from a terminal see it.
+    echo "stratosync: $summary — $body" >&2
+}
+
+is_stratosync_path() {
+    # Truthy iff the path carries the user.stratosync.status xattr that the
+    # FUSE layer writes for every managed file.
+    if command -v getfattr &>/dev/null; then
+        getfattr --absolute-names -n user.stratosync.status -- "$1" \
+            >/dev/null 2>&1
+    else
+        # Fall back to attr(1) — older systems / some distros.
+        command -v attr &>/dev/null && \
+            attr -q -g "stratosync.status" "$1" >/dev/null 2>&1
+    fi
+}
+
+if ! command -v stratosync &>/dev/null; then
+    notify critical "stratosync not found" \
+        "The stratosync CLI is not on PATH for this desktop session."
+    exit 3
+fi
+
+# ── Map action → CLI subcommand ───────────────────────────────────────────────
+
+case "$action" in
+    pin|unpin)
+        cli_args=("$action")
+        ;;
+    keep-local|keep-remote|merge)
+        cli_args=("conflicts" "$action")
+        ;;
+    *)
+        notify critical "unknown action" "Action '$action' is not recognised."
+        exit 2
+        ;;
+esac
+
+# ── Filter to stratosync-managed paths, run per-file ──────────────────────────
+
+skipped=()
+launched=0
+for path in "$@"; do
+    if [[ ! -e "$path" ]]; then
+        skipped+=("$path (does not exist)")
+        continue
+    fi
+    if ! is_stratosync_path "$path"; then
+        skipped+=("$path (not under a stratosync mount)")
+        continue
+    fi
+    # Detach: don't make the file manager wait, don't leak stdio.
+    setsid stratosync "${cli_args[@]}" "$path" \
+        </dev/null >/dev/null 2>&1 &
+    launched=$((launched + 1))
+done
+
+if (( launched == 0 )); then
+    notify normal "no eligible items" \
+        "Selected items are not under any stratosync mount."
+elif (( ${#skipped[@]} > 0 )); then
+    # Some skipped, some launched — let the user see why.
+    notify normal "stratosync $action" \
+        "Started on $launched item(s); skipped ${#skipped[@]}."
+fi
+
+exit 0

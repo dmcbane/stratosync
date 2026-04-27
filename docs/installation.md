@@ -92,33 +92,67 @@ install -m 755 target/release/stratosync-tray  ~/.local/bin/    # optional: syst
 
 ### Optional: file-manager integrations
 
-`install.sh` and the prebuilt packages auto-detect which of these have
-their Python bindings installed and ship the matching extension; nothing
-to do beyond installing the binding for your desktop.
+`install.sh` and the prebuilt packages drop the right files for each
+desktop's file manager. **Emblem support** is GTK-only today; **context-
+menu actions** (Pin, Unpin, Resolve conflict) are available everywhere.
 
-- **Nautilus** (GNOME) — `python3-nautilus` / `nautilus-python` /
-  `python-nautilus`. Sync-status emblems and context-menu actions
-  (Pin / Unpin / Resolve conflict).
-- **Nemo** (Cinnamon) — `python3-nemo` / `nemo-python`. Same emblems
-  and context-menu actions as Nautilus.
-- **Caja** (MATE) — `python3-caja` / `python-caja`. Same emblems and
-  context-menu actions.
-- **System tray** — run `stratosync-tray` (built alongside the CLI;
-  autostart `.desktop` shipped in packages).
-- **Dolphin (KDE), Thunar (XFCE), PCManFM** — pending Phase 6 follow-ups
-  in [ROADMAP.md](ROADMAP.md).
+| File manager | Desktop | Emblems | Actions | Loader needed |
+|--------------|---------|:-------:|:-------:|---------------|
+| Nautilus | GNOME | yes | yes | `python3-nautilus` |
+| Nemo | Cinnamon | yes | yes | `python3-nemo` |
+| Caja | MATE | yes | yes | `python3-caja` |
+| Dolphin / Konqueror | KDE | — | yes | none |
+| PCManFM / PCManFM-Qt | LXDE / LXQt | — | yes | none |
+| Thunar | XFCE | — | yes | none (manual UCA merge) |
 
-For manual install (without the installer or a package), copy the helper
-plus the per-FM file into the extensions directory for each desktop:
+The GTK trio's emblems read directly from the `user.stratosync.status`
+xattr the FUSE layer exposes, so there is no daemon round-trip — they
+update within one poll cycle of any status change. Actions everywhere
+shell out to the `stratosync` CLI through the shared
+`stratosync-fm-action` wrapper, which detaches via `setsid` so your
+file manager never blocks.
+
+System tray indicator: run `stratosync-tray` (built alongside the CLI;
+autostart `.desktop` shipped in packages).
+
+#### Manual installation (without the installer)
+
+GTK-family — copy the helper and the per-FM file:
 
 ```bash
+# Nautilus (Nemo and Caja paths analogous)
 mkdir -p ~/.local/share/nautilus-python/extensions
 cp contrib/file-managers/common/stratosync_fm_common.py    ~/.local/share/nautilus-python/extensions/
 cp contrib/file-managers/nautilus/stratosync_nautilus.py   ~/.local/share/nautilus-python/extensions/
 nautilus -q
 ```
 
-Repeat with `nemo-python` / `caja-python` paths for the other two.
+Dolphin / Konqueror — single ServiceMenu file:
+
+```bash
+mkdir -p ~/.local/share/kio/servicemenus
+install -m 755 contrib/file-managers/dolphin/stratosync.desktop \
+    ~/.local/share/kio/servicemenus/
+# Restart Dolphin
+```
+
+PCManFM / PCManFM-Qt — five action files:
+
+```bash
+mkdir -p ~/.local/share/file-manager/actions
+cp contrib/file-managers/pcmanfm/stratosync-*.desktop \
+    ~/.local/share/file-manager/actions/
+# Restart PCManFM
+```
+
+Thunar — manual merge required. See
+[`contrib/file-managers/thunar/README.md`](../contrib/file-managers/thunar/README.md)
+for the snippet and merge instructions; do not just overwrite an
+existing `~/.config/Thunar/uca.xml`.
+
+The action wrapper `stratosync-fm-action` is what every declarative
+menu calls; the project installer puts it in `~/.local/bin/` alongside
+`stratosync` and `stratosyncd`.
 
 ---
 

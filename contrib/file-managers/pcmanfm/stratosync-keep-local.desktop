@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Action
+Name=Resolve conflict — keep my version
+Tooltip=Upload local version, drop the remote conflict file
+Icon=document-edit-sign
+Profiles=stratosync_keep_local
+
+[X-Action-Profile stratosync_keep_local]
+Name=Default
+MimeTypes=*;
+SelectionCount=>0
+Exec=stratosync-fm-action keep-local %F

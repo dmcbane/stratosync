@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Action
+Name=Resolve conflict — 3-way merge (text)
+Tooltip=Attempt automatic merge via git merge-file
+Icon=merge
+Profiles=stratosync_merge
+
+[X-Action-Profile stratosync_merge]
+Name=Default
+MimeTypes=text/*;application/json;application/xml;application/x-yaml;
+SelectionCount=>0
+Exec=stratosync-fm-action merge %F

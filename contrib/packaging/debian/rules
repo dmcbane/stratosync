@@ -9,6 +9,7 @@ override_dh_auto_build:
 override_dh_auto_install:
 	install -Dm755 target/release/stratosyncd $(CURDIR)/debian/stratosync/usr/bin/stratosyncd
 	install -Dm755 target/release/stratosync $(CURDIR)/debian/stratosync/usr/bin/stratosync
+	install -Dm755 contrib/file-managers/bin/stratosync-fm-action $(CURDIR)/debian/stratosync/usr/bin/stratosync-fm-action
 	install -Dm644 contrib/systemd/stratosyncd.service $(CURDIR)/debian/stratosync/usr/lib/systemd/user/stratosyncd.service
 	# File manager extensions (Nautilus / Nemo / Caja). The shared helper
 	# is duplicated into each FM's extension directory because each
@@ -19,6 +20,21 @@ override_dh_auto_install:
 	install -Dm644 contrib/file-managers/nemo/stratosync_nemo.py            $(CURDIR)/debian/stratosync/usr/share/nemo-python/extensions/stratosync_nemo.py
 	install -Dm644 contrib/file-managers/common/stratosync_fm_common.py     $(CURDIR)/debian/stratosync/usr/share/caja-python/extensions/stratosync_fm_common.py
 	install -Dm644 contrib/file-managers/caja/stratosync_caja.py            $(CURDIR)/debian/stratosync/usr/share/caja-python/extensions/stratosync_caja.py
+	# Declarative-action file managers (Dolphin / PCManFM). Thunar is
+	# manual-merge only — the user's uca.xml may already contain custom
+	# actions, so we do not ship one here.
+	install -Dm644 contrib/file-managers/dolphin/stratosync.desktop         $(CURDIR)/debian/stratosync/usr/share/kio/servicemenus/stratosync.desktop
+	install -d $(CURDIR)/debian/stratosync/usr/share/file-manager/actions
+	install -Dm644 -t $(CURDIR)/debian/stratosync/usr/share/file-manager/actions/ \
+		contrib/file-managers/pcmanfm/stratosync-pin.desktop \
+		contrib/file-managers/pcmanfm/stratosync-unpin.desktop \
+		contrib/file-managers/pcmanfm/stratosync-keep-local.desktop \
+		contrib/file-managers/pcmanfm/stratosync-keep-remote.desktop \
+		contrib/file-managers/pcmanfm/stratosync-merge.desktop
+	# Thunar UCA snippet — shipped under share/doc so users can find and
+	# merge it into their ~/.config/Thunar/uca.xml.
+	install -Dm644 contrib/file-managers/thunar/stratosync-uca.xml          $(CURDIR)/debian/stratosync/usr/share/doc/stratosync/thunar/stratosync-uca.xml
+	install -Dm644 contrib/file-managers/thunar/README.md                   $(CURDIR)/debian/stratosync/usr/share/doc/stratosync/thunar/README.md
 
 override_dh_auto_test:
 	cargo test --workspace

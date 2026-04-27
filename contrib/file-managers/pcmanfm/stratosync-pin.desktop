@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Action
+Name=Pin for offline use
+Tooltip=Pin selected items so they survive cache eviction
+Icon=emblem-favorite
+Profiles=stratosync_pin
+
+[X-Action-Profile stratosync_pin]
+Name=Default
+MimeTypes=*;
+SelectionCount=>0
+Exec=stratosync-fm-action pin %F

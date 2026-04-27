@@ -1,0 +1,35 @@
+[Desktop Entry]
+Name=Stratosync
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/all;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Priority=TopLevel
+Actions=stratosyncPin;stratosyncUnpin;stratosyncResolveLocal;stratosyncResolveRemote;stratosyncResolveMerge;
+X-KDE-Submenu=Stratosync
+Icon=cloud
+
+[Desktop Action stratosyncPin]
+Name=Pin for offline use
+Icon=emblem-favorite
+Exec=stratosync-fm-action pin %F
+
+[Desktop Action stratosyncUnpin]
+Name=Unpin (allow eviction)
+Icon=emblem-remove
+Exec=stratosync-fm-action unpin %F
+
+[Desktop Action stratosyncResolveLocal]
+Name=Resolve conflict — keep my version
+Icon=document-edit-sign
+Exec=stratosync-fm-action keep-local %F
+
+[Desktop Action stratosyncResolveRemote]
+Name=Resolve conflict — keep remote version
+Icon=document-revert
+Exec=stratosync-fm-action keep-remote %F
+
+[Desktop Action stratosyncResolveMerge]
+Name=Resolve conflict — 3-way merge (text)
+Icon=merge
+Exec=stratosync-fm-action merge %F

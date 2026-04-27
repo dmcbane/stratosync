@@ -477,7 +477,7 @@
     <div class="phase">
       <span class="phase-badge current">In&nbsp;progress</span>
       <h3>Phase 6: File Manager Integration</h3>
-      <p>GTK slice <strong>shipped</strong>: Nemo (Cinnamon) and Caja (MATE) extensions; Nautilus extension upgraded with Pin / Unpin / Resolve-conflict context-menu actions; shared Python helper backs all three. Dolphin (KDE / Qt / C++) and Thunar (XFCE — no native emblem API) still ahead.</p>
+      <p>Context-menu actions <strong>shipped on every targeted file manager</strong> — Nautilus / Nemo / Caja (Python plugins, with emblems) plus Dolphin / Konqueror (KIO ServiceMenu), PCManFM / PCManFM-Qt (FreeDesktop Actions), and Thunar (UCA snippet, manual merge). All declarative menus dispatch through one shared <code>stratosync-fm-action</code> shell wrapper. Still ahead: Dolphin emblem overlays (needs a C++ <code>KOverlayIconPlugin</code>) and an emblem alternative for Thunar / PCManFM (no native emblem API).</p>
     </div>
   </div>
 </section>
