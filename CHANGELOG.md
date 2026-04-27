@@ -105,6 +105,20 @@ All notable changes to this project will be documented in this file.
   `list()` calls during traversal.
 
 ### Fixed
+- **Cache eviction stalled forever on phantom DB rows.** When a `cached`
+  row pointed at a `cache_path` that no longer existed on disk (manual
+  `rm`, prior crash mid-eviction, any out-of-band cleanup),
+  `tokio::fs::remove_file` returned `ENOENT` and the eviction loop logged
+  a WARN, skipped the row, and never reconciled the DB. The phantom row
+  stayed counted in `total_cache_bytes`, was returned again on the next
+  pass, ENOENT'd again. With many phantoms in the candidate set,
+  `pass_freed == 0` and the loop bailed — eviction did nothing for the
+  rest of the daemon's life. One observed daemon had 1000 phantom rows
+  hit the bail-out on the first pass after restart. Now ENOENT is treated
+  as success: the disk space is already freed, so we call `set_evicted`
+  to clear the DB row and add `cache_size` to the pass's progress.
+  Includes a regression test (`maybe_evict_reconciles_phantom_rows`)
+  that seeds 100 phantom rows and confirms eviction converges.
 - **Cache eviction never converged when far over quota.** `maybe_evict()`
   queried `lru_eviction_candidates(mount_id, 200)` once per pass and stopped
   after walking those 200 rows. With many small files (typical screenshots,

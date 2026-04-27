@@ -129,6 +129,23 @@ impl CacheManager {
                                 pass_freed += c.cache_size;
                                 debug!(inode = c.inode, bytes = c.cache_size, "evicted");
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                // The cache file is already gone — manual `rm`,
+                                // a previous crash mid-eviction, or some other
+                                // out-of-band cleanup. The DB row is stale; treat
+                                // this as a successful eviction (the disk space is
+                                // already freed) and reconcile the DB so this row
+                                // stops counting toward total_cache_bytes. Without
+                                // this branch, eviction enters an infinite skip
+                                // loop on phantom rows: every pass returns the
+                                // same candidates, every candidate ENOENTs,
+                                // pass_freed stays zero, the loop bails out and
+                                // the cache never converges.
+                                self.db.set_evicted(c.inode).await?;
+                                pass_freed += c.cache_size;
+                                debug!(inode = c.inode, bytes = c.cache_size,
+                                       "evicted (cache file already missing on disk)");
+                            }
                             Err(e) => {
                                 warn!(inode = c.inode, path = ?c.cache_path,
                                       "evict remove error: {e}");
@@ -352,6 +369,68 @@ mod tests {
         // Must not have over-freed: we only need to hit low_mark, not 0.
         // Allow a one-batch overshoot (1000 × 10 KB = 10 MB worst case).
         assert!(after > 0, "evicted everything; expected partial eviction");
+    }
+
+    /// Regression test for the phantom-row infinite-skip loop.
+    ///
+    /// If the on-disk cache file is missing while the DB still has a
+    /// `status='cached'` row pointing at it (manual `rm`, prior crash
+    /// mid-eviction, etc.), the old code WARNed and skipped, leaving the
+    /// row counted in `total_cache_bytes`. Eviction's `pass_freed == 0`
+    /// guard then bailed out and the cache never converged.
+    ///
+    /// The fix treats ENOENT as success — the disk space is already freed,
+    /// we just need to reconcile the DB. This test seeds 100 phantom rows
+    /// (rows in the DB pointing to files that don't exist) plus 50 real
+    /// rows, runs `maybe_evict`, and asserts both that the DB total drops
+    /// to 0 and that the real files survive (we only need to free phantoms
+    /// to converge — the real files are still under low-mark).
+    #[tokio::test]
+    async fn maybe_evict_reconciles_phantom_rows() {
+        let quota: u64 = 1024 * 1024;     // 1 MiB
+        let (db, mount_id, root, _cache_dir_guard) = make_mount(quota).await;
+        let cache_dir = _cache_dir_guard.path().to_path_buf();
+        let phantom_dir = cache_dir.join("phantoms");
+        std::fs::create_dir_all(&phantom_dir).unwrap();
+
+        // 100 phantom rows: cache_path set, but nothing on disk for them.
+        // Each "cache_size" 100 KiB; collectively 10 MiB == 10× quota.
+        for i in 0..100 {
+            let phantom_path = phantom_dir.join(format!("ghost-{i}.bin"));
+            db.insert_file(&NewFileEntry {
+                mount_id,
+                parent: root,
+                name: format!("ghost-{i}.bin"),
+                remote_path: format!("/ghost-{i}.bin"),
+                kind: FileKind::File,
+                size: 100 * 1024,
+                mtime: SystemTime::UNIX_EPOCH,
+                etag: Some("e".into()),
+                status: SyncStatus::Cached,
+                cache_path: Some(phantom_path),    // path doesn't exist
+                cache_size: Some(100 * 1024),
+            }).await.unwrap();
+            db.touch_lru(*db.list_children(mount_id, root).await.unwrap()
+                          .last().map(|e| &e.inode).unwrap()).await.unwrap();
+        }
+
+        // Sanity: DB-tracked total is far above quota even though disk is
+        // mostly empty.
+        let before = db.total_cache_bytes(mount_id).await.unwrap();
+        assert!(before > quota * 2);
+
+        let cm = CacheManager::new(mount_id, Arc::clone(&db), quota);
+        cm.maybe_evict().await.unwrap();
+
+        // The DB total should drop dramatically — most/all phantoms get
+        // reconciled to status='remote', removing their cache_size from
+        // the SUM.
+        let after = db.total_cache_bytes(mount_id).await.unwrap();
+        assert!(
+            after <= (quota as f64 * 0.80) as u64,
+            "expected total <= 80% of quota after phantom reconciliation, \
+             got before={before} after={after}",
+        );
     }
 
     /// Eviction is a no-op when usage is below the high-water mark.
