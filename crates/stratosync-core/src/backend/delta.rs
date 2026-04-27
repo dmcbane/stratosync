@@ -564,7 +564,9 @@ impl OneDriveDelta {
     /// We strip the `/drive/root:` prefix, then check if the result is
     /// under our `root_path`. Returns `None` if outside our root.
     fn resolve_item_path(&self, item: &OneDriveItem) -> Option<String> {
-        let name = &item.name;
+        // Items without a name (rare, but they exist on the delta channel)
+        // can't be turned into a path; skip them upstream.
+        let name = item.name.as_ref()?;
 
         // Build the full path from parentReference.path + name
         let parent_path = match item.parent_reference.as_ref() {
@@ -642,8 +644,15 @@ impl DeltaProvider for OneDriveDelta {
                 return Err(Self::map_http_error(status, &body));
             }
 
-            let page: OneDriveDeltaResponse = resp.json().await
-                .map_err(|e| SyncError::Fatal(format!("parse OneDrive delta response: {e}")))?;
+            let body = resp.text().await
+                .map_err(|e| SyncError::Network(format!("OneDrive delta read body: {e}")))?;
+            let page: OneDriveDeltaResponse = serde_json::from_str(&body)
+                .map_err(|e| {
+                    SyncError::Fatal(format!(
+                        "parse OneDrive delta response: {e}; body[..512]={:?}",
+                        body.chars().take(512).collect::<String>(),
+                    ))
+                })?;
 
             return page.delta_link.ok_or_else(|| {
                 SyncError::Fatal("OneDrive delta response missing @odata.deltaLink".into())
@@ -685,8 +694,15 @@ impl DeltaProvider for OneDriveDelta {
                 return Err(Self::map_http_error(status, &body));
             }
 
-            let page: OneDriveDeltaResponse = resp.json().await
-                .map_err(|e| SyncError::Fatal(format!("parse OneDrive delta: {e}")))?;
+            let body = resp.text().await
+                .map_err(|e| SyncError::Network(format!("OneDrive delta read body: {e}")))?;
+            let page: OneDriveDeltaResponse = serde_json::from_str(&body)
+                .map_err(|e| {
+                    SyncError::Fatal(format!(
+                        "parse OneDrive delta: {e}; body[..512]={:?}",
+                        body.chars().take(512).collect::<String>(),
+                    ))
+                })?;
 
             // Process items in this page
             for item in page.value {
@@ -708,6 +724,14 @@ impl DeltaProvider for OneDriveDelta {
                     None => continue,
                 };
 
+                // resolve_item_path already returned None for nameless
+                // items, but the type system doesn't know that. Pull the
+                // name eagerly here so the unwrap is local and obvious.
+                let name = match item.name.as_deref() {
+                    Some(n) => n.to_string(),
+                    None    => continue,
+                };
+
                 let is_dir = item.folder.is_some();
 
                 let mtime = item.last_modified_date_time.as_deref()
@@ -722,7 +746,7 @@ impl DeltaProvider for OneDriveDelta {
 
                 let meta = RemoteMetadata {
                     path,
-                    name: item.name.clone(),
+                    name,
                     size: item.size.unwrap_or(0) as u64,
                     mtime,
                     is_dir,
@@ -770,7 +794,15 @@ struct OneDriveDeltaResponse {
 
 #[derive(Deserialize)]
 struct OneDriveItem {
-    name: String,
+    /// Optional because Microsoft Graph occasionally omits this field on
+    /// delta-channel items — observed live on a real account, where a
+    /// page of ~25 items contained one stub with `id` + `createdDateTime`
+    /// + `parentReference` and no `name`. Treating it as required failed
+    /// the *entire* page (one nameless item kills 1000 good ones), so the
+    /// whole sync stalled. We now skip nameless items in the per-item
+    /// loop instead — they couldn't be meaningfully processed anyway,
+    /// since path resolution needs the name.
+    name: Option<String>,
     #[serde(default)]
     size: Option<i64>,
     #[serde(rename = "lastModifiedDateTime")]
@@ -1114,7 +1146,7 @@ mod tests {
         assert!(resp.next_link.is_none());
 
         let item = &resp.value[0];
-        assert_eq!(item.name, "report.docx");
+        assert_eq!(item.name.as_deref(), Some("report.docx"));
         assert_eq!(item.size.unwrap(), 51200);
         assert!(item.folder.is_none());
         assert!(item.deleted.is_none());
@@ -1181,7 +1213,7 @@ mod tests {
 
     fn make_onedrive_item(name: &str, parent_path: &str) -> OneDriveItem {
         OneDriveItem {
-            name: name.into(),
+            name: Some(name.into()),
             size: Some(100),
             last_modified_date_time: Some("2026-04-10T12:00:00Z".into()),
             parent_reference: Some(OneDriveParentRef {
@@ -1191,6 +1223,40 @@ mod tests {
             file: None,
             deleted: None,
         }
+    }
+
+    /// Microsoft Graph occasionally returns a `driveItem` with no `name`
+    /// field. Pre-fix this killed the entire delta page (and stalled every
+    /// subsequent poll). Post-fix, `name` is `Option<String>` and the
+    /// item is skipped on the per-item path. Verify both that the page
+    /// still parses and that `resolve_item_path` returns `None`.
+    #[test]
+    fn test_onedrive_nameless_item_does_not_break_parse() {
+        let json = r#"{
+            "value": [
+                {
+                    "id":"abc",
+                    "createdDateTime":"2024-11-29T12:01:52Z",
+                    "parentReference":{"path":"/drive/root:/Documents"}
+                },
+                {
+                    "id":"xyz",
+                    "name":"keeper.txt",
+                    "createdDateTime":"2024-11-29T12:01:52Z",
+                    "parentReference":{"path":"/drive/root:"}
+                }
+            ],
+            "@odata.deltaLink":"https://graph.microsoft.com/v1.0/me/drive/root/delta?token=fresh"
+        }"#;
+        let resp: OneDriveDeltaResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.value.len(), 2, "both items present in parsed value");
+        assert!(resp.value[0].name.is_none(), "first item is nameless");
+        assert!(resp.value[1].name.as_deref() == Some("keeper.txt"));
+
+        // resolve_item_path: nameless → None, named → Some(...)
+        let delta = make_onedrive_delta("");
+        assert_eq!(delta.resolve_item_path(&resp.value[0]), None);
+        assert_eq!(delta.resolve_item_path(&resp.value[1]).unwrap(), "keeper.txt");
     }
 
     #[test]
@@ -1237,7 +1303,7 @@ mod tests {
     fn test_onedrive_resolve_no_parent() {
         let delta = make_onedrive_delta("");
         let item = OneDriveItem {
-            name: "root".into(),
+            name: Some("root".into()),
             size: None,
             last_modified_date_time: None,
             parent_reference: None,
