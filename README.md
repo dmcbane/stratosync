@@ -31,227 +31,54 @@ Linux has excellent cloud sync tools, but none that provide all three: **on-dema
 - Avoid downloading your entire cloud storage locally
 - Edit files and have changes sync automatically
 - Keep working if two machines edit the same file (conflicts create `.conflict` siblings instead of overwriting)
-- Use any of rclone's 70+ backends (Google Drive, OneDrive, Dropbox, S3, Nextcloud, SFTP, ...)
+- Use any of rclone's 70+ backends (Google Drive, OneDrive, Dropbox, S3, Nextcloud, SFTP, …)
 
 ## Status
 
-🚧 **Pre-alpha (v0.12.0)** — Phases 1-4 complete; Phase 5 in progress. On-demand FUSE3 filesystem with bidirectional sync, 3-way merge conflict resolution, delta polling (Google Drive, OneDrive), pin/unpin for offline, range-read fast path, readdir prefetch, Nautilus emblem extension, system tray indicator, WebDAV sidecar backend, distribution packaging (.deb, .rpm, AUR) for x86_64 and ARM64, live dashboard TUI (`stratosync dashboard`), conflicts cleanup CLI, and selective sync via per-mount `ignore_patterns`. See the [CHANGELOG](CHANGELOG.md) for details.
+🚧 **Pre-alpha (v0.12.0, unreleased).** Phases 1–5 are functionally complete; encrypted cache is deferred to v0.13.0. The daemon already provides:
 
-## Prerequisites
+- On-demand FUSE3 filesystem with bidirectional sync
+- 3-way text merge for clean conflict resolution; `.conflict.*` siblings under `.stratosync-conflicts/` for everything else
+- Delta-API polling (Google Drive `pageToken`, OneDrive `/delta`)
+- Pin/unpin for offline; range-read fast path; readdir prefetch
+- Live dashboard TUI (`stratosync dashboard`)
+- Selective sync via per-mount `ignore_patterns`
+- Bandwidth scheduling via per-mount `upload_window`
+- File versioning with CLI list/restore
+- Prometheus `/metrics` endpoint (opt-in)
+- Nautilus emblem extension and `stratosync-tray` system-tray indicator
+- Distribution packages (`.deb`, `.rpm`, AUR) for x86_64 and ARM64
 
-- **Linux** with FUSE3 support
-- **Rust 1.80+** — `rustup update stable`
-- **rclone** — [https://rclone.org/install/](https://rclone.org/install/)
-- **libfuse3-dev** — `sudo apt install libfuse3-dev` (Debian/Ubuntu) or `sudo dnf install fuse3-devel` (Fedora)
-
-## Setup
-
-### 1. Configure rclone
-
-Stratosync uses [rclone](https://rclone.org/) as its backend for cloud provider access. You need a working rclone remote before stratosync can mount it.
-
-```bash
-rclone config
-```
-
-Follow the interactive prompts to add your cloud provider. See the [rclone documentation](https://rclone.org/docs/) for provider-specific setup:
-
-- [Google Drive](https://rclone.org/drive/)
-- [OneDrive](https://rclone.org/onedrive/)
-- [Dropbox](https://rclone.org/dropbox/)
-- [S3](https://rclone.org/s3/)
-- [Nextcloud/WebDAV](https://rclone.org/webdav/)
-- [Full provider list](https://rclone.org/overview/)
-
-Verify your remote works:
-
-```bash
-rclone lsd <remote_name>:    # list top-level directories
-rclone about <remote_name>:  # show storage quota
-```
-
-### 2. Install stratosync
-
-```bash
-git clone https://github.com/dmcbane/stratosync
-cd stratosync
-./install.sh
-```
-
-This builds the project, installs `stratosyncd` (daemon) and `stratosync` (CLI) to `~/.local/bin/`, creates a default config at `~/.config/stratosync/config.toml`, and enables a systemd user service.
-
-### 3. Configure a mount
-
-Edit `~/.config/stratosync/config.toml`:
-
-```toml
-[daemon]
-log_level = "info"
-
-[[mount]]
-name          = "gdrive"        # unique name for this mount
-remote        = "gdrive:/"      # rclone remote and path (from step 1)
-mount_path    = "~/GoogleDrive" # where files appear in your filesystem
-cache_quota   = "10 GiB"       # max local cache size
-poll_interval = "30s"           # how often to check for remote changes
-```
-
-You can add multiple `[[mount]]` sections for different cloud accounts.
-
-Test the configuration:
-
-```bash
-stratosync config test
-```
-
-### 4. Start the daemon
-
-**Option A — systemd (recommended for daily use):**
-
-```bash
-systemctl --user start stratosyncd
-systemctl --user status stratosyncd    # check it's running
-journalctl --user -u stratosyncd -f    # view logs
-```
-
-> **Note on systemd sandboxing:** The service unit intentionally omits
-> `PrivateTmp=true` and `NoNewPrivileges=true`. `PrivateTmp` creates a private
-> mount namespace that makes the FUSE mount invisible outside the daemon, and
-> `NoNewPrivileges` blocks the setuid `fusermount3` binary from performing the
-> mount. If you customize the unit file, do not re-enable these directives.
-
-**Option B — foreground (for development/debugging):**
-
-```bash
-RUST_LOG=stratosync=debug stratosyncd
-```
-
-Your cloud files are now accessible at the mount path (e.g., `~/GoogleDrive/`).
-
-## Usage
-
-Once mounted, the cloud directory works like any local directory:
-
-```bash
-# Browse files
-ls ~/GoogleDrive/Documents/
-
-# Read files (downloaded on-demand)
-cat ~/GoogleDrive/Documents/report.pdf
-
-# Edit files (changes upload automatically)
-vim ~/GoogleDrive/Documents/notes.md
-
-# Create, copy, move, delete — all work
-cp local-file.txt ~/GoogleDrive/
-mv ~/GoogleDrive/old.txt ~/GoogleDrive/new.txt
-rm ~/GoogleDrive/temp.txt
-mkdir ~/GoogleDrive/NewFolder
-```
-
-### CLI commands
-
-```bash
-stratosync status           # sync status across all mounts
-stratosync ls [path]        # list remote contents with sync status
-stratosync config show      # print current configuration
-stratosync config test      # verify connectivity to all remotes
-stratosync config edit      # open config in $EDITOR
-stratosync conflicts        # list files with sync conflicts
-```
-
-### How it works
-
-- **On-demand hydration**: files appear in the mount immediately with correct names and sizes. The actual content is downloaded from the cloud only when you open the file. Subsequent reads use the local cache.
-- **Automatic upload**: when you write to a file, changes are saved to the local cache immediately and uploaded to the cloud in the background after a short debounce window (default 2 seconds). `fsync()` triggers an immediate upload.
-- **Conflict resolution**: if you and someone else edit the same file, the remote version wins the canonical path and your local version is saved as `filename.conflict.20260403T120000Z.a1b2c3d4.ext`.
-- **Cache management**: the local cache is bounded by `cache_quota`. When the cache fills up, least-recently-used files are evicted (their data is deleted locally but remains in the cloud). Pinned files are never evicted.
-- **Change detection**: an inotify watcher detects local changes; a polling loop detects remote changes. Google Drive and OneDrive use delta APIs (change tokens) for efficient incremental polling; other backends use full directory listing.
-
-### Configuration reference
-
-```toml
-[daemon]
-log_level = "info"           # trace, debug, info, warn, error
-
-[daemon.fuse]
-threads         = 4          # FUSE worker threads
-attr_timeout_s  = 5          # seconds to cache file attributes
-entry_timeout_s = 5          # seconds to cache directory entries
-allow_other     = false      # allow other users to access the mount
-
-[daemon.sync]
-max_hydration_concurrent = 4    # parallel downloads
-max_upload_concurrent    = 2    # parallel uploads
-upload_debounce_ms       = 2000 # wait before uploading after last write
-upload_close_debounce_ms = 500  # wait after file close
-text_conflict_strategy   = "keep_both"  # or "merge"
-
-[[mount]]
-name          = "gdrive"
-remote        = "gdrive:/"
-mount_path    = "~/GoogleDrive"
-cache_quota   = "10 GiB"
-poll_interval = "30s"
-enabled       = true
-
-[mount.rclone]
-extra_flags = []             # extra flags for rclone commands
-bwlimit     = "10M"         # bandwidth limit (optional)
-transfers   = 4              # parallel rclone transfers (optional)
-
-[mount.eviction]
-policy    = "lru"            # lru, lfu, size_desc, never
-low_mark  = 0.80             # evict down to this fraction of quota
-high_mark = 0.90             # start evicting at this fraction
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│              ~/Cloud/ (FUSE3 mount)                  │
-└────────────────────────┬────────────────────────────┘
-                         │  kernel VFS calls
-┌────────────────────────▼────────────────────────────┐
-│                  stratosync daemon                    │
-│  ┌──────────────┐  ┌────────────────┐               │
-│  │  FUSE layer  │  │ inotify watcher│               │
-│  │   (fuser)    │  │ (notify crate) │               │
-│  └──────┬───────┘  └───────┬────────┘               │
-│         └─────────┬────────┘                         │
-│           ┌───────▼────────┐  ┌──────────────────┐  │
-│           │  Sync Engine   │  │  Cache Manager   │  │
-│           │  (diff/queue/  │  │  (LRU eviction,  │  │
-│           │   conflict)    │  │   quota policy)  │  │
-│           └───────┬────────┘  └──────────────────┘  │
-│           ┌───────▼────────┐                         │
-│           │  SQLite State  │  ← WAL mode             │
-│           │  (file index,  │                         │
-│           │   sync queue,  │                         │
-│           │   xattr store) │                         │
-│           └───────┬────────┘                         │
-└───────────────────┼─────────────────────────────────┘
-                    │  rclone subprocess / pipe
-          ┌─────────▼──────────┐
-          │  rclone backend    │
-          │  (any provider)    │
-          └────────────────────┘
-```
-
-See [`docs/architecture/`](docs/architecture/) for detailed design documents.
+See the [CHANGELOG](CHANGELOG.md) for release-by-release detail.
 
 ## Documentation
 
-- [Architecture Overview](docs/architecture/01-overview.md)
-- [FUSE Layer](docs/architecture/02-fuse-layer.md)
-- [Sync Engine & State Machine](docs/architecture/03-sync-engine.md)
-- [State DB Schema](docs/architecture/04-state-db.md)
-- [Backend Abstraction](docs/architecture/05-backend.md)
-- [Conflict Resolution](docs/architecture/06-conflict-resolution.md)
-- [Cache Management](docs/architecture/07-cache.md)
-- [Configuration](docs/architecture/08-config.md)
-- [Changelog](CHANGELOG.md)
+- **[Installation guide](docs/installation.md)** — prerequisites, build/install, systemd, first mount.
+- **[Usage guide](docs/usage.md)** — daily workflow, every CLI command, selective sync, bandwidth schedules, versioning, dashboard, conflicts.
+- **[Configuration reference](docs/architecture/08-config.md)** — every TOML setting, with examples and limitations.
+- **[Architecture](docs/architecture/01-overview.md)** — design docs (FUSE layer, sync engine, state DB, backend, conflicts, cache).
+- **[Roadmap](docs/ROADMAP.md)** — what shipped and what's next.
+
+## Quick start
+
+```bash
+# 1. Configure your cloud provider via rclone (one-time)
+rclone config
+rclone lsd <remote>:    # verify connectivity
+
+# 2. Install
+git clone https://github.com/dmcbane/stratosync
+cd stratosync
+./install.sh
+
+# 3. Edit ~/.config/stratosync/config.toml — at minimum, set name/remote/mount_path
+
+# 4. Start the daemon
+systemctl --user start stratosyncd
+ls ~/GoogleDrive/
+```
+
+For the full walkthrough, see **[docs/installation.md](docs/installation.md)**.
 
 ## Contributing
 

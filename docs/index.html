@@ -115,6 +115,42 @@
       <p>FUSE3 mount works with every tool: <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code>, your IDE, your file manager. No special client needed.</p>
     </div>
   </div>
+
+  <h2 class="section-title" style="margin-top:3em;">New in v0.12.0</h2>
+  <p class="section-sub">Phase 5: power-user features for daily use.</p>
+
+  <div class="features">
+    <div class="feature-card">
+      <span class="icon">&#128269;</span>
+      <h3>Selective sync</h3>
+      <p>Per-mount <code>ignore_patterns</code> glob list keeps <code>node_modules/</code>, <code>*.tmp</code>, build artefacts out of the index, the FUSE mount, and the upload queue.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128344;</span>
+      <h3>Bandwidth schedule</h3>
+      <p>Per-mount <code>upload_window = "22:00-06:00"</code>. Uploads only dispatch in the local-time window. <code>fsync()</code> always bypasses.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128194;</span>
+      <h3>File versioning</h3>
+      <p>Snapshots before each remote-replace and after each upload. <code>stratosync versions list/restore</code> brings back any of the last N versions; deduplicated against the merge base store.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128202;</span>
+      <h3>Prometheus metrics</h3>
+      <p>Opt-in <code>GET /metrics</code> with per-mount cache, queue, hydration, conflict, and poller gauges. Hand-rolled HTTP/1.1 — no axum/hyper baggage.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128187;</span>
+      <h3>Live dashboard</h3>
+      <p><code>stratosync dashboard</code> — ratatui TUI showing per-mount sync state, upload queue, hydration, and poller status updating in real time over the daemon IPC socket.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128274;</span>
+      <h3>Multi-account isolation</h3>
+      <p>Personal + work Google Drive? Two rclone remotes, two <code>[[mount]]</code> blocks. Total isolation: separate DB, cache, OAuth token, upload queue, and sidecar port.</p>
+    </div>
+  </div>
 </section>
 
 <!-- Prerequisites -->
@@ -150,20 +186,20 @@
   <p class="code-label">2. Install stratosync</p>
   <div class="code-block">
 <pre><span class="comment"># Debian / Ubuntu</span>
-<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync_0.11.0_amd64.deb</span>
-<span class="cmd">sudo dpkg</span> <span class="flag">-i</span> stratosync_0.11.0_amd64.deb
+<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync_0.12.0_amd64.deb</span>
+<span class="cmd">sudo dpkg</span> <span class="flag">-i</span> stratosync_0.12.0_amd64.deb
 
 <span class="comment"># Fedora / RHEL</span>
-<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync-0.11.0-1.x86_64.rpm</span>
-<span class="cmd">sudo dnf install</span> ./stratosync-0.11.0-1.x86_64.rpm
+<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync-0.12.0-1.x86_64.rpm</span>
+<span class="cmd">sudo dnf install</span> ./stratosync-0.12.0-1.x86_64.rpm
 
 <span class="comment"># Arch (AUR)</span>
 <span class="cmd">yay</span> <span class="flag">-S</span> stratosync-git
 
 <span class="comment"># Any distro (tarball)</span>
-<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync-0.11.0-linux-x86_64.tar.gz</span>
-<span class="cmd">tar xzf</span> stratosync-0.11.0-linux-x86_64.tar.gz
-<span class="cmd">sudo cp</span> stratosync-0.11.0-linux-x86_64/stratosync* <span class="str">/usr/local/bin/</span></pre>
+<span class="cmd">curl</span> <span class="flag">-LO</span> <span class="str">https://github.com/dmcbane/stratosync/releases/latest/download/stratosync-0.12.0-linux-x86_64.tar.gz</span>
+<span class="cmd">tar xzf</span> stratosync-0.12.0-linux-x86_64.tar.gz
+<span class="cmd">sudo cp</span> stratosync-0.12.0-linux-x86_64/stratosync* <span class="str">/usr/local/bin/</span></pre>
   </div>
   <p style="margin-top:0.5em;color:#888;font-size:0.9em;">ARM64 packages also available &mdash; replace <code>amd64</code>/<code>x86_64</code> with <code>arm64</code>/<code>aarch64</code>.
     See all downloads on the <a href="https://github.com/dmcbane/stratosync/releases/latest">releases page</a>.</p>
@@ -248,19 +284,28 @@
     <div>
       <p class="code-label">CLI commands</p>
       <div class="code-block">
-<pre><span class="comment"># Sync status across all mounts</span>
+<pre><span class="comment"># Sync status &amp; live dashboard</span>
 <span class="cmd">stratosync</span> status
+<span class="cmd">stratosync</span> dashboard         <span class="comment"># live TUI</span>
 
 <span class="comment"># List remote contents</span>
 <span class="cmd">stratosync</span> ls [path]
 
+<span class="comment"># Offline pinning</span>
+<span class="cmd">stratosync</span> pin   ~/Drive/important.pdf
+<span class="cmd">stratosync</span> unpin ~/Drive/important.pdf
+
 <span class="comment"># Configuration</span>
-<span class="cmd">stratosync</span> config show
-<span class="cmd">stratosync</span> config test
-<span class="cmd">stratosync</span> config edit
+<span class="cmd">stratosync</span> config show|test|edit
 
 <span class="comment"># Conflict management</span>
-<span class="cmd">stratosync</span> conflicts</pre>
+<span class="cmd">stratosync</span> conflicts
+<span class="cmd">stratosync</span> conflicts cleanup [--dry-run]
+<span class="cmd">stratosync</span> conflicts merge ~/Drive/notes.md
+
+<span class="comment"># File version history</span>
+<span class="cmd">stratosync</span> versions list    ~/Drive/notes.md
+<span class="cmd">stratosync</span> versions restore ~/Drive/notes.md <span class="flag">--index</span> 1</pre>
       </div>
     </div>
   </div>
@@ -366,19 +411,28 @@
 <span class="flag">max_upload_concurrent</span>     = <span class="str">2</span>
 <span class="flag">upload_debounce_ms</span>        = <span class="str">2000</span>
 <span class="flag">text_conflict_strategy</span>    = <span class="str">"merge"</span>   <span class="comment"># or "keep_both"</span>
-<span class="flag">base_retention_days</span>       = <span class="str">30</span></pre>
+<span class="flag">base_retention_days</span>       = <span class="str">30</span>
+
+[<span class="str">daemon.metrics</span>]                <span class="comment"># Prometheus, off by default</span>
+<span class="flag">enabled</span>     = <span class="str">false</span>
+<span class="flag">listen_addr</span> = <span class="str">"127.0.0.1:9090"</span></pre>
       </div>
     </div>
     <div>
       <p class="code-label">Mount settings (repeatable)</p>
       <div class="code-block">
 <pre>[[<span class="str">mount</span>]]
-<span class="flag">name</span>          = <span class="str">"gdrive"</span>
-<span class="flag">remote</span>        = <span class="str">"gdrive:/"</span>
-<span class="flag">mount_path</span>    = <span class="str">"~/GoogleDrive"</span>
-<span class="flag">cache_quota</span>   = <span class="str">"10 GiB"</span>
-<span class="flag">poll_interval</span> = <span class="str">"30s"</span>
-<span class="flag">enabled</span>       = <span class="str">true</span>
+<span class="flag">name</span>              = <span class="str">"gdrive"</span>
+<span class="flag">remote</span>            = <span class="str">"gdrive:/"</span>
+<span class="flag">mount_path</span>        = <span class="str">"~/GoogleDrive"</span>
+<span class="flag">cache_quota</span>       = <span class="str">"10 GiB"</span>
+<span class="flag">poll_interval</span>     = <span class="str">"30s"</span>
+<span class="flag">enabled</span>           = <span class="str">true</span>
+
+<span class="comment"># Phase 5 features (all optional)</span>
+<span class="flag">ignore_patterns</span>   = [<span class="str">"*.tmp"</span>, <span class="str">"node_modules/**"</span>]
+<span class="flag">upload_window</span>     = <span class="str">"22:00-06:00"</span>   <span class="comment"># local time</span>
+<span class="flag">version_retention</span> = <span class="str">10</span>              <span class="comment"># 0 to disable</span>
 
 [<span class="str">mount.eviction</span>]
 <span class="flag">policy</span>    = <span class="str">"lru"</span>
@@ -416,9 +470,14 @@
       <p>Pin/unpin for offline. Range-read fast path. Readdir prefetch. Nautilus emblem extension. System tray indicator. WebDAV sidecar backend. Distribution packaging (.deb, .rpm, AUR) for x86_64 and ARM64.</p>
     </div>
     <div class="phase">
-      <span class="phase-badge current">Next</span>
+      <span class="phase-badge done">Done</span>
       <h3>Phase 5: Advanced Features</h3>
-      <p>Selective sync with ignore patterns. File versioning. Bandwidth scheduling. Prometheus metrics. Encrypted cache.</p>
+      <p>Selective sync (per-mount <code>ignore_patterns</code>). Bandwidth scheduling (per-mount <code>upload_window</code>). File versioning with CLI list/restore. Prometheus <code>/metrics</code> endpoint. Multiple accounts per provider (per-mount isolation). Live dashboard TUI. Conflicts cleanup CLI. <em>Encrypted cache deferred to v0.13.0.</em></p>
+    </div>
+    <div class="phase">
+      <span class="phase-badge current">Next</span>
+      <h3>Phase 6: File Manager Integration</h3>
+      <p>Status overlays and context-menu actions for Dolphin (KDE), Nemo (Cinnamon), Caja (MATE), Thunar (XFCE) — extending the existing Nautilus emblem extension to every major Linux file manager. All extensions read the same <code>user.stratosync.*</code> xattrs.</p>
     </div>
   </div>
 </section>
