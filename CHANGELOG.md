@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [0.12.0] - unreleased
 
 ### Added
+- **Dolphin emblem-overlay plugin (KF6)**: new `KOverlayIconPlugin` C++
+  plugin under `contrib/file-managers/dolphin/overlay-plugin/`. Reads
+  `user.stratosync.status` via `getxattr(2)` and returns the same
+  freedesktop emblem names the GTK plugins use (cached/dirty/uploading/
+  hydrating/remote/conflict/stale → emblem-default/synchronizing/
+  downloads/web/important/generic). Ships as a separate
+  `stratosync-dolphin-overlay` subpackage in `.deb` and `.rpm` so non-KDE
+  installs don't pull KF6 KIO at runtime; AUR PKGBUILD adds `kio` as an
+  optdepend on the main package. install.sh detects KF6 KIO devel
+  headers and builds the plugin opt-in into `~/.local/lib/qt6/plugins/`.
+
 - **Phase 6 declarative slice**: context-menu actions now ship for
   Dolphin / Konqueror (KDE), Thunar (XFCE), and PCManFM / PCManFM-Qt
   (LXDE/LXQt). New shared shell wrapper

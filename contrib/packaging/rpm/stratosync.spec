@@ -1,6 +1,6 @@
 Name:           stratosync
 Version:        0.12.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Linux cloud sync daemon with on-demand FUSE3 filesystem
 
 License:        MIT OR Apache-2.0
@@ -11,7 +11,13 @@ BuildRequires:  rust >= 1.80
 BuildRequires:  cargo
 BuildRequires:  fuse3-devel
 BuildRequires:  gcc
+BuildRequires:  gcc-c++
 BuildRequires:  pkg-config
+# For the optional Dolphin emblem-overlay subpackage:
+BuildRequires:  cmake
+BuildRequires:  extra-cmake-modules
+BuildRequires:  qt6-qtbase-devel
+BuildRequires:  kf6-kio-devel
 
 Requires:       fuse3
 Requires:       rclone
@@ -25,11 +31,30 @@ Stratosync provides a FUSE3 virtual filesystem backed by rclone, supporting
 placeholders, hydrate on open(), and uploads propagate automatically with
 conflict detection and 3-way merge resolution.
 
+%package dolphin-overlay
+Summary:   Sync-status emblem overlays for Dolphin and Konqueror
+Requires:  stratosync = %{version}-%{release}
+Requires:  kf6-kio
+Supplements: dolphin
+%description dolphin-overlay
+KOverlayIconPlugin (KF6) that adds sync-status emblem overlays in Dolphin
+and Konqueror, matching the Nautilus / Nemo / Caja Python extensions
+(emblems for cached / dirty / uploading / hydrating / remote / conflict /
+stale). Pulls in KF6 KIO at runtime — install only on KDE Plasma desktops.
+
 %prep
 %autosetup
 
 %build
 cargo build --release
+# Build the optional Dolphin emblem-overlay plugin. We always build it in
+# the source tree; it's split off into its own subpackage so non-KDE
+# installs don't pull KF6 KIO at runtime.
+cmake -B contrib/file-managers/dolphin/overlay-plugin/build \
+      -S contrib/file-managers/dolphin/overlay-plugin \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build contrib/file-managers/dolphin/overlay-plugin/build
 
 %check
 cargo test --workspace
@@ -56,6 +81,9 @@ mkdir -p %{buildroot}%{_datadir}/file-manager/actions
 install -m 644 contrib/file-managers/pcmanfm/stratosync-*.desktop       %{buildroot}%{_datadir}/file-manager/actions/
 install -Dm644 contrib/file-managers/thunar/stratosync-uca.xml          %{buildroot}%{_docdir}/%{name}/thunar/stratosync-uca.xml
 install -Dm644 contrib/file-managers/thunar/README.md                   %{buildroot}%{_docdir}/%{name}/thunar/README.md
+# Dolphin emblem-overlay plugin (separate subpackage). Goes into KF6's
+# overlayicon plugin directory so KIO discovers it without per-user env.
+DESTDIR=%{buildroot} cmake --install contrib/file-managers/dolphin/overlay-plugin/build
 
 %files
 %license LICENSE-MIT LICENSE-APACHE
@@ -79,7 +107,14 @@ install -Dm644 contrib/file-managers/thunar/README.md                   %{buildr
 %{_docdir}/%{name}/thunar/stratosync-uca.xml
 %{_docdir}/%{name}/thunar/README.md
 
+%files dolphin-overlay
+%{_libdir}/qt6/plugins/kf6/overlayicon/stratosyncoverlay.so
+
 %changelog
+* Mon Apr 27 2026 Dale McBane <noreply@example.com> - 0.12.0-2
+- Add stratosync-dolphin-overlay subpackage: KF6 KOverlayIconPlugin that
+  renders sync-status emblems on Dolphin / Konqueror to match the
+  Nautilus / Nemo / Caja extensions.
 * Sun Apr 26 2026 Dale McBane <noreply@example.com> - 0.12.0-1
 - Phase 5 complete: selective sync, bandwidth schedule, file versioning,
   Prometheus metrics, multi-account isolation, dashboard TUI.

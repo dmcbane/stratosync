@@ -3,11 +3,12 @@
 Adds a **Stratosync** submenu to the right-click menu in Dolphin and
 Konqueror with Pin / Unpin / Resolve-conflict actions.
 
-> **Heads up — actions only, no emblems (yet).** Dolphin's emblem overlays
-> are driven by `KOverlayIconPlugin`, a C++/Qt plugin that needs a real
-> CMake build. That's tracked as a separate Phase 6 follow-up. This file
-> ships only the context-menu integration — the same `stratosync` CLI
-> actions that Nautilus / Nemo / Caja already have.
+> **Two pieces.** This `.desktop` file is the *context-menu* integration
+> (right-click → Stratosync). Sync-status **emblem overlays** are a
+> separate KF6 C++ plugin under
+> [`overlay-plugin/`](overlay-plugin/README.md) — real CMake build,
+> separate subpackage in `.deb`/`.rpm`. Either is useful on its own; both
+> together give Dolphin parity with the GTK file managers.
 
 ## Installation
 

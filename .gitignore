@@ -10,3 +10,7 @@ Cargo.lock
 # Python bytecode from contrib/file-managers/common/test_*.py runs
 __pycache__/
 *.pyc
+
+# CMake build trees for the optional Dolphin emblem-overlay plugin.
+contrib/file-managers/dolphin/overlay-plugin/build/
+contrib/file-managers/dolphin/overlay-plugin/build.log

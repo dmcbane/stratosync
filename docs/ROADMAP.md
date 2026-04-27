@@ -105,7 +105,7 @@ Smaller scope-creep items split out of the main Phase 5 deliverables. Not blocki
 
 ## Phase 6: File Manager Integration
 
-**Goal**: First-class status overlays and context-menu actions across the major Linux file managers, not just Nautilus. **Status**: context-menu actions shipped on every targeted file manager (Nautilus / Nemo / Caja / Dolphin / Konqueror / Thunar / PCManFM / PCManFM-Qt). Emblems shipped on the GTK trio; emblem support on Dolphin and an emblem alternative for Thunar/PCManFM are still ahead.
+**Goal**: First-class status overlays and context-menu actions across the major Linux file managers, not just Nautilus. **Status**: context-menu actions and sync-status emblems shipped on every desktop with a native overlay API (Nautilus / Nemo / Caja / Dolphin / Konqueror). Thunar and PCManFM ship context-menu actions only — neither has a native emblem API. Emblem alternatives for the GTK-less, no-overlay file managers still ahead.
 
 All extensions read the same `user.stratosync.{status,etag,remote_path}` xattrs already exposed by the FUSE layer. Actions shell out to the `stratosync` CLI; if latency ever justifies it, the daemon IPC protocol can grow native pin/unpin/resolve ops without changing the extension surface.
 
@@ -126,6 +126,13 @@ Shipped (in v0.12.0 dev cycle):
 - **Caja (MATE)** — thin wrapper over the shared Python helper.
 - **Dolphin / Konqueror (KDE)** — KIO ServiceMenu (`.desktop`) under a
   *Stratosync* submenu. Five context-menu items, no compilation.
+- **Dolphin emblem overlays** — KF6 `KOverlayIconPlugin` C++ plugin under
+  `contrib/file-managers/dolphin/overlay-plugin/`. Reads
+  `user.stratosync.status` via `getxattr(2)` and returns the same
+  freedesktop emblem names the GTK Python plugins use, so sync state
+  looks identical across desktops. Ships as a separate
+  `stratosync-dolphin-overlay` subpackage in `.deb`/`.rpm` (own
+  KF6 KIO build dep, opt-in for non-KDE installs).
 - **PCManFM / PCManFM-Qt (LXDE/LXQt)** — FreeDesktop file-manager Actions
   spec, one `.desktop` per item under `/usr/share/file-manager/actions/`.
 - **Thunar (XFCE)** — UCA (Custom Actions) snippet shipped under
@@ -137,8 +144,6 @@ Shipped (in v0.12.0 dev cycle):
   are only Recommends/Suggests, never required.
 
 Deferred to follow-ups:
-- **Dolphin emblem overlays** — `KOverlayIconPlugin` (C++/Qt + KIO + CMake).
-  Real build, not a config file. Tracked separately.
 - **Thunar / PCManFM emblems** — neither has a native emblem API. Options
   on the table: thumbnailer-based status badges, sidebar-panel widget,
   or a no-op (acceptable; the CLI/dashboard already cover the case where

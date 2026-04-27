@@ -477,7 +477,7 @@
     <div class="phase">
       <span class="phase-badge current">In&nbsp;progress</span>
       <h3>Phase 6: File Manager Integration</h3>
-      <p>Context-menu actions <strong>shipped on every targeted file manager</strong> — Nautilus / Nemo / Caja (Python plugins, with emblems) plus Dolphin / Konqueror (KIO ServiceMenu), PCManFM / PCManFM-Qt (FreeDesktop Actions), and Thunar (UCA snippet, manual merge). All declarative menus dispatch through one shared <code>stratosync-fm-action</code> shell wrapper. Still ahead: Dolphin emblem overlays (needs a C++ <code>KOverlayIconPlugin</code>) and an emblem alternative for Thunar / PCManFM (no native emblem API).</p>
+      <p>Context-menu actions <strong>shipped on every targeted file manager</strong> — Nautilus / Nemo / Caja, Dolphin / Konqueror, PCManFM / PCManFM-Qt, Thunar. Sync-status <strong>emblem overlays</strong> shipped on every desktop with a native overlay API: GTK trio via Python plugins, Dolphin / Konqueror via a KF6 <code>KOverlayIconPlugin</code> C++ plugin (separate <code>stratosync-dolphin-overlay</code> subpackage). Thunar and PCManFM ship actions only — neither has a native emblem API, so an alternative (thumbnailer badge or sidebar panel) is the remaining open question.</p>
     </div>
   </div>
 </section>

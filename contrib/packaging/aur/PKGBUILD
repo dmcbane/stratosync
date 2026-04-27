@@ -7,11 +7,12 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/dmcbane/stratosync"
 license=('MIT' 'Apache-2.0')
 depends=('fuse3' 'rclone')
-makedepends=('rust' 'cargo' 'git')
+makedepends=('rust' 'cargo' 'git' 'cmake' 'extra-cmake-modules' 'qt6-base' 'kio')
 optdepends=(
     'python-nautilus: Nautilus (GNOME) sync-status emblems and context-menu actions'
     'nemo-python: Nemo (Cinnamon) sync-status emblems and context-menu actions'
     'python-caja: Caja (MATE) sync-status emblems and context-menu actions'
+    'kio: Dolphin/Konqueror sync-status emblem overlays (KF6 KOverlayIconPlugin)'
     'libappindicator-gtk3: system tray indicator support'
 )
 provides=('stratosync')
@@ -27,6 +28,12 @@ pkgver() {
 build() {
     cd stratosync
     cargo build --release
+    # Dolphin emblem-overlay plugin (KF6 KOverlayIconPlugin).
+    cmake -B contrib/file-managers/dolphin/overlay-plugin/build \
+          -S contrib/file-managers/dolphin/overlay-plugin \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/usr
+    cmake --build contrib/file-managers/dolphin/overlay-plugin/build
 }
 
 check() {
@@ -58,6 +65,8 @@ package() {
     done
     install -Dm644 contrib/file-managers/thunar/stratosync-uca.xml       "$pkgdir/usr/share/doc/$pkgname/thunar/stratosync-uca.xml"
     install -Dm644 contrib/file-managers/thunar/README.md                "$pkgdir/usr/share/doc/$pkgname/thunar/README.md"
+    # Dolphin emblem-overlay plugin (KF6 KOverlayIconPlugin).
+    DESTDIR="$pkgdir" cmake --install contrib/file-managers/dolphin/overlay-plugin/build
     install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
     install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
 }

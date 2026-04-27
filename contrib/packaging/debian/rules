@@ -5,6 +5,13 @@
 
 override_dh_auto_build:
 	cargo build --release
+	# Optional Dolphin emblem-overlay plugin (KF6). Built in-tree; the
+	# .so ends up under contrib/.../build/bin/ and gets installed below.
+	cmake -B contrib/file-managers/dolphin/overlay-plugin/build \
+	      -S contrib/file-managers/dolphin/overlay-plugin \
+	      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+	      -DCMAKE_INSTALL_PREFIX=/usr
+	cmake --build contrib/file-managers/dolphin/overlay-plugin/build
 
 override_dh_auto_install:
 	install -Dm755 target/release/stratosyncd $(CURDIR)/debian/stratosync/usr/bin/stratosyncd
@@ -35,6 +42,12 @@ override_dh_auto_install:
 	# merge it into their ~/.config/Thunar/uca.xml.
 	install -Dm644 contrib/file-managers/thunar/stratosync-uca.xml          $(CURDIR)/debian/stratosync/usr/share/doc/stratosync/thunar/stratosync-uca.xml
 	install -Dm644 contrib/file-managers/thunar/README.md                   $(CURDIR)/debian/stratosync/usr/share/doc/stratosync/thunar/README.md
+	# Dolphin emblem-overlay plugin (separate binary package). KF6 KIO
+	# installs plugins under <multiarch>/qt6/plugins/kf6/overlayicon/.
+	# DEB_HOST_MULTIARCH varies by arch (e.g. x86_64-linux-gnu).
+	DEB_HOST_MULTIARCH=$$(dpkg-architecture -qDEB_HOST_MULTIARCH); \
+	    install -Dm755 contrib/file-managers/dolphin/overlay-plugin/build/bin/stratosyncoverlay.so \
+	        $(CURDIR)/debian/stratosync-dolphin-overlay/usr/lib/$${DEB_HOST_MULTIARCH}/qt6/plugins/kf6/overlayicon/stratosyncoverlay.so
 
 override_dh_auto_test:
 	cargo test --workspace
