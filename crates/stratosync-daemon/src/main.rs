@@ -102,6 +102,19 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(&cache_dir)
             .with_context(|| format!("create cache dir {:?}", cache_dir))?;
 
+        // Orphan reconciler. Walks <cache_dir> and removes regular files
+        // that have no corresponding file_index.cache_path entry — these
+        // accumulate when a cache file is created out-of-band, the daemon
+        // crashes mid-cleanup, or a path renames without DB tracking, and
+        // they leak disk space because eviction can't reach them. Runs
+        // before the FUSE mount so we cannot race with open files in the
+        // mount.
+        if let Err(e) = cache::reconcile::reconcile_orphans(
+            mount_id, &db, &cache_dir,
+        ).await {
+            warn!(mount = %mount_cfg.name, "orphan reconciler error: {e}");
+        }
+
         // Base-version object store (for 3-way merge conflict resolution)
         let base_store = Arc::new(
             BaseStore::new(cache_dir.join(".bases"))
