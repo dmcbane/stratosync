@@ -10,6 +10,7 @@ Package: stratosync
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, libfuse3-3, fuse3, rclone
 Recommends: python3-nautilus
+Suggests: python3-nemo, python3-caja
 Description: Linux cloud sync daemon with on-demand FUSE3 filesystem
  Stratosync provides a FUSE3 virtual filesystem backed by rclone, supporting
  70+ cloud storage providers. Files appear immediately with metadata-only

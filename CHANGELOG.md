@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 ## [0.12.0] - unreleased
 
 ### Added
+- **Phase 6 GTK slice**: file-manager integration extended beyond Nautilus.
+  New `contrib/file-managers/common/stratosync_fm_common.py` shared helper
+  (xattr reading, status→emblem mapping, CLI shell-out, single
+  `menu_items_for(paths)` generator with full unit-test coverage). The
+  Nautilus extension moved into `contrib/file-managers/nautilus/`, gained
+  a `MenuProvider` with Pin / Unpin and three conflict-resolution items
+  (keep-local / keep-remote / 3-way merge), and now uses the shared
+  helper. New `nemo` (Cinnamon) and `caja` (MATE) extensions are thin
+  wrappers over the same helper, with parity emblems and menu items.
+  install.sh / `.deb` / `.rpm` / AUR PKGBUILD all install the helper +
+  whichever extensions match installed Python bindings; python3-nautilus
+  is a Recommends, python3-nemo / python3-caja are Suggests.
 - **Dashboard TUI** (`stratosync dashboard`): live ratatui-based view of
   per-mount sync state, hydration queue, upload queue, and poller status.
   Backed by a new daemon IPC socket that aggregates per-mount status from

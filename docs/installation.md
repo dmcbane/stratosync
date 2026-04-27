@@ -92,9 +92,33 @@ install -m 755 target/release/stratosync-tray  ~/.local/bin/    # optional: syst
 
 ### Optional: file-manager integrations
 
-- **Nautilus emblem extension** — included in the `.deb` and `.rpm` packages; copy `contrib/nautilus/stratosync.py` to `~/.local/share/nautilus-python/extensions/` for manual installs.
-- **System tray** — run `stratosync-tray` (the workspace builds it alongside the CLI). An autostart `.desktop` is included in the packages.
-- **Other file managers** (Dolphin, Nemo, Caja, Thunar) — Phase 6 work, not yet shipped. See [ROADMAP.md](ROADMAP.md).
+`install.sh` and the prebuilt packages auto-detect which of these have
+their Python bindings installed and ship the matching extension; nothing
+to do beyond installing the binding for your desktop.
+
+- **Nautilus** (GNOME) — `python3-nautilus` / `nautilus-python` /
+  `python-nautilus`. Sync-status emblems and context-menu actions
+  (Pin / Unpin / Resolve conflict).
+- **Nemo** (Cinnamon) — `python3-nemo` / `nemo-python`. Same emblems
+  and context-menu actions as Nautilus.
+- **Caja** (MATE) — `python3-caja` / `python-caja`. Same emblems and
+  context-menu actions.
+- **System tray** — run `stratosync-tray` (built alongside the CLI;
+  autostart `.desktop` shipped in packages).
+- **Dolphin (KDE), Thunar (XFCE), PCManFM** — pending Phase 6 follow-ups
+  in [ROADMAP.md](ROADMAP.md).
+
+For manual install (without the installer or a package), copy the helper
+plus the per-FM file into the extensions directory for each desktop:
+
+```bash
+mkdir -p ~/.local/share/nautilus-python/extensions
+cp contrib/file-managers/common/stratosync_fm_common.py    ~/.local/share/nautilus-python/extensions/
+cp contrib/file-managers/nautilus/stratosync_nautilus.py   ~/.local/share/nautilus-python/extensions/
+nautilus -q
+```
+
+Repeat with `nemo-python` / `caja-python` paths for the other two.
 
 ---
 

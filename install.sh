@@ -144,20 +144,47 @@ if [[ "$INSTALL_SERVICE" == "true" ]]; then
     fi
 fi
 
-# ── Nautilus extension ────────────────────────────────────────────────────────
-NAUTILUS_EXT_DIR="${HOME}/.local/share/nautilus-python/extensions"
-NAUTILUS_SRC="${REPO_DIR}/contrib/nautilus/stratosync_nautilus.py"
-if [[ -f "$NAUTILUS_SRC" ]]; then
-    if command -v nautilus &>/dev/null && python3 -c "import gi; gi.require_version('Nautilus','4.0')" 2>/dev/null || \
-       python3 -c "import gi; gi.require_version('Nautilus','3.0')" 2>/dev/null; then
-        mkdir -p "${NAUTILUS_EXT_DIR}"
-        cp "$NAUTILUS_SRC" "${NAUTILUS_EXT_DIR}/"
-        echo "✓ Nautilus extension installed (restart Nautilus: nautilus -q)"
-    else
-        echo "  Nautilus extension available but python3-nautilus not found — skipping"
-        echo "  Install python3-nautilus and re-run to enable file manager emblems"
+# ── File-manager extensions (Nautilus / Nemo / Caja) ──────────────────────────
+#
+# Each extension is a thin GObject shell over `stratosync_fm_common.py`.
+# We install the helper alongside whichever extension(s) the user's
+# desktop has bindings for. Missing python3-{nautilus,nemo,caja}
+# packages are not errors — that desktop is simply skipped.
+COMMON_SRC="${REPO_DIR}/contrib/file-managers/common/stratosync_fm_common.py"
+
+install_fm_extension() {
+    local fm_name="$1"          # "nautilus" | "nemo" | "caja"
+    local gi_module="$2"        # "Nautilus" | "Nemo" | "Caja"
+    local versions="$3"         # space-separated, e.g. "4.0 3.0"
+    local ext_filename="$4"     # "stratosync_nautilus.py" etc.
+
+    local ext_src="${REPO_DIR}/contrib/file-managers/${fm_name}/${ext_filename}"
+    local ext_dir="${HOME}/.local/share/${fm_name}-python/extensions"
+
+    [[ -f "$ext_src" && -f "$COMMON_SRC" ]] || return 0
+
+    local found=0
+    for v in $versions; do
+        if python3 -c "import gi; gi.require_version('${gi_module}','${v}')" \
+                2>/dev/null; then
+            found=1
+            break
+        fi
+    done
+    if [[ $found -eq 0 ]]; then
+        echo "  ${fm_name} extension available but python3-${fm_name} not found — skipping"
+        return 0
     fi
-fi
+
+    mkdir -p "${ext_dir}"
+    install -m 644 "$COMMON_SRC" "${ext_dir}/stratosync_fm_common.py"
+    install -m 644 "$ext_src"    "${ext_dir}/"
+    echo "✓ ${fm_name} extension installed (restart: ${fm_name} -q)"
+}
+
+install_fm_extension nautilus Nautilus "4.0 3.0" stratosync_nautilus.py
+install_fm_extension nemo     Nemo     "3.0"     stratosync_nemo.py
+install_fm_extension caja     Caja     "2.0"     stratosync_caja.py
 
 # ── Fuse configuration ────────────────────────────────────────────────────────
 FUSE_CONF="/etc/fuse.conf"

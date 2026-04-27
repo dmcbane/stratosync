@@ -105,20 +105,42 @@ Smaller scope-creep items split out of the main Phase 5 deliverables. Not blocki
 
 ## Phase 6: File Manager Integration
 
-**Goal**: First-class status overlays and context-menu actions across the major Linux file managers, not just Nautilus.
+**Goal**: First-class status overlays and context-menu actions across the major Linux file managers, not just Nautilus. **Status**: GTK-family slice landed (Nautilus / Nemo / Caja); KDE and XFCE still ahead.
 
-All extensions read the same `user.stratosync.{status,etag,remote_path}` xattrs already exposed by the FUSE layer, and talk to the daemon via the existing dashboard IPC socket for actions. Goal is feature parity: emblem/overlay icons for `synced` / `syncing` / `pinned` / `conflict`, plus context-menu entries for pin/unpin, resolve conflict, copy public link, and "open remote in browser".
+All extensions read the same `user.stratosync.{status,etag,remote_path}` xattrs already exposed by the FUSE layer. The current slice shells out to the `stratosync` CLI for actions; if latency ever justifies it, the daemon IPC protocol can grow native pin/unpin/resolve ops without changing the extension surface (the helper API stays put).
 
-Deliverables:
-- **Dolphin (KDE Plasma)** — KFileItemActionPlugin (C++/Qt) for context-menu actions, plus an Overlay Icon plugin (`KOverlayIconPlugin`) for status emblems.
-- **Nemo (Cinnamon)** — Python extension via `nemo-python` (API mirrors Nautilus, mostly a port of the existing extension).
-- **Caja (MATE)** — Python extension via `caja-python` (also Nautilus-API compatible; share code with Nemo where possible).
-- **Thunar (XFCE)** — `thunarx` C plugin or `uca` (custom-actions) shim; Thunar has no native emblem API, so fall back to thumbnailer-based status badges or a sidebar panel.
-- **PCManFM / PCManFM-Qt (LXDE/LXQt)** — investigate; likely custom-actions only (no overlay API).
-- Shared logic extracted into a small helper library so each extension is a thin shell.
-- Packaging: each extension as its own optional package (`stratosync-dolphin`, `stratosync-nemo`, etc.) so users only install what their desktop uses.
+Shipped (in v0.12.0 dev cycle):
+- **Shared helper** at `contrib/file-managers/common/stratosync_fm_common.py` —
+  xattr reading, status→emblem mapping, CLI shell-out, and a single
+  `menu_items_for(paths)` generator that drives all three GTK extensions.
+  Pure-Python, unit-tested (no `gi` imports).
+- **Nautilus extension upgraded**: kept the emblem `InfoProvider`, added a
+  `MenuProvider` with Pin / Unpin and three conflict-resolution items
+  (keep-local / keep-remote / 3-way merge). Nautilus 4.0 with 3.0 fallback.
+- **Nemo (Cinnamon)** — thin wrapper over the shared helper.
+- **Caja (MATE)** — thin wrapper over the shared helper.
+- **Packaging**: `.deb`, `.rpm`, and AUR PKGBUILD now ship all three
+  extensions under their canonical `usr/share/{nautilus,nemo,caja}-python/extensions/` paths, with python3-nautilus / python3-nemo / python3-caja as Recommends/Suggests/optdepends so users only install what their desktop uses.
 
-Acceptance criteria:
-- On a fresh KDE/Cinnamon/MATE/XFCE install, the matching extension package installs cleanly and shows the right emblem within one poll cycle of a status change.
-- Context-menu "Pin for offline" round-trips through the daemon and updates the emblem without a file-manager restart.
-- No extension blocks the file manager UI on slow network calls — all daemon RPC is async or backgrounded.
+Deferred to follow-ups:
+- **Dolphin (KDE Plasma)** — `KFileItemActionPlugin` (C++/Qt) for context-menu
+  actions plus a `KOverlayIconPlugin` for status emblems. Different ecosystem
+  from the GTK trio; warrants its own PR.
+- **Thunar (XFCE)** — `thunarx` C plugin or `uca` (custom-actions) shim.
+  Thunar has no native emblem API, so emblems will need a thumbnailer-based
+  status badge or a sidebar panel — design question, not a quick port.
+- **PCManFM / PCManFM-Qt (LXDE/LXQt)** — likely custom-actions only.
+- **"Copy public link" / "Open remote in browser"** context-menu items —
+  need a new `Backend::public_link()` method and a way to map
+  `user.stratosync.remote_path` to a browsable URL per provider.
+- **Pinned-state xattr** (`user.stratosync.pinned`) so the menu can offer
+  Pin *or* Unpin instead of both. Avoided in this slice — the daemon is
+  idempotent and there's no UX win worth a daemon change yet.
+
+Acceptance criteria for the GTK slice (met):
+- Each extension package installs cleanly under its canonical
+  `<fm>-python/extensions/` path on Debian, Fedora, and Arch derivatives.
+- Emblems render within one poll cycle of a status change (driven by the
+  same `user.stratosync.status` xattr that already powers Nautilus).
+- Context-menu actions never block the file manager — every CLI shell-out
+  is detached (`Popen` with `start_new_session=True`, no wait).

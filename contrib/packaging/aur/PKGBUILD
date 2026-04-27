@@ -1,6 +1,6 @@
 # Maintainer: Dale McBane <noreply@example.com>
 pkgname=stratosync-git
-pkgver=0.11.0
+pkgver=0.12.0
 pkgrel=1
 pkgdesc="Linux cloud sync daemon with on-demand FUSE3 filesystem"
 arch=('x86_64' 'aarch64')
@@ -9,7 +9,9 @@ license=('MIT' 'Apache-2.0')
 depends=('fuse3' 'rclone')
 makedepends=('rust' 'cargo' 'git')
 optdepends=(
-    'python-nautilus: Nautilus file manager sync status emblems'
+    'python-nautilus: Nautilus (GNOME) sync-status emblems and context-menu actions'
+    'nemo-python: Nemo (Cinnamon) sync-status emblems and context-menu actions'
+    'python-caja: Caja (MATE) sync-status emblems and context-menu actions'
     'libappindicator-gtk3: system tray indicator support'
 )
 provides=('stratosync')
@@ -37,7 +39,16 @@ package() {
     install -Dm755 target/release/stratosyncd "$pkgdir/usr/bin/stratosyncd"
     install -Dm755 target/release/stratosync "$pkgdir/usr/bin/stratosync"
     install -Dm644 contrib/systemd/stratosyncd.service "$pkgdir/usr/lib/systemd/user/stratosyncd.service"
-    install -Dm644 contrib/nautilus/stratosync_nautilus.py "$pkgdir/usr/share/nautilus-python/extensions/stratosync_nautilus.py"
+    # File manager extensions (Nautilus / Nemo / Caja). The shared helper
+    # is duplicated into each FM's extension directory because each
+    # loader can only see its own.
+    for fm in nautilus nemo caja; do
+        install -Dm644 "contrib/file-managers/common/stratosync_fm_common.py" \
+            "$pkgdir/usr/share/${fm}-python/extensions/stratosync_fm_common.py"
+    done
+    install -Dm644 contrib/file-managers/nautilus/stratosync_nautilus.py "$pkgdir/usr/share/nautilus-python/extensions/stratosync_nautilus.py"
+    install -Dm644 contrib/file-managers/nemo/stratosync_nemo.py         "$pkgdir/usr/share/nemo-python/extensions/stratosync_nemo.py"
+    install -Dm644 contrib/file-managers/caja/stratosync_caja.py         "$pkgdir/usr/share/caja-python/extensions/stratosync_caja.py"
     install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
     install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
 }

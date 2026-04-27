@@ -10,7 +10,15 @@ override_dh_auto_install:
 	install -Dm755 target/release/stratosyncd $(CURDIR)/debian/stratosync/usr/bin/stratosyncd
 	install -Dm755 target/release/stratosync $(CURDIR)/debian/stratosync/usr/bin/stratosync
 	install -Dm644 contrib/systemd/stratosyncd.service $(CURDIR)/debian/stratosync/usr/lib/systemd/user/stratosyncd.service
-	install -Dm644 contrib/nautilus/stratosync_nautilus.py $(CURDIR)/debian/stratosync/usr/share/nautilus-python/extensions/stratosync_nautilus.py
+	# File manager extensions (Nautilus / Nemo / Caja). The shared helper
+	# is duplicated into each FM's extension directory because each
+	# loader can only see its own.
+	install -Dm644 contrib/file-managers/common/stratosync_fm_common.py     $(CURDIR)/debian/stratosync/usr/share/nautilus-python/extensions/stratosync_fm_common.py
+	install -Dm644 contrib/file-managers/nautilus/stratosync_nautilus.py    $(CURDIR)/debian/stratosync/usr/share/nautilus-python/extensions/stratosync_nautilus.py
+	install -Dm644 contrib/file-managers/common/stratosync_fm_common.py     $(CURDIR)/debian/stratosync/usr/share/nemo-python/extensions/stratosync_fm_common.py
+	install -Dm644 contrib/file-managers/nemo/stratosync_nemo.py            $(CURDIR)/debian/stratosync/usr/share/nemo-python/extensions/stratosync_nemo.py
+	install -Dm644 contrib/file-managers/common/stratosync_fm_common.py     $(CURDIR)/debian/stratosync/usr/share/caja-python/extensions/stratosync_fm_common.py
+	install -Dm644 contrib/file-managers/caja/stratosync_caja.py            $(CURDIR)/debian/stratosync/usr/share/caja-python/extensions/stratosync_caja.py
 
 override_dh_auto_test:
 	cargo test --workspace
