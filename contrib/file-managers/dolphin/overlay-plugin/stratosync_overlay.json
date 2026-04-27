@@ -1,0 +1,19 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Stratosync Project"
+            }
+        ],
+        "Description": "Sync-status emblem overlays for stratosync-managed files in Dolphin and Konqueror.",
+        "Description[en_US]": "Sync-status emblem overlays for stratosync-managed files in Dolphin and Konqueror.",
+        "License": "MIT or Apache-2.0",
+        "Name": "Stratosync Sync Status Overlays",
+        "Name[en_US]": "Stratosync Sync Status Overlays",
+        "ServiceTypes": [
+            "KOverlayIconPlugin"
+        ],
+        "Version": "0.12.0",
+        "Website": "https://github.com/dmcbane/stratosync"
+    }
+}

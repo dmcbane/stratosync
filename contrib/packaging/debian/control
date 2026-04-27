@@ -2,7 +2,15 @@ Source: stratosync
 Section: utils
 Priority: optional
 Maintainer: Dale McBane <noreply@example.com>
-Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.80), libfuse3-dev, pkg-config
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.80),
+               libfuse3-dev,
+               pkg-config,
+               cmake,
+               extra-cmake-modules,
+               qt6-base-dev,
+               libkf6kio-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/dmcbane/stratosync
 
@@ -16,3 +24,12 @@ Description: Linux cloud sync daemon with on-demand FUSE3 filesystem
  70+ cloud storage providers. Files appear immediately with metadata-only
  placeholders, hydrate on open(), and uploads propagate automatically with
  conflict detection and 3-way merge resolution.
+
+Package: stratosync-dolphin-overlay
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, stratosync (= ${binary:Version})
+Enhances: dolphin
+Description: Sync-status emblem overlays for Dolphin and Konqueror
+ KOverlayIconPlugin (KF6) that adds sync-status emblem overlays in Dolphin
+ and Konqueror, matching the Nautilus / Nemo / Caja Python extensions.
+ Pulls in KF6 KIO at runtime — install only on KDE Plasma desktops.

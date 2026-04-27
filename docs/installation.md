@@ -101,7 +101,7 @@ menu actions** (Pin, Unpin, Resolve conflict) are available everywhere.
 | Nautilus | GNOME | yes | yes | `python3-nautilus` |
 | Nemo | Cinnamon | yes | yes | `python3-nemo` |
 | Caja | MATE | yes | yes | `python3-caja` |
-| Dolphin / Konqueror | KDE | — | yes | none |
+| Dolphin / Konqueror | KDE | yes | yes | KF6 KIO at runtime (separate subpackage) |
 | PCManFM / PCManFM-Qt | LXDE / LXQt | — | yes | none |
 | Thunar | XFCE | — | yes | none (manual UCA merge) |
 
@@ -127,7 +127,7 @@ cp contrib/file-managers/nautilus/stratosync_nautilus.py   ~/.local/share/nautil
 nautilus -q
 ```
 
-Dolphin / Konqueror — single ServiceMenu file:
+Dolphin / Konqueror — single ServiceMenu file (context-menu actions):
 
 ```bash
 mkdir -p ~/.local/share/kio/servicemenus
@@ -135,6 +135,28 @@ install -m 755 contrib/file-managers/dolphin/stratosync.desktop \
     ~/.local/share/kio/servicemenus/
 # Restart Dolphin
 ```
+
+Dolphin / Konqueror emblem-overlay plugin (KF6 C++) — opt-in, separate
+build. Needs `cmake`, `extra-cmake-modules`, `qt6-base-dev`, `libkf6kio-dev`
+(or the equivalent Fedora/Arch packages — see
+[`overlay-plugin/README.md`](../contrib/file-managers/dolphin/overlay-plugin/README.md)):
+
+```bash
+cd contrib/file-managers/dolphin/overlay-plugin
+cmake -B build -S .
+cmake --build build
+sudo cmake --install build           # system-wide
+# OR per-user:
+cmake -B build -S . \
+    -DCMAKE_INSTALL_PREFIX=$HOME/.local \
+    -DKDE_INSTALL_PLUGINDIR=$HOME/.local/lib/qt6/plugins
+cmake --build build && cmake --install build
+```
+
+`install.sh` does this automatically when `kf6-kio-devel` /
+`libkf6kio-dev` is present; skips silently otherwise. The `.deb`/`.rpm`
+ship a separate `stratosync-dolphin-overlay` package — install only on
+KDE.
 
 PCManFM / PCManFM-Qt — five action files:
 

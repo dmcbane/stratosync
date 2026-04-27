@@ -206,6 +206,51 @@ if [[ -f "$DOLPHIN_SRC" ]]; then
     echo "✓ Dolphin/Konqueror service menu installed (restart Dolphin)"
 fi
 
+# Dolphin (KDE) — emblem-overlay plugin (KF6 KOverlayIconPlugin, real C++).
+# Opt-in: only built when KF6 KIO devel headers are present, since this
+# pulls in extra-cmake-modules, qt6-base-dev, and kf6-kio-dev. Skipping is
+# fine — Dolphin still gets context-menu actions via the ServiceMenu above.
+OVERLAY_DIR="${REPO_DIR}/contrib/file-managers/dolphin/overlay-plugin"
+have_kf6_kio_devel() {
+    # KF6KIOConfig.cmake is the headline file shipped by kf6-kio-devel /
+    # libkf6kio-dev. Probe a couple of common multilib paths.
+    local p
+    for p in /usr/lib64/cmake/KF6KIO /usr/lib/cmake/KF6KIO \
+             /usr/lib/x86_64-linux-gnu/cmake/KF6KIO \
+             /usr/lib/aarch64-linux-gnu/cmake/KF6KIO; do
+        [[ -f "$p/KF6KIOConfig.cmake" ]] && return 0
+    done
+    return 1
+}
+if [[ -f "${OVERLAY_DIR}/CMakeLists.txt" ]] && command -v cmake &>/dev/null; then
+    if have_kf6_kio_devel; then
+        echo "Building Dolphin emblem-overlay plugin (KF6)..."
+        OVERLAY_BUILD="${OVERLAY_DIR}/build"
+        # Per-user install: CMAKE_INSTALL_PREFIX=$HOME/.local. KIO scans
+        # $QT_PLUGIN_PATH and the standard system paths; we still need to
+        # get the plugin onto one of those, so per-user installs end up at
+        # $HOME/.local/lib/qt6/plugins/kf6/overlayicon and the user has to
+        # add that to their session env.
+        if cmake -B "$OVERLAY_BUILD" -S "$OVERLAY_DIR" \
+                -DCMAKE_INSTALL_PREFIX="${HOME}/.local" \
+                -DKDE_INSTALL_PLUGINDIR="${HOME}/.local/lib/qt6/plugins" \
+                &>"${OVERLAY_BUILD}.log" \
+            && cmake --build "$OVERLAY_BUILD" &>>"${OVERLAY_BUILD}.log" \
+            && cmake --install "$OVERLAY_BUILD" &>>"${OVERLAY_BUILD}.log"; then
+            echo "✓ Dolphin emblem plugin installed → ${HOME}/.local/lib/qt6/plugins/kf6/overlayicon/"
+            if [[ ":${QT_PLUGIN_PATH:-}:" != *":${HOME}/.local/lib/qt6/plugins:"* ]]; then
+                echo "  NOTE: add to your session env (e.g. ~/.config/plasma-workspace/env/)"
+                echo "    export QT_PLUGIN_PATH=\"\$HOME/.local/lib/qt6/plugins:\${QT_PLUGIN_PATH:-}\""
+            fi
+        else
+            echo "  Dolphin emblem plugin failed to build — see ${OVERLAY_BUILD}.log"
+        fi
+    else
+        echo "  Dolphin emblem plugin available but KF6 KIO devel headers not found — skipping"
+        echo "  Install: dnf install kf6-kio-devel extra-cmake-modules  (or apt install libkf6kio-dev extra-cmake-modules)"
+    fi
+fi
+
 # PCManFM / PCManFM-Qt — FreeDesktop file-manager Actions spec
 PCMANFM_ACTIONS_DIR="${HOME}/.local/share/file-manager/actions"
 PCMANFM_SRC_DIR="${REPO_DIR}/contrib/file-managers/pcmanfm"
