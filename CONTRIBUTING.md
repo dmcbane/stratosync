@@ -110,6 +110,13 @@ The **upload model**: writes go to the local cache file immediately. A debounced
 - [x] Phase 4: Performance & UX (pin/unpin, range hydration, prefetch, WebDAV sidecar, Nautilus extension, tray indicator, packaging)
 - [ ] Phase 5: Selective sync, bandwidth scheduling, Prometheus metrics
 
+## Releasing
+
+Releases are tag-driven — push a `v*` tag and `.github/workflows/release.yml`
+builds the multi-arch packages and creates the GitHub Release. Full
+walkthrough including the recovery path for botched releases:
+**[docs/RELEASING.md](docs/RELEASING.md)**.
+
 ## Dependency version notes
 
 This project deliberately pins some versions for Rust 1.75 compatibility in CI:
