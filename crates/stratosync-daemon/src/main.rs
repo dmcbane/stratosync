@@ -30,6 +30,38 @@ use state::{DaemonState, MountHandle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle informational flags before any side effects (config load, DB
+    // open, FUSE mount). Hand-rolled because the daemon has no other CLI
+    // surface — pulling in clap for two flags would be overkill. The
+    // unknown-arg branch is the important one: previously, invoking
+    // `stratosyncd --version` (or any unknown flag) silently fell through
+    // to the daemon startup, which produced confusing mount-conflict
+    // behaviour against an already-running unit.
+    let mut args = std::env::args().skip(1);
+    if let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("stratosyncd {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!("stratosyncd {} — stratosync cloud sync daemon", env!("CARGO_PKG_VERSION"));
+                println!();
+                println!("Usage: stratosyncd [--version | --help]");
+                println!();
+                println!("This daemon takes no command-line arguments. Configuration is read from");
+                println!("~/.config/stratosync/config.toml (override via STRATOSYNC_CONFIG env var).");
+                println!("For service control, use `stratosync daemon …` or `systemctl --user`.");
+                return Ok(());
+            }
+            other => {
+                eprintln!("stratosyncd: unknown argument '{other}'");
+                eprintln!("This daemon takes no command-line arguments. Try --help.");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let config_path = std::env::var("STRATOSYNC_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| stratosync_core::config::default_config_path());
