@@ -116,11 +116,16 @@ jobs:
           RPM_ARCH="${{ matrix.arch_label }}"
           # RPM uses aarch64 not arm64
           VERSION="${{ steps.version.outputs.version }}"
+          # RPM forbids `-` in Version: (reserved as Version-Release separator).
+          # Substitute with `~`, RPM's pre-release sort marker —
+          # `0.12.0~beta.1` sorts BEFORE `0.12.0`, which is the correct
+          # ordering for a beta vs the eventual final release.
+          RPM_VERSION="${VERSION//-/\~}"
 
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
 
           # Create the installed file tree directly in BUILDROOT
-          BROOT="rpmbuild/BUILDROOT/stratosync-${VERSION}-1.${RPM_ARCH}"
+          BROOT="rpmbuild/BUILDROOT/stratosync-${RPM_VERSION}-1.${RPM_ARCH}"
           mkdir -p "$BROOT/usr/bin"
           mkdir -p "$BROOT/usr/lib/systemd/user"
           mkdir -p "$BROOT/usr/share/nautilus-python/extensions"
@@ -166,7 +171,7 @@ jobs:
           /usr/share/doc/stratosync/CHANGELOG.md
           SPEC
           sed -i 's/^          //' rpmbuild/SPECS/stratosync.spec
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" rpmbuild/SPECS/stratosync.spec
+          sed -i "s/VERSION_PLACEHOLDER/${RPM_VERSION}/" rpmbuild/SPECS/stratosync.spec
 
           rpmbuild --define "_topdir $(pwd)/rpmbuild" \
                    --define "_rpmdir $(pwd)/rpmbuild/RPMS" \
@@ -174,7 +179,7 @@ jobs:
                    -bb rpmbuild/SPECS/stratosync.spec
 
           # Move RPM to predictable location
-          find rpmbuild/RPMS -name "*.rpm" -exec cp {} "stratosync-${VERSION}-1.${RPM_ARCH}.rpm" \;
+          find rpmbuild/RPMS -name "*.rpm" -exec cp {} "stratosync-${RPM_VERSION}-1.${RPM_ARCH}.rpm" \;
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
