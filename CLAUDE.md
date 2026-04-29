@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Stratosync is a Linux cloud sync daemon providing on-demand virtual filesystem via FUSE3, with multi-backend support through rclone. Files appear immediately with metadata-only placeholders, hydrate on `open()`, and uploads propagate automatically with conflict detection.
 
-**Status**: Pre-alpha (v0.12.0, unreleased). Phases 1-4 complete; Phase 5 in progress. Phase 4 (released in v0.11.0): pin/unpin for offline, range-read fast path, readdir prefetch, Nautilus emblem extension, system tray indicator (`stratosync-tray`), WebDAV sidecar backend (`rclone serve webdav`), distribution packaging (deb/rpm/AUR). v0.12.0 dev cycle adds: dashboard TUI (`stratosync dashboard`), conflicts cleanup CLI, conflict-namespace isolation under `.stratosync-conflicts/`, and selective sync via per-mount `ignore_patterns` (Phase 5 item 1).
+**Status**: Beta (v0.12.0-beta.1). Phases 1–6 functionally complete; encrypted caching is the only Phase 5 item deferred (to v0.13.0+). v0.11.0 was the last alpha release. v0.12.0-beta.1 adds: dashboard TUI (`stratosync dashboard`), file versioning (`stratosync versions`), selective sync via per-mount `ignore_patterns`, bandwidth scheduling, Prometheus `/metrics`, multi-FM integration (Nemo / Caja extensions and Dolphin emblem-overlay plugin alongside the existing Nautilus extension; KDE/Thunar/PCManFM context-menu actions), conflicts cleanup CLI, conflict-namespace isolation under `.stratosync-conflicts/`, and the `stratosync daemon` subcommand wrapping `systemctl --user` / `journalctl`.
 
 ## Build & Test Commands
 
@@ -33,10 +33,12 @@ cargo run -p stratosync-cli -- status              # sync status across mounts
 cargo run -p stratosync-cli -- ls [path]            # list remote contents
 cargo run -p stratosync-cli -- config show|test|edit
 cargo run -p stratosync-cli -- conflicts            # list conflict files
-cargo run -p stratosync-cli -- pin <path>            # (stub) pin for offline
-cargo run -p stratosync-cli -- unpin <path>          # (stub) remove pin
+cargo run -p stratosync-cli -- pin <path>            # download + lock for offline use
+cargo run -p stratosync-cli -- unpin <path>          # release the offline lock
+cargo run -p stratosync-cli -- daemon status         # systemctl/journalctl wrapper
+cargo run -p stratosync-cli -- daemon logs --follow
 ```
-The CLI binary is `stratosync`. There is no `init` or `daemon` subcommand — the README's old Quick Start was wrong.
+The CLI binary is `stratosync`. There is no `init` subcommand. `daemon` *is* a real subcommand (added in v0.12.0-beta.1) — it's a thin wrapper over `systemctl --user` / `journalctl` for the `stratosyncd.service` user unit, not a way to run the daemon in-process.
 
 ## Architecture
 
@@ -62,9 +64,14 @@ The CLI binary is `stratosync`. There is no `init` or `daemon` subcommand — th
 
 ## Dependency Pinning
 
-Several deps are pinned for Rust 1.75 CI compatibility:
-- `clap = "=4.5.57"` (4.6+ needs edition2024)
-- `toml = "=0.7.2"`, `toml_edit = "=0.19.9"` (later versions pull indexmap 2.12+ → Rust 1.82)
-- `fuser = "0.14"` (0.15+ pulls clap as non-dev dep)
+Project MSRV is **Rust 1.80** (declared in `install.sh` and the Prerequisites
+section above). CI uses `dtolnay/rust-toolchain@stable`, which floats well
+above the MSRV; the pins below exist to keep the build working *for users*
+on a 1.80 toolchain, not to keep CI happy.
 
-Remove all pins when CI moves to Rust 1.85+.
+- `clap = "=4.5.57"` — 4.6+ requires `edition2024` (Rust 1.85)
+- `toml = "=0.7.2"`, `toml_edit = "=0.19.9"` — later versions pull `indexmap` 2.12+ which needs Rust 1.82
+- `fuser = "0.14"` — 0.15+ adds `clap` as a non-dev dep, which collides with our `clap` pin's exact-version resolution. Not MSRV-driven, but unpinning needs the `clap` pin lifted first.
+
+Bumping MSRV to 1.85 (planned for v0.13.0+) lifts every constraint above and
+the pins can come out together.
