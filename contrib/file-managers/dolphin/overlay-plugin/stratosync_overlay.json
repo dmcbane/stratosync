@@ -13,7 +13,7 @@
         "ServiceTypes": [
             "KOverlayIconPlugin"
         ],
-        "Version": "0.12.0",
+        "Version": "0.12.0-beta.1",
         "Website": "https://github.com/dmcbane/stratosync"
     }
 }

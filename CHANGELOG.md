@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.12.0] - unreleased
+## [0.12.0-beta.1] - 2026-04-29
 
 ### Added
 - **Dolphin emblem-overlay plugin (KF6)**: new `KOverlayIconPlugin` C++
