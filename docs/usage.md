@@ -315,16 +315,28 @@ for the full series list.
 
 ## Systemd operations
 
-Daily commands, for reference:
+Daily commands, via the `stratosync daemon` wrapper (and the raw
+`systemctl --user` / `journalctl` equivalents):
 
 ```bash
-systemctl --user start stratosyncd       # start
-systemctl --user stop stratosyncd        # stop (unmounts cleanly)
-systemctl --user restart stratosyncd     # pick up config changes
-systemctl --user status stratosyncd      # is it running?
-journalctl --user -u stratosyncd -f      # follow live logs
-journalctl --user -u stratosyncd --since "1 hour ago"
+stratosync daemon start                  # systemctl --user start stratosyncd
+stratosync daemon stop                   # systemctl --user stop stratosyncd  (unmounts cleanly)
+stratosync daemon restart                # systemctl --user restart stratosyncd  (pick up config changes)
+stratosync daemon status                 # systemctl --user status stratosyncd
+stratosync daemon logs --follow          # journalctl --user-unit=stratosyncd.service -f
+stratosync daemon logs -n 500            # last 500 lines
 ```
+
+The wrapper is just a convenience — every command above has an exact
+`systemctl --user …` / `journalctl …` equivalent. One important nit on the
+log form: the wrapper uses `journalctl --user-unit=stratosyncd.service`,
+**not** `journalctl --user -u stratosyncd`. The latter reads from the
+per-user journal file, which doesn't exist on systems where journald has
+no persistent storage (`/var/log/journal/` missing). On those systems
+`--user -u …` reports "No journal files were found" even though the
+daemon is logging fine into the system journal. See the [installation
+guide](installation.md#option-a-systemd-recommended-for-daily-use) for
+the one-time sudo recipe to enable persistent journals.
 
 The daemon performs `fusermount3 -u <mount_path>` for every active mount on
 clean shutdown. If a mount is stuck after a crash:
@@ -338,7 +350,7 @@ fusermount3 -u ~/GoogleDrive
 ## Troubleshooting
 
 **The mount appears empty.** First poll hasn't completed yet — give it
-`poll_interval` seconds. After that, `journalctl --user -u stratosyncd | tail`
+`poll_interval` seconds. After that, `journalctl --user-unit=stratosyncd.service | tail`
 will show backend errors (auth, network, quota).
 
 **`Operation not permitted` on `mkdir` or `touch`.** Either `ignore_patterns`

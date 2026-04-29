@@ -49,6 +49,11 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Control the stratosyncd user service (wraps `systemctl --user`)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// File version history — list and restore prior versions of a file
     Versions {
         #[command(subcommand)]
@@ -65,6 +70,41 @@ enum ConfigAction {
     Show,
     Test,
     Edit,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (systemctl --user start stratosyncd)
+    Start,
+    /// Stop the daemon (systemctl --user stop stratosyncd)
+    Stop,
+    /// Restart the daemon (systemctl --user restart stratosyncd)
+    Restart,
+    /// Reload the daemon if supported, otherwise restart
+    Reload,
+    /// Show systemd unit status (systemctl --user status stratosyncd)
+    Status,
+    /// Enable the daemon to start on login
+    Enable {
+        /// Also start the daemon now
+        #[arg(long)]
+        now: bool,
+    },
+    /// Disable autostart on login
+    Disable {
+        /// Also stop the daemon now
+        #[arg(long)]
+        now: bool,
+    },
+    /// Show daemon logs (journalctl --user -u stratosyncd)
+    Logs {
+        /// Follow the journal in real time
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of trailing lines to show (default 200 unless --follow)
+        #[arg(short = 'n', long)]
+        lines: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -159,6 +199,17 @@ async fn main() -> Result<()> {
         }
         Command::Dashboard { once } => {
             commands::dashboard::run(&config_path, once).await?;
+        }
+        Command::Daemon { action } => match action {
+            DaemonAction::Start            => commands::daemon::start()?,
+            DaemonAction::Stop             => commands::daemon::stop()?,
+            DaemonAction::Restart          => commands::daemon::restart()?,
+            DaemonAction::Reload           => commands::daemon::reload()?,
+            DaemonAction::Status           => commands::daemon::status()?,
+            DaemonAction::Enable { now }   => commands::daemon::enable(now)?,
+            DaemonAction::Disable { now }  => commands::daemon::disable(now)?,
+            DaemonAction::Logs { follow, lines } =>
+                commands::daemon::logs(follow, lines)?,
         }
         Command::Versions { action } => match action {
             VersionsAction::List { path } =>

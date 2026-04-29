@@ -218,15 +218,33 @@ This verifies that every enabled mount's rclone remote is reachable.
 ### Option A: systemd (recommended for daily use)
 
 ```bash
-systemctl --user enable --now stratosyncd
-systemctl --user status stratosyncd      # check it's running
-journalctl --user -u stratosyncd -f      # follow logs
+stratosync daemon enable --now           # start now and on every login
+stratosync daemon status                 # check it's running
+stratosync daemon logs --follow          # follow logs
 ```
+
+The `stratosync daemon` subcommand is a thin wrapper over `systemctl --user`
+and `journalctl --user-unit=…` for the `stratosyncd.service` unit; the raw
+`systemctl --user enable --now stratosyncd` etc. work just as well.
 
 > **Don't enable `PrivateTmp=true` or `NoNewPrivileges=true` in the unit file.**
 > `PrivateTmp` creates a private mount namespace that hides the FUSE mount from
 > every other process; `NoNewPrivileges` blocks the setuid `fusermount3` binary
 > from performing the mount. The shipped service unit intentionally omits both.
+
+> **Journal storage gotcha.** If `/var/log/journal/` doesn't exist on your
+> system, journald is in volatile mode: per-user services log fine, but their
+> entries land in the system journal rather than a per-user journal file.
+> That makes the common `journalctl --user -u stratosyncd` form report
+> "No journal files were found", which is misleading — the logs are flowing,
+> just not where that command looks. `stratosync daemon logs` (and
+> `journalctl --user-unit=stratosyncd.service`) work either way. To enable
+> persistent journals so both forms work and logs survive reboots:
+> ```bash
+> sudo mkdir -p /var/log/journal
+> sudo systemd-tmpfiles --create --prefix /var/log/journal
+> sudo systemctl restart systemd-journald
+> ```
 
 ### Option B: foreground (for development / debugging)
 
@@ -247,7 +265,7 @@ For day-to-day commands (`status`, `dashboard`, `conflicts`, `pin`, `versions`, 
 ## Uninstalling
 
 ```bash
-systemctl --user disable --now stratosyncd
+stratosync daemon disable --now       # or: systemctl --user disable --now stratosyncd
 fusermount3 -u ~/GoogleDrive          # unmount each configured mount
 rm -rf ~/.config/stratosync ~/.cache/stratosync ~/.local/share/stratosync
 

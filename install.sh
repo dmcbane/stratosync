@@ -140,9 +140,9 @@ if [[ "$INSTALL_SERVICE" == "true" ]]; then
         systemctl --user enable stratosyncd.service
         echo "✓ Systemd user service installed and enabled"
         echo ""
-        echo "To start now:    systemctl --user start stratosyncd"
-        echo "To check status: systemctl --user status stratosyncd"
-        echo "To view logs:    journalctl --user -u stratosyncd -f"
+        echo "To start now:    stratosync daemon start          (or: systemctl --user start stratosyncd)"
+        echo "To check status: stratosync daemon status         (or: systemctl --user status stratosyncd)"
+        echo "To view logs:    stratosync daemon logs --follow  (or: journalctl --user-unit=stratosyncd.service -f)"
     else
         echo "✓ Systemd unit installed at ${SYSTEMD_DIR}/stratosyncd.service"
         echo "  (systemctl not available — enable manually)"
@@ -279,6 +279,24 @@ if [[ -f "$FUSE_CONF" ]] && ! grep -q "^user_allow_other" "$FUSE_CONF"; then
     echo "to ${FUSE_CONF} (requires sudo), then set allow_other=true in config."
 fi
 
+# ── Journal persistence ───────────────────────────────────────────────────────
+# Without /var/log/journal, journald runs in volatile mode: logs live in
+# tmpfs and the per-user journal file isn't created. `journalctl --user -u
+# stratosyncd` then reports "No journal files were found" even though logs
+# are flowing into the system journal. The `stratosync daemon logs` wrapper
+# uses `--user-unit=` and works in either mode, but persistent storage is
+# usually what people actually want.
+if [[ ! -d /var/log/journal ]]; then
+    echo ""
+    echo "OPTIONAL: journald has no persistent storage on this system."
+    echo "  Logs are wiped on reboot, and 'journalctl --user -u stratosyncd'"
+    echo "  will report no entries (use 'stratosync daemon logs' instead, which"
+    echo "  works regardless). To enable persistent journals (requires sudo):"
+    echo "    sudo mkdir -p /var/log/journal"
+    echo "    sudo systemd-tmpfiles --create --prefix /var/log/journal"
+    echo "    sudo systemctl restart systemd-journald"
+fi
+
 # ── Shell completions ────────────────────────────────────────────────────────
 echo ""
 echo "Shell completions (recommended):"
@@ -309,5 +327,5 @@ echo "Quick start:"
 echo "  1. Configure a cloud remote:  rclone config"
 echo "  2. Edit config:               \$EDITOR ${CONFIG_DIR}/config.toml"
 echo "  3. Test connectivity:         stratosync config test"
-echo "  4. Start daemon:              systemctl --user start stratosyncd"
+echo "  4. Start daemon:              stratosync daemon start"
 echo "  5. Check status:              stratosync status"
