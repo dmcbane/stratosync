@@ -67,7 +67,8 @@ jobs:
           cp target/${{ matrix.target }}/release/stratosync "$DIST/"
           cp target/${{ matrix.target }}/release/stratosync-tray "$DIST/" 2>/dev/null || true
           cp contrib/systemd/stratosyncd.service "$DIST/"
-          cp contrib/nautilus/stratosync_nautilus.py "$DIST/"
+          cp contrib/file-managers/nautilus/stratosync_nautilus.py "$DIST/"
+          cp contrib/file-managers/common/stratosync_fm_common.py "$DIST/"
           cp contrib/desktop/stratosync-tray.desktop "$DIST/"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$DIST/"
           tar czf "$DIST.tar.gz" "$DIST"
@@ -85,7 +86,8 @@ jobs:
           cp target/${{ matrix.target }}/release/stratosync deb-root/usr/bin/
           cp target/${{ matrix.target }}/release/stratosync-tray deb-root/usr/bin/ 2>/dev/null || true
           cp contrib/systemd/stratosyncd.service deb-root/usr/lib/systemd/user/
-          cp contrib/nautilus/stratosync_nautilus.py deb-root/usr/share/nautilus-python/extensions/
+          cp contrib/file-managers/nautilus/stratosync_nautilus.py deb-root/usr/share/nautilus-python/extensions/
+          cp contrib/file-managers/common/stratosync_fm_common.py deb-root/usr/share/nautilus-python/extensions/
           cp contrib/desktop/stratosync-tray.desktop deb-root/usr/share/applications/ 2>/dev/null || true
 
           cat > deb-root/DEBIAN/control << CTRL
@@ -130,7 +132,8 @@ jobs:
           cp target/${{ matrix.target }}/release/stratosync "$BROOT/usr/bin/"
           cp target/${{ matrix.target }}/release/stratosync-tray "$BROOT/usr/bin/" 2>/dev/null || true
           cp contrib/systemd/stratosyncd.service "$BROOT/usr/lib/systemd/user/"
-          cp contrib/nautilus/stratosync_nautilus.py "$BROOT/usr/share/nautilus-python/extensions/"
+          cp contrib/file-managers/nautilus/stratosync_nautilus.py "$BROOT/usr/share/nautilus-python/extensions/"
+          cp contrib/file-managers/common/stratosync_fm_common.py "$BROOT/usr/share/nautilus-python/extensions/"
           cp contrib/desktop/stratosync-tray.desktop "$BROOT/usr/share/applications/" 2>/dev/null || true
           cp LICENSE-MIT LICENSE-APACHE "$BROOT/usr/share/licenses/stratosync/"
           cp README.md CHANGELOG.md "$BROOT/usr/share/doc/stratosync/"
@@ -155,6 +158,7 @@ jobs:
           /usr/bin/stratosync-tray
           /usr/lib/systemd/user/stratosyncd.service
           /usr/share/nautilus-python/extensions/stratosync_nautilus.py
+          /usr/share/nautilus-python/extensions/stratosync_fm_common.py
           /usr/share/applications/stratosync-tray.desktop
           /usr/share/licenses/stratosync/LICENSE-MIT
           /usr/share/licenses/stratosync/LICENSE-APACHE
