@@ -30,15 +30,30 @@ All notable changes to this project will be documented in this file.
   `fuser`'s `abi-7-12` feature exposes `inval_inode`. Nautilus picked
   up the changes via inotify regardless; Dolphin/KIO needed the
   explicit kernel-cache invalidation.
-- **Defensive readdir dedup**: in `fuse::readdir`, hide rows that share
-  `(parent_inode, name)` with a sibling — keep only the lowest-inode
-  row, matching what `lookup` already returns. The kernel's stale
-  readdir cache used to hide such phantoms, so the post-mutation
-  `inval_inode` from this release exposed them. Logs a warning when it
-  fires so leftover dupes from earlier versions can be surfaced and
-  cleaned up. The latent insert path that produces these rows is still
-  under investigation; this guard preserves user-visible consistency
-  while we trace it.
+- **OneDrive duplicate folders at the root of the mount**: the OneDrive
+  delta provider's `resolve_item_path` only stripped the `/drive/root:`
+  form of `parentReference.path`. Microsoft Graph also returns
+  `/drives/{drive_id}/root:/...` for non-default drives (SharePoint,
+  business OneDrive with a `drive_id` configured). Items from the
+  second form fell through to a raw passthrough and got persisted as
+  e.g. `drives/4139BC84D0721EB5/root:/test`. The rclone poller
+  meanwhile reported the same item with the clean `test`, so the
+  `(mount_id, remote_path)` UNIQUE didn't catch the collision and the
+  DB ended up with two rows per affected entry. Pre-v0.12.1 the
+  kernel readdir cache happened to hide the duplicates; v0.12.1's
+  post-mutation `inval_inode` exposed them. Two changes:
+   - `resolve_item_path` now strips both forms via a shared
+     `strip_onedrive_root_prefix` helper.
+   - Migration `0006_dedupe_file_index.sql` collapses any existing
+     duplicates (lowest inode wins; child rows reparented onto it) and
+     adds a partial `UNIQUE(mount_id, parent_inode, name)` index so
+     future writes can't reintroduce the bug. Runs automatically on
+     daemon startup.
+- **Defensive readdir dedup** (belt-and-suspenders): `fuse::readdir`
+  also hides any in-memory rows that share `(parent_inode, name)` with
+  a sibling — lowest inode wins, matching what `lookup` returns. With
+  migration 0006 in place this should never fire in practice; if it
+  does, the warning log surfaces it for follow-up.
 
 ## [0.12.0-beta.1] - 2026-04-29
 

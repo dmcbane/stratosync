@@ -557,12 +557,23 @@ impl OneDriveDelta {
         }
     }
 
+    // (helper `strip_onedrive_root_prefix` defined below the impl block)
+
     /// Convert a OneDrive item's parentReference.path to a relative path
     /// within our mount root.
     ///
-    /// OneDrive paths look like: `/drive/root:/Documents/Sub`
-    /// We strip the `/drive/root:` prefix, then check if the result is
-    /// under our `root_path`. Returns `None` if outside our root.
+    /// Microsoft Graph returns the parent path in two equivalent forms
+    /// depending on how the drive is being addressed:
+    ///   - `/drive/root:/Documents/Sub`               — default drive
+    ///   - `/drives/{drive_id}/root:/Documents/Sub`   — specific drive
+    ///     (SharePoint, business OneDrive with a `drive_id`)
+    /// Both must collapse to the same relative path. Pre-fix we only
+    /// handled the first form; items from the second slipped through
+    /// and got stored with the raw `drives/{id}/root:/…` path. Since
+    /// the rclone poller reported the *same* item with its clean
+    /// relative path, the DB ended up with two rows per entry and
+    /// directories duplicated in the listing. Returns `None` if outside
+    /// our `root_path`.
     fn resolve_item_path(&self, item: &OneDriveItem) -> Option<String> {
         // Items without a name (rare, but they exist on the delta channel)
         // can't be turned into a path; skip them upstream.
@@ -572,15 +583,16 @@ impl OneDriveDelta {
         let parent_path = match item.parent_reference.as_ref() {
             Some(pr) => {
                 let raw = pr.path.as_deref().unwrap_or("");
-                // Strip the "/drive/root:" prefix that OneDrive always includes
-                if let Some(rest) = raw.strip_prefix("/drive/root:") {
-                    rest.to_string()
-                } else if raw == "/drive/root" {
-                    // Item is directly in the root
-                    String::new()
-                } else {
-                    // Unexpected format — try as-is
-                    raw.to_string()
+                match strip_onedrive_root_prefix(raw) {
+                    Some(rest) => rest,
+                    None => {
+                        warn!(
+                            raw_path = %raw,
+                            "OneDrive parentReference.path has unexpected format; \
+                             passing through unchanged",
+                        );
+                        raw.to_string()
+                    }
                 }
             }
             None => return None, // root item itself
@@ -609,6 +621,36 @@ impl OneDriveDelta {
             }
         }
     }
+}
+
+/// Strip whichever form Microsoft Graph used for the drive-root prefix.
+/// Returns `None` if the path doesn't start with a recognized form, so the
+/// caller can decide whether to log + pass-through or treat it as a hard
+/// error. Recognized forms (with optional trailing `:` before the path):
+///   - `/drive/root[:/...]`              — default drive
+///   - `/drives/{drive_id}/root[:/...]`  — specific drive
+fn strip_onedrive_root_prefix(raw: &str) -> Option<String> {
+    if let Some(rest) = raw.strip_prefix("/drive/root:") {
+        return Some(rest.to_string());
+    }
+    if raw == "/drive/root" {
+        return Some(String::new());
+    }
+    // `/drives/{drive_id}/root[:/...]` — drive_id may contain alphanumerics,
+    // hyphens, exclamation marks (SharePoint), commas, etc.; we don't parse
+    // it, just split on the next `/` after `/drives/`.
+    if let Some(after_drives) = raw.strip_prefix("/drives/") {
+        if let Some(slash_idx) = after_drives.find('/') {
+            let after_id = &after_drives[slash_idx..];
+            if let Some(rest) = after_id.strip_prefix("/root:") {
+                return Some(rest.to_string());
+            }
+            if after_id == "/root" {
+                return Some(String::new());
+            }
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -1330,6 +1372,64 @@ mod tests {
         let item = make_onedrive_item("file.txt", "/drive/root");
         let path = delta.resolve_item_path(&item);
         assert_eq!(path.unwrap(), "file.txt");
+    }
+
+    /// Microsoft Graph returns `parentReference.path` in the form
+    /// `/drives/{drive_id}/root:/...` for non-default drives (SharePoint,
+    /// business OneDrive with a specific drive_id). Pre-fix we only stripped
+    /// `/drive/root:` (singular, no id) and fell through to passing the raw
+    /// string. That meant the same item would land in the DB with a path
+    /// like `drives/4139BC84D0721EB5/root:/test`, while the rclone poller
+    /// reported it as `test` — two rows, identical (parent, name), no
+    /// UNIQUE collision because remote_path differed. Reproducer for the
+    /// duplicate-folder issue at the root of OneDrive mounts.
+    #[test]
+    fn test_onedrive_resolve_drives_id_root_prefix() {
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item(
+            "test",
+            "/drives/4139BC84D0721EB5/root:",
+        );
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(
+            path.as_deref(), Some("test"),
+            "must strip /drives/{{id}}/root: the same way it strips /drive/root:",
+        );
+    }
+
+    #[test]
+    fn test_onedrive_resolve_drives_id_root_nested() {
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item(
+            "report.pdf",
+            "/drives/4139BC84D0721EB5/root:/Documents/Work",
+        );
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.as_deref(), Some("Documents/Work/report.pdf"));
+    }
+
+    #[test]
+    fn test_onedrive_resolve_drives_id_root_no_colon() {
+        // Some Graph responses give the bare `/drives/{id}/root` form when
+        // the parent is the drive root itself.
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item(
+            "file.txt",
+            "/drives/4139BC84D0721EB5/root",
+        );
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.as_deref(), Some("file.txt"));
+    }
+
+    #[test]
+    fn test_onedrive_resolve_drives_id_with_sub_root() {
+        let delta = make_onedrive_delta("/Documents");
+        let item = make_onedrive_item(
+            "report.pdf",
+            "/drives/4139BC84D0721EB5/root:/Documents/Work",
+        );
+        let path = delta.resolve_item_path(&item);
+        assert_eq!(path.as_deref(), Some("Work/report.pdf"));
     }
 
     // ── OneDrive HTTP error mapping tests ────────────────────────────────

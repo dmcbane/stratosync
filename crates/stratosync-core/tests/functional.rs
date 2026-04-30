@@ -372,6 +372,96 @@ async fn upload_completion_does_not_clobber_cache_path_after_rename() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Regression for the OneDrive `/drives/{id}/root:/` path leak that left
+/// two rows per entry in the DB. Migration 0006 must collapse pre-existing
+/// dupes (keeping the lowest inode) and the new partial UNIQUE index must
+/// reject any later attempt to insert a second row with the same
+/// (mount_id, parent_inode, name).
+#[tokio::test]
+async fn migration_dedupes_phantom_rows_and_blocks_future_dupes() {
+    // Build the DB by hand to mirror what an affected v0.12.0 install
+    // would look like just before migrate() runs: two rows for `test`
+    // under root, one with the clean path and one with the
+    // `/drives/{id}/root:/` leak.
+    let db = StateDb::in_memory().unwrap();
+    {
+        let conn = db.raw_conn().await;
+        // Run only the migrations that came before 0006 so we can seed
+        // duplicates (which 0006 itself would forbid). Mark each as
+        // applied so migrate() below only runs 0006.
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version     TEXT PRIMARY KEY,
+                applied_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+                description TEXT
+            );"
+        ).unwrap();
+        for (ver, sql) in [
+            ("0001", include_str!("../src/state/migrations/0001_initial.sql")),
+            ("0002", include_str!("../src/state/migrations/0002_delete_tombstones.sql")),
+            ("0003", include_str!("../src/state/migrations/0003_poll_generation.sql")),
+            ("0004", include_str!("../src/state/migrations/0004_base_versions.sql")),
+            ("0005", include_str!("../src/state/migrations/0005_version_history.sql")),
+        ] {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                rusqlite::params![ver],
+            ).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO mounts (id, name, remote, mount_path, cache_dir)
+             VALUES (1, 't', 'onedrv:/', '/mnt/t', '/tmp/c');
+
+             INSERT INTO file_index (inode, mount_id, parent_inode, name, remote_path, kind, status)
+             VALUES
+               (1,    1, NULL, '/',    '/',                                                'dir', 'remote'),
+               (100,  1, 1,    'test', 'test',                                             'dir', 'cached'),
+               (200,  1, 1,    'test', 'drives/4139BC84D0721EB5/root:/test',               'dir', 'cached'),
+               (300,  1, 200,  'orphan.txt', 'drives/4139BC84D0721EB5/root:/test/orphan.txt', 'file', 'cached');
+            "
+        ).unwrap();
+    }
+
+    // Now run the full migration set, which includes 0006.
+    db.migrate().await.unwrap();
+
+    // The duplicate row 200 must be gone and its child row 300 must
+    // have been reparented onto the keeper (inode 100).
+    let after: Vec<_> = {
+        let conn = db.raw_conn().await;
+        let mut stmt = conn.prepare(
+            "SELECT inode, parent_inode, name, remote_path FROM file_index WHERE mount_id=1 ORDER BY inode"
+        ).unwrap();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, Option<i64>>(1)?.map(|x| x as u64),
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        rows
+    };
+    let test_rows: Vec<_> = after.iter().filter(|r| r.2 == "test").collect();
+    assert_eq!(test_rows.len(), 1, "exactly one `test` row after migration; got {after:?}");
+    assert_eq!(test_rows[0].0, 100, "lowest-inode row is the keeper");
+
+    let orphan = after.iter().find(|r| r.2 == "orphan.txt")
+        .expect("orphan.txt must still exist");
+    assert_eq!(orphan.1, Some(100), "child row must be reparented onto the keeper");
+
+    // Future inserts that would create a (parent, name) dupe must fail
+    // — the new partial UNIQUE index is now in place.
+    let conn = db.raw_conn().await;
+    let result = conn.execute(
+        "INSERT INTO file_index (mount_id, parent_inode, name, remote_path, kind, status)
+         VALUES (1, 1, 'test', 'some/other/path', 'dir', 'remote')",
+        [],
+    );
+    assert!(result.is_err(), "second `test` row under root must violate UNIQUE");
+}
+
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]

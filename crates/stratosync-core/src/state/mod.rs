@@ -865,6 +865,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0003", include_str!("migrations/0003_poll_generation.sql")),
     ("0004", include_str!("migrations/0004_base_versions.sql")),
     ("0005", include_str!("migrations/0005_version_history.sql")),
+    ("0006", include_str!("migrations/0006_dedupe_file_index.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
