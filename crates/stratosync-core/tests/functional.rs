@@ -327,6 +327,51 @@ async fn rename_across_directories() {
     assert!(db.get_by_parent_name(mid,dir_b, "file.txt").await.unwrap().is_some());
 }
 
+/// Regression for the rename-during-upload race observed when Dolphin/
+/// Nautilus copy-overwrite a file via `goutputstream` + `g_file_move`.
+///
+/// `run_upload` snapshots `entry.cache_path` at start. If a FUSE rename
+/// arrives mid-upload, the cache file is moved on disk and the DB row's
+/// `cache_path` is updated to the new path. When the upload completes,
+/// the upload path must NOT write the stale captured path back into the
+/// row — otherwise the next upload trigger reads a path with no file
+/// and fails with "cache file missing".
+#[tokio::test]
+async fn upload_completion_does_not_clobber_cache_path_after_rename() {
+    let (db, mid, root) = setup().await;
+    let tmp = tempdir();
+    let old_cache = tmp.join(".goutputstream-XYZ");
+    let new_cache = tmp.join("Final.mp4");
+    std::fs::write(&new_cache, b"final content").unwrap();
+
+    let inode = insert_file(
+        &db, mid, root, ".goutputstream-XYZ", ".goutputstream-XYZ",
+        SyncStatus::Uploading, Some(old_cache.to_str().unwrap()),
+    ).await;
+
+    // Concurrent rename: cache file moved, DB updated to new path.
+    db.rename_entry(inode, root, "Final.mp4", "Final.mp4", Some(&new_cache))
+        .await.unwrap();
+
+    // Upload finishes — must update status/etag/size without touching cache_path.
+    db.set_uploaded(
+        inode,
+        b"final content".len() as u64,
+        Some("etag-after-upload"),
+        SystemTime::now(),
+        b"final content".len() as u64,
+    ).await.unwrap();
+
+    let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+    assert_eq!(entry.cache_path, Some(new_cache.clone()),
+        "set_uploaded must not overwrite cache_path that a concurrent rename set");
+    assert_eq!(entry.status, SyncStatus::Cached);
+    assert_eq!(entry.etag.as_deref(), Some("etag-after-upload"));
+    assert_eq!(entry.name, "Final.mp4");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]

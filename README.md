@@ -35,7 +35,7 @@ Linux has excellent cloud sync tools, but none that provide all three: **on-dema
 
 ## Status
 
-**Beta (v0.12.0-beta.1).** Phases 1–6 are functionally complete; encrypted cache is deferred to v0.13.0+. Suitable for daily use on personal cloud storage with the usual beta caveats — back up anything irreplaceable. The daemon provides:
+**Beta (v0.12.1).** Phases 1–6 are functionally complete; encrypted cache is deferred to v0.13.0+. Suitable for daily use on personal cloud storage with the usual beta caveats — back up anything irreplaceable. The daemon provides:
 
 - On-demand FUSE3 filesystem with bidirectional sync
 - 3-way text merge for clean conflict resolution; `.conflict.*` siblings under `.stratosync-conflicts/` for everything else

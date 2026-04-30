@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.1] - 2026-04-30
+
+### Fixed
+- **Dolphin: "not enough room on the device" when pasting** — `StratoFs`
+  now implements the FUSE `statfs` callback, returning host-filesystem
+  totals from `statvfs(2)` on the cache directory. Without this the
+  fuser default reported zero blocks/inodes and KIO's copy-job
+  pre-flight refused. Nautilus and `cp` skipped the pre-flight, which
+  is why the symptom was Dolphin-only.
+- **Copy-overwrite via Dolphin/Nautilus failed with "cache file
+  missing: …/.goutputstream-XXX"** — race between `handle_rename` and a
+  concurrent in-flight upload. `run_upload` snapshots `cache_path` at
+  start; if a `g_file_move` rename arrived mid-upload, the cache file
+  moved on disk and the DB row's `cache_path` was updated, but the
+  upload finalizer used `set_cached`, which clobbered the rename's new
+  path back to the stale temp-file path. The next debounced upload
+  trigger then read a phantom path. Added `StateDb::set_uploaded`
+  (status/etag/size/mtime only — leaves `cache_path` alone) and
+  switched the upload finalizer to it. CLI `cp` was unaffected because
+  it doesn't fsync, so there was no overlap between upload and rename.
+- **Dolphin: new folders/files not appearing until you re-enter the
+  parent** — directory mutations (`mkdir`/`create`/`unlink`/`rmdir`/
+  `rename`) now invalidate the kernel's readdir cache for the affected
+  parent inode(s). `mount()` was refactored to use `fuser::Session`
+  directly so a `Notifier` can be plumbed into `StratoFs`; enabling
+  `fuser`'s `abi-7-12` feature exposes `inval_inode`. Nautilus picked
+  up the changes via inotify regardless; Dolphin/KIO needed the
+  explicit kernel-cache invalidation.
+
 ## [0.12.0-beta.1] - 2026-04-29
 
 ### Added

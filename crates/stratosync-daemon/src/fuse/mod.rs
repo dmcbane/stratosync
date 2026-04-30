@@ -6,7 +6,7 @@ pub mod write_ops;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 
@@ -14,7 +14,8 @@ use anyhow::Context;
 use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request,
 };
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
@@ -56,6 +57,28 @@ pub struct StratoFs {
     pub hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
     pub upload_queue:      Arc<UploadQueue>,
     pub ignore:            Arc<GlobSet>,
+    /// Kernel-cache invalidator. Populated once `Session::new` is built —
+    /// before that the slot is empty and any invalidation is a no-op (the
+    /// kernel hasn't cached anything yet anyway). Used after directory
+    /// mutations (mkdir/create/unlink/rmdir/rename) so KIO/Dolphin's
+    /// readdir cache for the parent gets dropped and the new entry shows
+    /// up without the user navigating away and back.
+    pub notifier:          Arc<OnceLock<fuser::Notifier>>,
+}
+
+impl StratoFs {
+    /// Drop the kernel's cached data for `parent_inode` so the next readdir
+    /// request comes back to us and reflects DB changes we just made.
+    /// Errors are logged but never surfaced — invalidation is a hint, not
+    /// a correctness boundary.
+    fn invalidate_dir_cache(&self, parent_inode: Inode) {
+        let Some(n) = self.notifier.get() else { return };
+        if let Err(e) = n.inval_inode(parent_inode, 0, 0) {
+            // ENOENT means the kernel had nothing cached for this inode,
+            // which is fine; other errors are worth a debug log.
+            debug!(parent_inode, "inval_inode: {e}");
+        }
+    }
 }
 
 fn entry_to_attr(e: &FileEntry) -> FileAttr {
@@ -75,6 +98,47 @@ fn entry_to_attr(e: &FileEntry) -> FileAttr {
         gid: unsafe { libc::getgid() },
         rdev: 0, blksize: 4096, flags: 0,
     }
+}
+
+/// Host-filesystem stats reported back to the kernel for `statfs(2)`.
+/// Returned in the units fuser's `ReplyStatfs::statfs` expects.
+///
+/// Without this, fuser's default `statfs` returns zeros for every block
+/// and inode count — and Dolphin's KIO copy-job pre-flights free space
+/// via `statvfs(2)` and refuses to paste with "not enough room on the
+/// device." Nautilus and `cp` skip the pre-flight, which is why the
+/// symptom is Dolphin-specific.
+#[derive(Debug)]
+pub struct StatfsTotals {
+    pub blocks:  u64,
+    pub bfree:   u64,
+    pub bavail:  u64,
+    pub files:   u64,
+    pub ffree:   u64,
+    pub bsize:   u32,
+    pub namelen: u32,
+    pub frsize:  u32,
+}
+
+pub fn host_statfs(path: &std::path::Path) -> std::io::Result<StatfsTotals> {
+    use std::ffi::CString;
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(StatfsTotals {
+        blocks:  buf.f_blocks  as u64,
+        bfree:   buf.f_bfree   as u64,
+        bavail:  buf.f_bavail  as u64,
+        files:   buf.f_files   as u64,
+        ffree:   buf.f_ffree   as u64,
+        bsize:   buf.f_bsize   as u32,
+        namelen: buf.f_namemax as u32,
+        frsize:  buf.f_frsize  as u32,
+    })
 }
 
 fn errno(e: &SyncError) -> libc::c_int {
@@ -608,6 +672,7 @@ impl Filesystem for StratoFs {
         match self.rt.block_on(write_ops::handle_create(parent, &name_str, mid, &db, &cache_dir, &open_files, &next_fh, &ignore)) {
             Ok((inode, fh)) => {
                 let attr = FileAttr { ino: inode, size: 0, blocks: 0, atime: SystemTime::now(), mtime: SystemTime::now(), ctime: SystemTime::now(), crtime: SystemTime::now(), kind: FileType::RegularFile, perm: 0o644, nlink: 1, uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() }, rdev: 0, blksize: 4096, flags: 0 };
+                self.invalidate_dir_cache(parent);
                 reply.created(&cfg.entry_timeout(), &attr, 0, fh, 0);
             }
             Err(e) => reply.error(e),
@@ -620,6 +685,7 @@ impl Filesystem for StratoFs {
         match self.rt.block_on(write_ops::handle_mkdir(parent, &name_str, mid, &db, &backend, &ignore)) {
             Ok(inode) => {
                 let attr = FileAttr { ino: inode, size: 0, blocks: 0, atime: SystemTime::now(), mtime: SystemTime::now(), ctime: SystemTime::now(), crtime: SystemTime::now(), kind: FileType::Directory, perm: 0o755, nlink: 2, uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() }, rdev: 0, blksize: 4096, flags: 0 };
+                self.invalidate_dir_cache(parent);
                 reply.entry(&cfg.entry_timeout(), &attr, 0);
             }
             Err(e) => reply.error(e),
@@ -629,19 +695,32 @@ impl Filesystem for StratoFs {
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
         let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
-        match self.rt.block_on(write_ops::handle_unlink(parent, &name_str, mid, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
+        match self.rt.block_on(write_ops::handle_unlink(parent, &name_str, mid, &db, &backend)) {
+            Ok(()) => { self.invalidate_dir_cache(parent); reply.ok(); }
+            Err(e) => reply.error(e),
+        }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
         let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
-        match self.rt.block_on(write_ops::handle_rmdir(parent, &name_str, mid, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
+        match self.rt.block_on(write_ops::handle_rmdir(parent, &name_str, mid, &db, &backend)) {
+            Ok(()) => { self.invalidate_dir_cache(parent); reply.ok(); }
+            Err(e) => reply.error(e),
+        }
     }
 
     fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
         let (n, nn) = match (name.to_str(), new_name.to_str()) { (Some(a), Some(b)) => (a.to_owned(), b.to_owned()), _ => { reply.error(libc::EINVAL); return; } };
         let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
-        match self.rt.block_on(write_ops::handle_rename(parent, &n, new_parent, &nn, mid, &db, &backend)) { Ok(()) => reply.ok(), Err(e) => reply.error(e), }
+        match self.rt.block_on(write_ops::handle_rename(parent, &n, new_parent, &nn, mid, &db, &backend)) {
+            Ok(()) => {
+                self.invalidate_dir_cache(parent);
+                if new_parent != parent { self.invalidate_dir_cache(new_parent); }
+                reply.ok();
+            }
+            Err(e) => reply.error(e),
+        }
     }
 
     fn getxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
@@ -695,6 +774,20 @@ impl Filesystem for StratoFs {
             reply.data(&buf);
         } else {
             reply.error(libc::ERANGE);
+        }
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        match host_statfs(&self.cache_dir) {
+            Ok(t) => reply.statfs(
+                t.blocks, t.bfree, t.bavail,
+                t.files, t.ffree,
+                t.bsize, t.namelen, t.frsize,
+            ),
+            Err(e) => {
+                warn!(cache_dir = ?self.cache_dir, "statfs failed: {e}");
+                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+            }
         }
     }
 
@@ -767,9 +860,48 @@ pub fn mount(
     // Restrict partial dir to owner-only (prevents symlink attacks by other users)
     std::fs::set_permissions(&partial_dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir_all(mount_path)?;
-    let fs = StratoFs { mount_id, mount_name: mount_name.to_owned(), db, backend, base_store, sync_config, cache_dir, cfg: cfg.clone(), rt, open_files: Arc::new(DashMap::new()), next_fh: Arc::new(AtomicU64::new(1)), hydration_waiters, upload_queue, ignore };
+    let notifier_slot = Arc::new(OnceLock::new());
+    let fs = StratoFs {
+        mount_id, mount_name: mount_name.to_owned(), db, backend, base_store,
+        sync_config, cache_dir, cfg: cfg.clone(), rt,
+        open_files: Arc::new(DashMap::new()),
+        next_fh: Arc::new(AtomicU64::new(1)),
+        hydration_waiters, upload_queue, ignore,
+        notifier: Arc::clone(&notifier_slot),
+    };
     let mut opts = vec![MountOption::FSName(format!("stratosync:{mount_name}")), MountOption::AutoUnmount, MountOption::DefaultPermissions];
     if cfg.allow_other { opts.push(MountOption::AllowOther); }
-    fuser::mount2(fs, mount_path, &opts)?;
+    // Use Session directly (rather than fuser::mount2) so we can pull a
+    // Notifier off it and give it to the filesystem. Without this, the
+    // kernel's readdir cache lingers after directory mutations and KIO/
+    // Dolphin won't show new entries until the user re-enters the folder.
+    let mut session = fuser::Session::new(fs, mount_path, &opts)?;
+    let _ = notifier_slot.set(session.notifier());
+    session.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod statfs_tests {
+    use super::host_statfs;
+    use std::path::Path;
+
+    #[test]
+    fn host_statfs_returns_realistic_values_for_real_path() {
+        // Without this implementation, fuser's default statfs returns
+        // zeros and Dolphin refuses to paste with "not enough room on
+        // the device." Sanity-check that we now return real numbers.
+        let stats = host_statfs(Path::new("/tmp")).expect("statvfs /tmp must succeed");
+        assert!(stats.blocks > 0, "blocks must be > 0 (got {})", stats.blocks);
+        assert!(stats.bsize >= 512, "bsize must be sane (got {})", stats.bsize);
+        assert!(stats.namelen > 0, "namelen must be > 0");
+        assert!(stats.frsize > 0, "frsize must be > 0");
+    }
+
+    #[test]
+    fn host_statfs_propagates_enoent_for_missing_path() {
+        let err = host_statfs(Path::new("/definitely/does/not/exist/xyzzy"))
+            .expect_err("statvfs on a missing path must error");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
 }

@@ -411,10 +411,11 @@ async fn run_upload(
         entry.etag.as_deref(),
     ).await?;
 
-    // Success — update etag and mark CACHED
-    db.set_cached(
+    // Success — update etag and mark CACHED. Use `set_uploaded` (not
+    // `set_cached`) so a rename that landed mid-upload keeps its new
+    // cache_path. See the rename-during-upload regression test.
+    db.set_uploaded(
         inode,
-        &cache_path,
         meta.size,
         meta.etag.as_deref(),
         meta.mtime,

@@ -387,6 +387,42 @@ impl StateDb {
         Ok(())
     }
 
+    /// Mark a file as cached after a successful upload. Unlike `set_cached`,
+    /// this does NOT touch `cache_path` — the cache file already lives at
+    /// the path the row records (or wherever a concurrent FUSE rename has
+    /// since moved it to). Overwriting `cache_path` here would lose the
+    /// rename's update and leave subsequent uploads pointing at a phantom
+    /// path. See `upload_completion_does_not_clobber_cache_path_after_rename`.
+    pub async fn set_uploaded(
+        &self,
+        inode:      Inode,
+        cache_size: u64,
+        etag:       Option<&str>,
+        mtime:      SystemTime,
+        size:       u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE file_index
+             SET status='cached', cache_size=?1,
+                 etag=?2, mtime=?3, size=?4, cache_mtime=unixepoch()
+             WHERE inode = ?5",
+            params![
+                cache_size as i64,
+                etag,
+                to_unix(mtime),
+                size as i64,
+                inode as i64,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO cache_lru (inode, last_access) VALUES (?1, unixepoch())
+             ON CONFLICT(inode) DO UPDATE SET last_access=unixepoch()",
+            params![inode as i64],
+        )?;
+        Ok(())
+    }
+
     pub async fn set_evicted(&self, inode: Inode) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
