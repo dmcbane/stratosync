@@ -385,6 +385,20 @@ async fn run_upload(
         return Ok(());
     }
 
+    // Defense in depth: directories don't have a cache_path so they
+    // can't be uploaded, even if a stale row in the DB has them
+    // marked dirty. `get_pending_uploads` filters these out at the
+    // source, but a write/rename trigger could still hand us an
+    // invalid inode. Quietly reset to Cached and move on instead of
+    // returning a Fatal that spams desktop notifications.
+    if entry.kind != stratosync_core::types::FileKind::File {
+        debug!(inode, kind = ?entry.kind, "non-file entry queued for upload — resetting to cached");
+        if let Err(e) = db.set_status(inode, SyncStatus::Cached).await {
+            warn!(inode, "failed to clear non-file dirty status: {e}");
+        }
+        return Ok(());
+    }
+
     let cache_path = entry.cache_path
         .ok_or_else(|| SyncError::Fatal(format!("inode {inode}: dirty but no cache_path")))?;
 

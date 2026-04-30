@@ -181,7 +181,22 @@ async fn main() -> Result<()> {
             );
         }
 
-        // Re-queue any dirty/uploading files from prior run
+        // Reset any directory rows lingering with status=dirty/uploading
+        // (legacy alpha-era data, or a setattr edge case). Without this,
+        // `get_pending_uploads` would return them on every start and
+        // `run_upload` would crash with "dirty but no cache_path",
+        // spamming desktop notifications.
+        match db.reset_stuck_dirty_directories().await {
+            Ok(n) if n > 0 => warn!(
+                count = n, mount = %mount_cfg.name,
+                "reset stuck dirty directories to cached",
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(mount = %mount_cfg.name, "reset_stuck_dirty_directories failed: {e}"),
+        }
+
+        // Re-queue any dirty/uploading files from prior run.
+        // `get_pending_uploads` already restricts to kind='file'.
         let pending = db.get_pending_uploads(mount_id).await?;
         if !pending.is_empty() {
             warn!(count = pending.len(), mount = %mount_cfg.name, "re-queuing pending uploads");

@@ -711,14 +711,40 @@ impl StateDb {
     /// Return all entries that were UPLOADING (need retry after restart).
     pub async fn get_pending_uploads(&self, mount_id: u32) -> Result<Vec<FileEntry>> {
         let conn = self.conn.lock().await;
+        // Restrict to kind='file': directories never have a cache_path
+        // and the upload path requires one. Legacy data with status=dirty
+        // on a directory used to feed `run_upload`, which then crashed
+        // with "dirty but no cache_path" and spammed desktop notifications.
         let mut stmt = conn.prepare(
             "SELECT inode, mount_id, parent_inode, name, remote_path, kind,
                     size, mtime, etag, status, cache_path, cache_size, dir_listed
-             FROM file_index WHERE mount_id=?1 AND status IN ('dirty','uploading')",
+             FROM file_index
+             WHERE mount_id = ?1
+               AND status IN ('dirty','uploading')
+               AND kind = 'file'",
         )?;
         let rows = stmt.query_map(params![mount_id], row_to_entry)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// One-shot cleanup: any directory rows lingering with
+    /// `status IN ('dirty','uploading')` (legacy alpha-era data, or a
+    /// setattr edge case) get reset to `cached`. They were never going
+    /// to be uploaded — directories don't have cache files — and
+    /// leaving them in dirty/uploading state means the upload queue
+    /// re-discovers them on every restart and warn-logs each time.
+    /// Returns the number of rows reset.
+    pub async fn reset_stuck_dirty_directories(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE file_index
+             SET status = 'cached'
+             WHERE kind = 'dir'
+               AND status IN ('dirty','uploading')",
+            [],
+        )?;
+        Ok(n)
     }
 }
 

@@ -102,6 +102,21 @@ All notable changes to this project will be documented in this file.
   Verified live against a folder of eleven 1–2 GB Google-Drive MP4s
   through Dolphin: from ~45 s freeze pre-fix → instant post-fix once
   the focus pass completes (~3 s after navigating into the folder).
+- **`upload fatal: dirty but no cache_path` warning storm on every
+  daemon start** — `get_pending_uploads()` returned every row with
+  `status IN ('dirty','uploading')` regardless of kind, so directory
+  rows that had been left in a dirty state (legacy alpha data or some
+  setattr edge case) were re-queued for upload on every restart, then
+  crashed `run_upload` (directories have no cache_path) and spammed
+  desktop notifications. Three layers:
+   - SQL filter: `get_pending_uploads()` now restricts to `kind='file'`.
+   - One-shot startup cleanup: `reset_stuck_dirty_directories()`
+     resets any `kind='dir' AND status IN ('dirty','uploading')`
+     rows to `'cached'` so the queue stops re-discovering them
+     across restarts.
+   - Defense in depth in `run_upload`: a non-file inode that slips
+     through (e.g. via a stray `Write` trigger) is silently reset to
+     `Cached` and skipped, no fatal-notification.
 
 ## [0.12.0-beta.1] - 2026-04-29
 

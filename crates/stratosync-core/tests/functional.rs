@@ -462,6 +462,45 @@ async fn migration_dedupes_phantom_rows_and_blocks_future_dupes() {
     assert!(result.is_err(), "second `test` row under root must violate UNIQUE");
 }
 
+/// Regression for "upload fatal: dirty but no cache_path" warnings on
+/// daemon startup. Directory rows that somehow ended up in the DB with
+/// `status='dirty'` (legacy data from an earlier alpha, or a setattr
+/// edge case) used to flow through `get_pending_uploads` and then crash
+/// the upload finalizer because directories have no cache_path.
+/// `get_pending_uploads` now restricts to `kind='file'`.
+#[tokio::test]
+async fn get_pending_uploads_excludes_directories() {
+    let (db, mid, root) = setup().await;
+
+    // A real dirty file — should appear.
+    let file_inode = insert_file(
+        &db, mid, root, "doc.txt", "doc.txt",
+        SyncStatus::Dirty, Some("/tmp/cache/doc.txt"),
+    ).await;
+
+    // A pathological dirty *directory* — should NOT appear in pending
+    // uploads regardless of how it got marked dirty.
+    let dir_inode = db.insert_file(&NewFileEntry {
+        mount_id:   mid,
+        parent:     root,
+        name:       "stuck".into(),
+        remote_path: "stuck".into(),
+        kind:       FileKind::Directory,
+        size:       0,
+        mtime:      SystemTime::now(),
+        etag:       None,
+        status:     SyncStatus::Dirty,
+        cache_path: None,
+        cache_size: None,
+    }).await.unwrap();
+
+    let pending = db.get_pending_uploads(mid).await.unwrap();
+    let inodes: Vec<_> = pending.iter().map(|e| e.inode).collect();
+    assert!(inodes.contains(&file_inode), "the dirty file must be in pending uploads");
+    assert!(!inodes.contains(&dir_inode),
+        "a dirty directory must NOT be in pending uploads (no cache_path to upload)");
+}
+
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
