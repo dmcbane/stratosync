@@ -239,11 +239,12 @@ pub async fn handle_mkdir(
 // ── unlink ────────────────────────────────────────────────────────────────────
 
 pub async fn handle_unlink(
-    parent:   Inode,
-    name:     &str,
-    mount_id: u32,
-    db:       &Arc<StateDb>,
-    backend:  &Arc<dyn Backend>,
+    parent:    Inode,
+    name:      &str,
+    mount_id:  u32,
+    db:        &Arc<StateDb>,
+    backend:   &Arc<dyn Backend>,
+    cache_dir: &Path,
 ) -> Result<(), libc::c_int> {
     let entry = db.get_by_parent_name(mount_id, parent, name).await
         .map_err(|_| libc::EIO)?
@@ -258,6 +259,8 @@ pub async fn handle_unlink(
             }
         }
     }
+    // Drop the header cache too — the file is gone.
+    super::header_cache::invalidate_header(cache_dir, entry.inode).await;
 
     // Remove DB entry and insert tombstone so the poller doesn't re-add it
     // before the background remote delete completes.
@@ -333,6 +336,7 @@ pub async fn handle_rename(
     mount_id:   u32,
     db:         &Arc<StateDb>,
     backend:    &Arc<dyn Backend>,
+    cache_dir:  &Path,
 ) -> Result<(), libc::c_int> {
     validate_filename(new_name)?;
 
@@ -352,6 +356,9 @@ pub async fn handle_rename(
         if let Err(e) = db.delete_entry(dest.inode).await {
             warn!(inode = dest.inode, "delete_entry for rename overwrite failed: {e}");
         }
+        // The dest's cached header (if any) referred to a file that no
+        // longer exists at this inode — drop it.
+        super::header_cache::invalidate_header(cache_dir, dest.inode).await;
         Some(rp)
     } else {
         None
@@ -578,7 +585,7 @@ mod tests {
         // Move every child of test/ into test/SUBSUB/.
         for n in ["a.txt", "b.txt", "c.txt"] {
             handle_rename(
-                test_inode, n, subsub_inode, n, mid, &db, &backend,
+                test_inode, n, subsub_inode, n, mid, &db, &backend, cache.path(),
             ).await.expect("rename into SUBSUB");
         }
 

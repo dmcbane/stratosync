@@ -237,6 +237,7 @@ async fn main() -> Result<()> {
             Arc::clone(&base_store),
             version_max_size,
             mount_cfg.version_retention,
+            cache_dir.clone(),
         );
         let poller_state = poller.state_handle();
         let poller_mount = mount_cfg.name.clone();

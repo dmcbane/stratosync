@@ -32,6 +32,9 @@ pub struct RemotePoller {
     /// `0` disables versioning. Otherwise: keep this many history rows
     /// per inode.
     version_retention: u32,
+    /// Path to the on-disk cache root. Needed so we can drop stale
+    /// header-cache files when the poller detects a remote change.
+    cache_dir:     std::path::PathBuf,
 }
 
 impl RemotePoller {
@@ -44,6 +47,7 @@ impl RemotePoller {
         base_store:    Arc<BaseStore>,
         version_max_size:  u64,
         version_retention: u32,
+        cache_dir:     std::path::PathBuf,
     ) -> Self {
         let mode = if backend.supports_delta() { "delta" } else { "full-listing" };
         let state = Arc::new(RwLock::new(PollerStatus {
@@ -53,7 +57,7 @@ impl RemotePoller {
         }));
         Self {
             mount_id, db, backend, poll_interval, state, ignore,
-            base_store, version_max_size, version_retention,
+            base_store, version_max_size, version_retention, cache_dir,
         }
     }
 
@@ -291,6 +295,12 @@ impl RemotePoller {
                 generation,
             ).await?;
 
+            // Drop any pre-fetched header for this inode — the
+            // remote content just changed, so the cached bytes are
+            // stale. The next reader will fetch fresh ones (or fall
+            // through to a range download).
+            crate::fuse::header_cache::invalidate_header(&self.cache_dir, inode).await;
+
             path_to_inode.insert(meta.path.clone(), inode);
         }
 
@@ -306,6 +316,8 @@ impl RemotePoller {
                 if let Some(cp) = cache_path {
                     let _ = tokio::fs::remove_file(cp).await;
                 }
+                // And the header file, if any.
+                crate::fuse::header_cache::invalidate_header(&self.cache_dir, inode).await;
             }
         }
 
@@ -492,6 +504,9 @@ impl RemotePoller {
                         0, // generation is not used in delta mode
                     ).await?;
 
+                    // Drop any cached header — content may have changed.
+                    crate::fuse::header_cache::invalidate_header(&self.cache_dir, inode).await;
+
                     path_to_inode.insert(meta.path.clone(), inode);
                     added += 1;
                 }
@@ -503,6 +518,7 @@ impl RemotePoller {
                         if let Some(cp) = cache_path {
                             let _ = tokio::fs::remove_file(cp).await;
                         }
+                        crate::fuse::header_cache::invalidate_header(&self.cache_dir, inode).await;
                         deleted += 1;
                     }
                 }
@@ -584,9 +600,10 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(backend);
         let bs_dir = tempfile::tempdir().unwrap().keep();
         let bs = Arc::new(BaseStore::new(bs_dir).unwrap());
+        let cache_dir = tempfile::tempdir().unwrap().keep();
         RemotePoller::new(
             mount_id, db, backend, Duration::from_secs(60), ignore,
-            bs, 10 * 1024 * 1024, retention,
+            bs, 10 * 1024 * 1024, retention, cache_dir,
         )
     }
 
@@ -663,9 +680,11 @@ mod tests {
         let bs_dir = tempfile::tempdir().unwrap().keep();
         let bs = Arc::new(BaseStore::new(bs_dir.clone()).unwrap());
         let backend_arc: Arc<dyn Backend> = Arc::new(backend.clone());
+        let cache_root = tempfile::tempdir().unwrap().keep();
         let p = RemotePoller::new(
             mid, Arc::clone(&db), backend_arc, Duration::from_secs(60),
             Arc::clone(&ignore), Arc::clone(&bs), 10 * 1024 * 1024, 5,
+            cache_root,
         );
         p.poll_once().await.unwrap();
 

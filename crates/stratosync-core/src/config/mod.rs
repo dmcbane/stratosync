@@ -165,6 +165,22 @@ pub struct SyncConfig {
     pub base_max_file_size:        String,
     pub text_extensions:           Vec<String>,
     pub prefetch_threshold:        String,
+    /// Cap, per file, on how much of an over-`prefetch_threshold` file we
+    /// pre-fetch into a local "header cache" right after a directory is
+    /// listed. File managers (Dolphin / KIO) read 16–64 KB from the start
+    /// of every selected file to sniff MIME / generate thumbnails when you
+    /// right-click; without this, every right-click on N files blocks for
+    /// N × `rclone cat` round-trips. Set to `"0"` (or the empty string) to
+    /// disable header pre-fetch entirely.
+    pub header_prefetch_size:      String,
+    /// Files larger than this are NOT auto-hydrated when `open()` is
+    /// called — only on first read past the header cache. Stops file
+    /// managers' MIME / thumbnail probes from kicking off multi-GB
+    /// rclone copies in the background just because the user
+    /// right-clicked a folder of videos. Set to `"0"` (or the empty
+    /// string) to disable the cap (every open() triggers full
+    /// hydration; legacy v0.12.0 behavior).
+    pub auto_hydrate_max_size:     String,
 }
 
 impl Default for SyncConfig {
@@ -180,6 +196,8 @@ impl Default for SyncConfig {
             text_extensions:           crate::base_store::DEFAULT_TEXT_EXTENSIONS
                                            .iter().map(|s| (*s).to_string()).collect(),
             prefetch_threshold:        "1 MB".into(),
+            header_prefetch_size:      "64 KB".into(),
+            auto_hydrate_max_size:     "100 MB".into(),
         }
     }
 }
@@ -191,6 +209,18 @@ impl SyncConfig {
     /// Returns the prefetch size threshold in bytes, or 0 if disabled.
     pub fn prefetch_threshold_bytes(&self) -> u64 {
         parse_size(&self.prefetch_threshold).unwrap_or(0)
+    }
+    /// Returns the header pre-fetch size in bytes, or 0 if disabled.
+    pub fn header_prefetch_size_bytes(&self) -> u64 {
+        if self.header_prefetch_size.is_empty() { return 0; }
+        parse_size(&self.header_prefetch_size).unwrap_or(0)
+    }
+    /// Files larger than this skip the auto-hydrate-on-open step.
+    /// Returns `None` to mean "no cap — always auto-hydrate on open".
+    pub fn auto_hydrate_max_size_bytes(&self) -> Option<u64> {
+        if self.auto_hydrate_max_size.is_empty() { return None; }
+        let n = parse_size(&self.auto_hydrate_max_size).unwrap_or(0);
+        if n == 0 { None } else { Some(n) }
     }
 }
 

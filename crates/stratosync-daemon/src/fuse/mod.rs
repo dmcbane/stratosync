@@ -1,6 +1,7 @@
 #![allow(unused_imports, unused_variables, dead_code)]
 /// FUSE filesystem implementation — Phase 1 (read) + Phase 2 (write).
 /// See docs/architecture/02-fuse-layer.md for design details.
+pub mod header_cache;
 pub mod write_ops;
 
 use std::ffi::OsStr;
@@ -411,6 +412,60 @@ fn spawn_prefetch_small_files(
     });
 }
 
+/// Background-prefetch the first N bytes of files in this directory
+/// that are over `prefetch_threshold` (so the small-file pass won't
+/// hydrate them in full). Without this, the first right-click on a
+/// directory of large media files blocks the file-manager UI for a
+/// few seconds per file while KIO sniffs MIME / builds thumbnails.
+fn spawn_prefetch_headers(
+    db: Arc<StateDb>, backend: Arc<dyn Backend>, mid: u32, parent_inode: Inode,
+    cache_dir: PathBuf, sync_config: Arc<SyncConfig>,
+) {
+    let header_size = sync_config.header_prefetch_size_bytes();
+    let full_threshold = sync_config.prefetch_threshold_bytes();
+    if header_size == 0 { return; }
+
+    tokio::spawn(async move {
+        let children = db.list_children(mid, parent_inode).await.unwrap_or_default();
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+
+        for child in children {
+            if child.kind != FileKind::File { continue; }
+            if !child.status.needs_hydration() { continue; }
+            // The small-file pass hydrates everything <= full_threshold
+            // in full, so a separate header pass is wasted work there.
+            if child.size <= full_threshold { continue; }
+            // If we already have a header from a prior listing, reuse.
+            if header_cache::header_path(&cache_dir, child.inode).exists() {
+                continue;
+            }
+
+            let backend = Arc::clone(&backend);
+            let cache_dir = cache_dir.clone();
+            let sem = Arc::clone(&sem);
+
+            tokio::spawn(async move {
+                let Ok(_permit) = sem.acquire().await else { return };
+                let take = header_size.min(child.size);
+                match backend.download_range(&child.remote_path, 0, take).await {
+                    Ok(data) => {
+                        if let Err(e) = header_cache::write_header(
+                            &cache_dir, child.inode, &data,
+                        ).await {
+                            debug!(inode = child.inode, "header write failed: {e}");
+                        } else {
+                            debug!(inode = child.inode, len = data.len(), "header pre-fetched");
+                        }
+                    }
+                    Err(e) => {
+                        debug!(inode = child.inode, "header pre-fetch failed: {e}");
+                    }
+                }
+            });
+        }
+    });
+}
+
 impl Filesystem for StratoFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
@@ -497,7 +552,13 @@ impl Filesystem for StratoFs {
                 // Prefetch small files in the background
                 spawn_prefetch_small_files(
                     Arc::clone(&db), Arc::clone(&backend), mid, ino,
-                    cache_dir, waiters, base_store, sync_config,
+                    cache_dir.clone(), waiters, base_store, Arc::clone(&sync_config),
+                );
+                // Prefetch the first ~64 KiB of large files so file-manager
+                // MIME sniffs / thumbnail reads don't block the UI later.
+                spawn_prefetch_headers(
+                    Arc::clone(&db), Arc::clone(&backend), mid, ino,
+                    cache_dir, sync_config,
                 );
             }
             db.list_children(mid, ino).await
@@ -562,7 +623,17 @@ impl Filesystem for StratoFs {
                 cache_dir.join(entry.remote_path.trim_start_matches('/'))
             });
 
-            if needs_hydration {
+            // Skip the auto-hydrate kick-off for huge files: a
+            // file-manager open()/read(0,32K) probe should never trigger
+            // a multi-GB background download. Reads past the header
+            // cache will fall back to the existing range-download path,
+            // and the user can `pin` a file (or set
+            // `auto_hydrate_max_size = "0"`) to force full hydration.
+            let auto_hydrate = match sync_config.auto_hydrate_max_size_bytes() {
+                Some(cap) => entry.size <= cap,
+                None      => true,
+            };
+            if needs_hydration && auto_hydrate {
                 // Start download in background — don't block open()
                 db.set_status(ino, SyncStatus::Hydrating).await
                     .map_err(|e| SyncError::Fatal(e.to_string()))?;
@@ -611,6 +682,25 @@ impl Filesystem for StratoFs {
             };
 
             if needs_wait {
+                // Header cache fast path: file managers (Dolphin / KIO,
+                // Nautilus + thumbnailers) open every selected file and
+                // read 16-64 KiB from offset 0 to sniff MIME / generate
+                // thumbnails. Without this the right-click context menu
+                // blocks for ~3 s × N on rclone-cat round trips. Misses
+                // fall through to the existing range-download path.
+                let header_size = sync_config.header_prefetch_size_bytes();
+                let off = offset.max(0) as u64;
+                let len = size as u64;
+                if header_size > 0 && off.saturating_add(len) <= header_size {
+                    match header_cache::read_header(&cache_dir, ino, off, len).await {
+                        Ok(Some(data)) => return Ok(data),
+                        Ok(None) => { /* miss — fall through */ }
+                        Err(e) => {
+                            debug!(ino, "header cache read failed, falling through: {e}");
+                        }
+                    }
+                }
+
                 // Check if full hydration has completed since open()
                 if let Ok(Some(fe)) = db.get_by_inode(ino).await {
                     if fe.status.has_local_data() && !fe.status.is_hydrating() {
@@ -622,6 +712,31 @@ impl Filesystem for StratoFs {
                         let _ = db.touch_lru(ino).await;
                         // Fall through to normal cache read below
                     } else {
+                        // We're past the header cache and the file isn't
+                        // locally hydrated. If we'd previously deferred the
+                        // open()-time hydrate (because the file was over
+                        // `auto_hydrate_max_size`), this is the moment to
+                        // kick it off — the user is reading real content,
+                        // not just sniffing MIME. Subsequent reads keep
+                        // serving via range download until the full file
+                        // lands in cache, then switch to cache reads.
+                        if fe.status == SyncStatus::Remote {
+                            if db.set_status(ino, SyncStatus::Hydrating).await.is_ok() {
+                                let (db2, be2, cd2, w2) = (
+                                    Arc::clone(&db), Arc::clone(&backend),
+                                    cache_dir.clone(), Arc::clone(&waiters),
+                                );
+                                let (bs2, sc2) = (Arc::clone(&base_store), Arc::clone(&sync_config));
+                                tokio::spawn(async move {
+                                    let entry = match db2.get_by_inode(ino).await {
+                                        Ok(Some(e)) => e,
+                                        _ => return,
+                                    };
+                                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &entry, &bs2, &sc2).await;
+                                });
+                            }
+                        }
+
                         // Still hydrating — try range download for this read
                         match backend.download_range(&remote_path, offset as u64, size as u64).await {
                             Ok(data) => return Ok(data),
@@ -712,8 +827,11 @@ impl Filesystem for StratoFs {
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() { Some(s) => s.to_owned(), None => { reply.error(libc::EINVAL); return; } };
-        let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
-        match self.rt.block_on(write_ops::handle_unlink(parent, &name_str, mid, &db, &backend)) {
+        let (db, backend, mid, cache_dir) = (
+            Arc::clone(&self.db), Arc::clone(&self.backend),
+            self.mount_id, self.cache_dir.clone(),
+        );
+        match self.rt.block_on(write_ops::handle_unlink(parent, &name_str, mid, &db, &backend, &cache_dir)) {
             Ok(()) => { self.invalidate_dir_cache(parent); reply.ok(); }
             Err(e) => reply.error(e),
         }
@@ -730,8 +848,11 @@ impl Filesystem for StratoFs {
 
     fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
         let (n, nn) = match (name.to_str(), new_name.to_str()) { (Some(a), Some(b)) => (a.to_owned(), b.to_owned()), _ => { reply.error(libc::EINVAL); return; } };
-        let (db, backend, mid) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.mount_id);
-        match self.rt.block_on(write_ops::handle_rename(parent, &n, new_parent, &nn, mid, &db, &backend)) {
+        let (db, backend, mid, cache_dir) = (
+            Arc::clone(&self.db), Arc::clone(&self.backend),
+            self.mount_id, self.cache_dir.clone(),
+        );
+        match self.rt.block_on(write_ops::handle_rename(parent, &n, new_parent, &nn, mid, &db, &backend, &cache_dir)) {
             Ok(()) => {
                 self.invalidate_dir_cache(parent);
                 if new_parent != parent { self.invalidate_dir_cache(new_parent); }

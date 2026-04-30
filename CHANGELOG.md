@@ -54,6 +54,34 @@ All notable changes to this project will be documented in this file.
   a sibling — lowest inode wins, matching what `lookup` returns. With
   migration 0006 in place this should never fire in practice; if it
   does, the warning log surfaces it for follow-up.
+- **30-second context-menu hangs in Dolphin on folders of large media
+  files**: KIO opens every selected file and reads 16–64 KiB from
+  offset 0 to sniff MIME / generate thumbnails on right-click. Each
+  read on a `Remote` file used to be a fresh `rclone cat --offset 0
+  --count 32768` invocation (process spawn + OAuth refresh + cloud
+  round-trip ≈ 1–3 s), so right-clicking N selected files blocked the
+  UI for ~3 s × N. Worse, our `open()` was *also* optimistically
+  kicking off a full `rclone copyto` for every file in the background,
+  so a casual right-click on five MP4s would queue up multi-GB
+  downloads. Two changes:
+   - **Header cache** (`<cache_dir>/.meta/headers/<inode>`): the new
+     `spawn_prefetch_headers` task pre-fetches the first 64 KiB of
+     every over-`prefetch_threshold` file as soon as a directory is
+     listed. `read()` now serves any offset-0 sniff that fits within
+     the header from the local file, skipping the network entirely.
+     New config knob `[sync] header_prefetch_size` (default `"64 KB"`,
+     `"0"` to disable). Headers are dropped on rename overwrite,
+     unlink, and any poller-detected remote change.
+   - **Deferred auto-hydrate for huge files**: files larger than the
+     new `[sync] auto_hydrate_max_size` (default `"100 MB"`) are no
+     longer full-downloaded by `open()`. They still hydrate on the
+     first read past the header — which is the user actually
+     accessing content rather than KIO sniffing — so streaming and
+     `cat`-style use still work. Set to `"0"` to keep legacy v0.12.0
+     behavior.
+  Together: right-click on a folder of MP4s is now ~instant after the
+  initial directory listing settles, and we don't burn bandwidth on
+  files the user only glanced at.
 
 ## [0.12.0-beta.1] - 2026-04-29
 
