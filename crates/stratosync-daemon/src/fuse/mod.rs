@@ -65,6 +65,25 @@ pub struct StratoFs {
     /// readdir cache for the parent gets dropped and the new entry shows
     /// up without the user navigating away and back.
     pub notifier:          Arc<OnceLock<fuser::Notifier>>,
+    /// Inodes that currently have a header prefetch (or opportunistic
+    /// cache write) in flight. Lets concurrent reads / prefetch passes
+    /// dedupe — without this, 11 simultaneous KIO sniffs on the same
+    /// file each spawn their own range download, and the prefetch pass
+    /// piles on top.
+    pub prefetch_inflight: Arc<DashMap<Inode, ()>>,
+    /// Daemon-wide cap on concurrent header pre-fetches. Without a
+    /// shared semaphore, every readdir spawns its own task pool and a
+    /// busy file manager (Dolphin tree view + breadcrumb panel) can
+    /// kick off hundreds of concurrent rclone-cat invocations at once.
+    pub prefetch_sem:      Arc<tokio::sync::Semaphore>,
+    /// Inode of the directory whose prefetch we currently care about.
+    /// Updated on every readdir; pre-fetch tasks check it after waking
+    /// from the semaphore and bail out if the user has navigated to a
+    /// different directory in the meantime. Without this, KIO walking
+    /// 30 dirs through its tree-view + breadcrumb panel queues
+    /// hundreds of headers, and the user's actual target lands at the
+    /// back of that queue — minutes after they've right-clicked.
+    pub prefetch_focus_dir: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl StratoFs {
@@ -417,9 +436,18 @@ fn spawn_prefetch_small_files(
 /// hydrate them in full). Without this, the first right-click on a
 /// directory of large media files blocks the file-manager UI for a
 /// few seconds per file while KIO sniffs MIME / builds thumbnails.
+///
+/// Skips any inode that already has a header on disk OR is currently
+/// being fetched (tracked in `inflight`). The dedupe prevents the
+/// runaway cat-storm we saw when Dolphin readdirs walked through every
+/// dir in its tree-view + breadcrumb panel and each one re-spawned
+/// prefetches for the same files.
 fn spawn_prefetch_headers(
     db: Arc<StateDb>, backend: Arc<dyn Backend>, mid: u32, parent_inode: Inode,
     cache_dir: PathBuf, sync_config: Arc<SyncConfig>,
+    inflight: Arc<DashMap<Inode, ()>>,
+    sem: Arc<tokio::sync::Semaphore>,
+    focus_dir: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let header_size = sync_config.header_prefetch_size_bytes();
     let full_threshold = sync_config.prefetch_threshold_bytes();
@@ -427,7 +455,6 @@ fn spawn_prefetch_headers(
 
     tokio::spawn(async move {
         let children = db.list_children(mid, parent_inode).await.unwrap_or_default();
-        let sem = Arc::new(tokio::sync::Semaphore::new(4));
 
         for child in children {
             if child.kind != FileKind::File { continue; }
@@ -435,32 +462,60 @@ fn spawn_prefetch_headers(
             // The small-file pass hydrates everything <= full_threshold
             // in full, so a separate header pass is wasted work there.
             if child.size <= full_threshold { continue; }
-            // If we already have a header from a prior listing, reuse.
+            // Already cached on disk?
             if header_cache::header_path(&cache_dir, child.inode).exists() {
+                continue;
+            }
+            // Already in flight (another readdir or read started a
+            // fetch)? `insert` returns the previous value if the key
+            // was already present, so Some means we lost the race.
+            if inflight.insert(child.inode, ()).is_some() {
                 continue;
             }
 
             let backend = Arc::clone(&backend);
             let cache_dir = cache_dir.clone();
             let sem = Arc::clone(&sem);
+            let inflight = Arc::clone(&inflight);
+            let inode = child.inode;
+            let remote_path = child.remote_path.clone();
+            let size = child.size;
 
+            let focus_for_task = Arc::clone(&focus_dir);
             tokio::spawn(async move {
-                let Ok(_permit) = sem.acquire().await else { return };
-                let take = header_size.min(child.size);
-                match backend.download_range(&child.remote_path, 0, take).await {
+                let Ok(_permit) = sem.acquire().await else {
+                    inflight.remove(&inode);
+                    return;
+                };
+                // Bail if the user has moved on to a different directory
+                // since we queued. Their current focus deserves the
+                // bandwidth more than this stale dir.
+                if focus_for_task.load(std::sync::atomic::Ordering::Relaxed) != parent_inode {
+                    inflight.remove(&inode);
+                    return;
+                }
+                // Re-check on disk after acquiring the permit — another
+                // task may have completed while we were queued.
+                if header_cache::header_path(&cache_dir, inode).exists() {
+                    inflight.remove(&inode);
+                    return;
+                }
+                let take = header_size.min(size);
+                match backend.download_range(&remote_path, 0, take).await {
                     Ok(data) => {
                         if let Err(e) = header_cache::write_header(
-                            &cache_dir, child.inode, &data,
+                            &cache_dir, inode, &data,
                         ).await {
-                            debug!(inode = child.inode, "header write failed: {e}");
+                            debug!(inode, "header write failed: {e}");
                         } else {
-                            debug!(inode = child.inode, len = data.len(), "header pre-fetched");
+                            debug!(inode, len = data.len(), "header pre-fetched");
                         }
                     }
                     Err(e) => {
-                        debug!(inode = child.inode, "header pre-fetch failed: {e}");
+                        debug!(inode, "header pre-fetch failed: {e}");
                     }
                 }
+                inflight.remove(&inode);
             });
         }
     });
@@ -545,6 +600,14 @@ impl Filesystem for StratoFs {
             Arc::clone(&self.base_store), Arc::clone(&self.sync_config), self.cache_dir.clone(),
         );
         let waiters = Arc::clone(&self.hydration_waiters);
+        let inflight = Arc::clone(&self.prefetch_inflight);
+        let prefetch_sem = Arc::clone(&self.prefetch_sem);
+        let focus_dir = Arc::clone(&self.prefetch_focus_dir);
+        // The current readdir target becomes "the dir the user cares
+        // about right now". Older queued prefetches (for sidebar / tree
+        // dirs the user moved past) will see the new value and bail
+        // out before doing their rclone-cat.
+        focus_dir.store(ino, std::sync::atomic::Ordering::Relaxed);
         let result = self.rt.block_on(async move {
             let dir = db.get_by_inode(ino).await?.ok_or_else(|| anyhow::anyhow!("inode {ino}"))?;
             if dir.dir_listed.is_none() {
@@ -554,13 +617,17 @@ impl Filesystem for StratoFs {
                     Arc::clone(&db), Arc::clone(&backend), mid, ino,
                     cache_dir.clone(), waiters, base_store, Arc::clone(&sync_config),
                 );
-                // Prefetch the first ~64 KiB of large files so file-manager
-                // MIME sniffs / thumbnail reads don't block the UI later.
-                spawn_prefetch_headers(
-                    Arc::clone(&db), Arc::clone(&backend), mid, ino,
-                    cache_dir, sync_config,
-                );
             }
+            // Trigger header prefetch on every readdir. Made safe by:
+            //   - per-inode `inflight` dedup (DashMap),
+            //   - on-disk header check before re-fetching,
+            //   - shared `prefetch_sem` capping daemon-wide concurrency,
+            //   - `prefetch_focus_dir` so stale queued tasks bail when
+            //      the user moves on.
+            spawn_prefetch_headers(
+                Arc::clone(&db), Arc::clone(&backend), mid, ino,
+                cache_dir, sync_config, inflight, prefetch_sem, focus_dir,
+            );
             db.list_children(mid, ino).await
         });
         match result {
@@ -669,13 +736,23 @@ impl Filesystem for StratoFs {
     }
 
     fn read(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+        // Async-spawn instead of block_on. The fuser session loop reads
+        // requests serially on a single thread; if read() blocks until
+        // the work completes, every other FUSE request — including N-1
+        // sibling reads from the same right-click — queues behind it.
+        // Spawning frees the FUSE worker thread immediately so all 11
+        // concurrent sniff reads run in parallel through the rclone
+        // backend instead of serially. Reply is sent from inside the
+        // task once the work completes; ReplyData is Send.
         let open_files = Arc::clone(&self.open_files);
         let (db, backend, cache_dir, waiters) = (
             Arc::clone(&self.db), Arc::clone(&self.backend),
             self.cache_dir.clone(), Arc::clone(&self.hydration_waiters),
         );
         let (base_store, sync_config) = (Arc::clone(&self.base_store), Arc::clone(&self.sync_config));
-        let result = self.rt.block_on(async move {
+        let prefetch_inflight = Arc::clone(&self.prefetch_inflight);
+        self.rt.spawn(async move {
+            let result: Result<Vec<u8>, SyncError> = async {
             let (ino, needs_wait, remote_path) = {
                 let entry = open_files.get(&fh).ok_or_else(|| SyncError::Fatal(format!("bad fh {fh}")))?;
                 (entry.inode, entry.hydrating, entry.remote_path.clone())
@@ -691,7 +768,9 @@ impl Filesystem for StratoFs {
                 let header_size = sync_config.header_prefetch_size_bytes();
                 let off = offset.max(0) as u64;
                 let len = size as u64;
-                if header_size > 0 && off.saturating_add(len) <= header_size {
+                let read_within_header = header_size > 0
+                    && off.saturating_add(len) <= header_size;
+                if read_within_header {
                     match header_cache::read_header(&cache_dir, ino, off, len).await {
                         Ok(Some(data)) => return Ok(data),
                         Ok(None) => { /* miss — fall through */ }
@@ -712,15 +791,15 @@ impl Filesystem for StratoFs {
                         let _ = db.touch_lru(ino).await;
                         // Fall through to normal cache read below
                     } else {
-                        // We're past the header cache and the file isn't
-                        // locally hydrated. If we'd previously deferred the
-                        // open()-time hydrate (because the file was over
-                        // `auto_hydrate_max_size`), this is the moment to
-                        // kick it off — the user is reading real content,
-                        // not just sniffing MIME. Subsequent reads keep
-                        // serving via range download until the full file
-                        // lands in cache, then switch to cache reads.
-                        if fe.status == SyncStatus::Remote {
+                        // If the read is past the header range AND the
+                        // file is still Remote (open()-time auto-hydrate
+                        // was deferred), this is the user actually
+                        // accessing content, not a MIME / thumbnail
+                        // sniff — kick off full hydration now. Reads
+                        // *within* the header range never trigger this:
+                        // they're satisfied by a one-shot range download
+                        // and (below) cached for next time.
+                        if !read_within_header && fe.status == SyncStatus::Remote {
                             if db.set_status(ino, SyncStatus::Hydrating).await.is_ok() {
                                 let (db2, be2, cd2, w2) = (
                                     Arc::clone(&db), Arc::clone(&backend),
@@ -739,7 +818,43 @@ impl Filesystem for StratoFs {
 
                         // Still hydrating — try range download for this read
                         match backend.download_range(&remote_path, offset as u64, size as u64).await {
-                            Ok(data) => return Ok(data),
+                            Ok(data) => {
+                                // Opportunistic: cache whatever bytes we
+                                // just got so the next sniff at offset 0
+                                // hits the disk instead of the network.
+                                // We deliberately DON'T issue an extra
+                                // fetch to fill out to `header_size` — a
+                                // partial header still serves any sniff
+                                // that asks for ≤ what we cached, and
+                                // the previous "fetch the rest" version
+                                // doubled bandwidth on every cold sniff.
+                                // Dedupe via the inflight set so 11
+                                // simultaneous KIO sniffs on the same
+                                // file don't all spawn writes.
+                                if read_within_header
+                                    && off == 0
+                                    && header_size > 0
+                                    && !data.is_empty()
+                                    && !header_cache::header_path(&cache_dir, ino).exists()
+                                    && prefetch_inflight.insert(ino, ()).is_none()
+                                {
+                                    let cd2 = cache_dir.clone();
+                                    let inflight2 = Arc::clone(&prefetch_inflight);
+                                    let bytes = data.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = header_cache::write_header(
+                                            &cd2, ino, &bytes,
+                                        ).await {
+                                            debug!(inode = ino, "lazy header write failed: {e}");
+                                        } else {
+                                            debug!(inode = ino, len = bytes.len(),
+                                                "lazy header captured from sniff read");
+                                        }
+                                        inflight2.remove(&ino);
+                                    });
+                                }
+                                return Ok(data);
+                            }
                             Err(SyncError::NotSupported) => {
                                 // Backend doesn't support ranges — fall back to blocking wait
                                 hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &base_store, &sync_config).await?;
@@ -777,8 +892,12 @@ impl Filesystem for StratoFs {
             let n = f.read(&mut buf).await.map_err(SyncError::Io)?;
             buf.truncate(n);
             Ok::<Vec<u8>, SyncError>(buf)
+            }.await;
+            match result {
+                Ok(data) => reply.data(&data),
+                Err(e)   => { error!(fh, "read: {e}"); reply.error(errno(&e)); }
+            }
         });
-        match result { Ok(data) => reply.data(&data), Err(e) => { error!(fh, "read: {e}"); reply.error(errno(&e)); } }
     }
 
     fn write(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, data: &[u8], _wf: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
@@ -1007,6 +1126,16 @@ pub fn mount(
         next_fh: Arc::new(AtomicU64::new(1)),
         hydration_waiters, upload_queue, ignore,
         notifier: Arc::clone(&notifier_slot),
+        prefetch_inflight: Arc::new(DashMap::new()),
+        // Header prefetch concurrency. Each rclone-cat call is dominated
+        // by process spawn + OAuth refresh + cloud round-trip (~2-3 s),
+        // and the per-call CPU cost is negligible — running many in
+        // parallel is mostly bound by rclone process count and Drive
+        // API quota. 16 hits a sweet spot: fills a typical media folder
+        // (10-20 large files) in 2-3 s once focus lands on it, without
+        // forking dozens of concurrent rclone processes.
+        prefetch_sem:      Arc::new(tokio::sync::Semaphore::new(16)),
+        prefetch_focus_dir: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let mut opts = vec![MountOption::FSName(format!("stratosync:{mount_name}")), MountOption::AutoUnmount, MountOption::DefaultPermissions];
     if cfg.allow_other { opts.push(MountOption::AllowOther); }

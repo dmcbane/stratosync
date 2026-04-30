@@ -54,34 +54,54 @@ All notable changes to this project will be documented in this file.
   a sibling — lowest inode wins, matching what `lookup` returns. With
   migration 0006 in place this should never fire in practice; if it
   does, the warning log surfaces it for follow-up.
-- **30-second context-menu hangs in Dolphin on folders of large media
-  files**: KIO opens every selected file and reads 16–64 KiB from
-  offset 0 to sniff MIME / generate thumbnails on right-click. Each
-  read on a `Remote` file used to be a fresh `rclone cat --offset 0
-  --count 32768` invocation (process spawn + OAuth refresh + cloud
-  round-trip ≈ 1–3 s), so right-clicking N selected files blocked the
+- **30-second-plus context-menu hangs in Dolphin on folders of large
+  media files**: KIO opens every selected file and reads 16–64 KiB
+  from offset 0 to sniff MIME / generate thumbnails on right-click.
+  Each read on a `Remote` file used to be a fresh `rclone cat --offset
+  0 --count 32768` invocation (process spawn + OAuth refresh + cloud
+  round-trip ≈ 1–3 s), and KIO's sniff loop is *serial* — read, await
+  reply, read next — so right-clicking N selected files blocked the
   UI for ~3 s × N. Worse, our `open()` was *also* optimistically
   kicking off a full `rclone copyto` for every file in the background,
   so a casual right-click on five MP4s would queue up multi-GB
-  downloads. Two changes:
-   - **Header cache** (`<cache_dir>/.meta/headers/<inode>`): the new
-     `spawn_prefetch_headers` task pre-fetches the first 64 KiB of
-     every over-`prefetch_threshold` file as soon as a directory is
-     listed. `read()` now serves any offset-0 sniff that fits within
-     the header from the local file, skipping the network entirely.
-     New config knob `[sync] header_prefetch_size` (default `"64 KB"`,
-     `"0"` to disable). Headers are dropped on rename overwrite,
-     unlink, and any poller-detected remote change.
-   - **Deferred auto-hydrate for huge files**: files larger than the
-     new `[sync] auto_hydrate_max_size` (default `"100 MB"`) are no
+  downloads. Five interacting changes that together drop right-click
+  on a primed folder of MP4s from ~45 s to instant:
+   - **Header cache** (`<cache_dir>/.meta/headers/<inode>`): persists
+     the first N bytes of a file at owner-only perms, atomic
+     temp-rename writes. `read()` serves any in-range sniff from the
+     local file. New config knob `[sync] header_prefetch_size`
+     (default `"64 KB"`, `"0"` to disable). Headers are dropped on
+     rename-overwrite, unlink, and any poller-detected remote change.
+   - **Background `spawn_prefetch_headers`** runs on every `readdir`
+     for files over `[sync] prefetch_threshold` (the small-file pass
+     already hydrates everything below it in full). Idempotent —
+     skips files that already have a header on disk OR are tracked in
+     a daemon-wide `prefetch_inflight` DashMap, so concurrent reads
+     and concurrent readdirs of the same dir never duplicate work.
+   - **Focus-aware queue**: each `readdir` records its target inode
+     in `prefetch_focus_dir`. Queued prefetch tasks check it after
+     waking from the semaphore and bail if the user has navigated
+     elsewhere — so the user's *current* directory isn't stuck
+     behind 600 stale headers from sidebar-tree readdirs. (Without
+     this, KIO's tree-view + breadcrumb panel walking 30 dirs sent
+     the user's actual right-click target to the back of a 3-min
+     queue.) Daemon-wide concurrency cap is 16 simultaneous
+     rclone-cat invocations.
+   - **Async-spawned `read()` handler**: was `rt.block_on`, now
+     `rt.spawn` so the FUSE worker thread frees up immediately to
+     accept the next request. Replies fire from inside the spawned
+     task once work completes (`ReplyData` is `Send`). Doesn't help
+     when the *caller* serializes (KIO does), but unlocks parallelism
+     for callers that don't.
+   - **Deferred auto-hydrate for huge files**: files larger than
+     `[sync] auto_hydrate_max_size` (default `"100 MB"`) are no
      longer full-downloaded by `open()`. They still hydrate on the
-     first read past the header — which is the user actually
-     accessing content rather than KIO sniffing — so streaming and
-     `cat`-style use still work. Set to `"0"` to keep legacy v0.12.0
-     behavior.
-  Together: right-click on a folder of MP4s is now ~instant after the
-  initial directory listing settles, and we don't burn bandwidth on
-  files the user only glanced at.
+     first read past the header — that's the user actually accessing
+     content rather than KIO sniffing — so streaming and `cat`-style
+     use still work. Set to `"0"` to keep legacy v0.12.0 behavior.
+  Verified live against a folder of eleven 1–2 GB Google-Drive MP4s
+  through Dolphin: from ~45 s freeze pre-fix → instant post-fix once
+  the focus pass completes (~3 s after navigating into the folder).
 
 ## [0.12.0-beta.1] - 2026-04-29
 
