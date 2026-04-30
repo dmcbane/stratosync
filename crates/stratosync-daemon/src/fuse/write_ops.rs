@@ -544,6 +544,68 @@ mod tests {
         assert!(db.get_by_remote_path(mid, "keep.txt").await.unwrap().is_some());
     }
 
+    /// Regression for the user-reported "two copies of test/ at root after
+    /// mkdir + move" scenario. After creating `test/SUBSUB` and renaming
+    /// every file under `test/` into `test/SUBSUB/`, the root listing must
+    /// still contain exactly one `test` entry. Duplicate rows would
+    /// indicate a stray insert in mkdir/rename that creates a second row
+    /// with same (parent, name) but different remote_path.
+    #[tokio::test]
+    async fn root_listing_stable_through_mkdir_and_recursive_move() {
+        let (db, mid, backend, cache, open_files, next_fh, ignore) = setup(&[]).await;
+
+        // Pre-existing layout: root/test/{a.txt, b.txt, c.txt}
+        let test_inode = handle_mkdir(
+            FUSE_ROOT_INODE, "test", mid, &db, &backend, &ignore,
+        ).await.expect("mkdir test");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            handle_create(
+                test_inode, n, mid, &db, cache.path(),
+                &open_files, &next_fh, &ignore,
+            ).await.expect("create file");
+        }
+
+        // Confirm one "test" at root before the move.
+        let pre = db.list_children(mid, FUSE_ROOT_INODE).await.unwrap();
+        let test_count = pre.iter().filter(|e| e.name == "test").count();
+        assert_eq!(test_count, 1, "exactly one test/ at root before move");
+
+        // mkdir test/SUBSUB
+        let subsub_inode = handle_mkdir(
+            test_inode, "SUBSUB", mid, &db, &backend, &ignore,
+        ).await.expect("mkdir SUBSUB");
+
+        // Move every child of test/ into test/SUBSUB/.
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            handle_rename(
+                test_inode, n, subsub_inode, n, mid, &db, &backend,
+            ).await.expect("rename into SUBSUB");
+        }
+
+        // Root listing should still have exactly one "test" entry.
+        let post = db.list_children(mid, FUSE_ROOT_INODE).await.unwrap();
+        let post_test_count = post.iter().filter(|e| e.name == "test").count();
+        let names: Vec<_> = post.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            post_test_count, 1,
+            "root must have exactly one test/ after recursive move; got names: {names:?}"
+        );
+
+        // And test/ should now contain exactly SUBSUB (no leftover children).
+        let test_kids = db.list_children(mid, test_inode).await.unwrap();
+        let test_kid_names: Vec<_> = test_kids.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            test_kid_names, vec!["SUBSUB"],
+            "test/ should only contain SUBSUB after move"
+        );
+
+        // SUBSUB should have all three files.
+        let subsub_kids = db.list_children(mid, subsub_inode).await.unwrap();
+        let mut names: Vec<_> = subsub_kids.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt", "b.txt", "c.txt"]);
+    }
+
     #[tokio::test]
     async fn handle_mkdir_blocks_ignored_names() {
         // Match the directory itself; `node_modules/**` matches contents

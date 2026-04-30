@@ -505,7 +505,25 @@ impl Filesystem for StratoFs {
         match result {
             Err(e) => { error!(ino, "readdir: {e:#}"); reply.error(libc::EIO); }
             Ok(children) => {
-                debug!(ino, count = children.len(), offset, "readdir returning entries");
+                // Hide rows whose (parent, name) collides — only the
+                // lowest-inode row wins, matching what `get_by_parent_name`
+                // (and therefore lookup) returns. Two children with the
+                // same name in one directory is logically invalid; before
+                // v0.12.1 the kernel readdir cache hid such phantoms, but
+                // the post-mutation `inval_inode` introduced in v0.12.1
+                // exposed them. Dedup keeps the visible filesystem state
+                // consistent while we hunt the upstream cause.
+                // `list_children` already sorts by inode ASC, so the first
+                // occurrence of any name is the lowest-inode row.
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                let unique: Vec<&FileEntry> = children.iter()
+                    .filter(|e| seen.insert(e.name.as_str()))
+                    .collect();
+                let dropped = children.len() - unique.len();
+                if dropped > 0 {
+                    warn!(ino, dropped, "readdir hid duplicate (parent,name) rows");
+                }
+                debug!(ino, count = unique.len(), offset, "readdir returning entries");
                 let dots: Vec<(u64, FileType, &str)> = vec![
                     (ino, FileType::Directory, "."),
                     (ino, FileType::Directory, ".."),
@@ -518,7 +536,7 @@ impl Filesystem for StratoFs {
                     }
                     i += 1;
                 }
-                for e in &children {
+                for e in &unique {
                     let ft = match e.kind { FileKind::Directory => FileType::Directory, FileKind::Symlink => FileType::Symlink, _ => FileType::RegularFile };
                     if i >= offset as usize && reply.add(e.inode, (i + 1) as i64, ft, e.name.as_str()) {
                         reply.ok();

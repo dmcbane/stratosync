@@ -30,6 +30,15 @@ All notable changes to this project will be documented in this file.
   `fuser`'s `abi-7-12` feature exposes `inval_inode`. Nautilus picked
   up the changes via inotify regardless; Dolphin/KIO needed the
   explicit kernel-cache invalidation.
+- **Defensive readdir dedup**: in `fuse::readdir`, hide rows that share
+  `(parent_inode, name)` with a sibling — keep only the lowest-inode
+  row, matching what `lookup` already returns. The kernel's stale
+  readdir cache used to hide such phantoms, so the post-mutation
+  `inval_inode` from this release exposed them. Logs a warning when it
+  fires so leftover dupes from earlier versions can be surfaced and
+  cleaned up. The latent insert path that produces these rows is still
+  under investigation; this guard preserves user-visible consistency
+  while we trace it.
 
 ## [0.12.0-beta.1] - 2026-04-29
 
