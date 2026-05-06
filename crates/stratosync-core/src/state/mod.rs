@@ -746,6 +746,61 @@ impl StateDb {
         )?;
         Ok(n)
     }
+
+    // ── Mount health (hydration) ─────────────────────────────────────────────
+
+    /// Increment the failure counter and stash the latest error / timestamp.
+    /// Idempotent on first call (upsert) so callers don't have to seed a row.
+    pub async fn record_hydration_failure(
+        &self, mount_id: u32, error: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO mount_health
+                 (mount_id, consecutive_hydration_failures,
+                  last_hydration_error, last_hydration_failure_unix)
+             VALUES (?1, 1, ?2, unixepoch())
+             ON CONFLICT(mount_id) DO UPDATE SET
+                 consecutive_hydration_failures =
+                     consecutive_hydration_failures + 1,
+                 last_hydration_error        = excluded.last_hydration_error,
+                 last_hydration_failure_unix = excluded.last_hydration_failure_unix",
+            params![mount_id, error],
+        )?;
+        Ok(())
+    }
+
+    /// Reset the failure counter on a successful hydration. Leaves the
+    /// `last_hydration_*` columns intact so the dashboard can show "last
+    /// failure was N minutes ago, healthy now."
+    pub async fn record_hydration_success(&self, mount_id: u32) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO mount_health (mount_id, consecutive_hydration_failures)
+             VALUES (?1, 0)
+             ON CONFLICT(mount_id) DO UPDATE SET
+                 consecutive_hydration_failures = 0",
+            params![mount_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_mount_health(&self, mount_id: u32) -> Result<MountHealth> {
+        let conn = self.conn.lock().await;
+        let row = conn.query_row(
+            "SELECT consecutive_hydration_failures,
+                    last_hydration_error,
+                    last_hydration_failure_unix
+             FROM mount_health WHERE mount_id = ?1",
+            params![mount_id],
+            |r| Ok(MountHealth {
+                consecutive_hydration_failures: r.get::<_, i64>(0)? as u32,
+                last_hydration_error:           r.get(1)?,
+                last_hydration_failure_unix:    r.get(2)?,
+            }),
+        ).optional()?;
+        Ok(row.unwrap_or_default())
+    }
 }
 
 // ── Data structures ───────────────────────────────────────────────────────────
@@ -762,6 +817,13 @@ pub struct NewFileEntry {
     pub status:      SyncStatus,
     pub cache_path:  Option<PathBuf>,
     pub cache_size:  Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MountHealth {
+    pub consecutive_hydration_failures: u32,
+    pub last_hydration_error:           Option<String>,
+    pub last_hydration_failure_unix:    Option<i64>,
 }
 
 #[derive(Debug)]
@@ -892,6 +954,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0004", include_str!("migrations/0004_base_versions.sql")),
     ("0005", include_str!("migrations/0005_version_history.sql")),
     ("0006", include_str!("migrations/0006_dedupe_file_index.sql")),
+    ("0007", include_str!("migrations/0007_mount_health.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -1454,6 +1517,61 @@ mod tests {
         let orphans = db.prune_version_history(inode, 0).await.unwrap();
         assert_eq!(orphans.len(), 3);
         assert!(db.list_version_history(inode).await.unwrap().is_empty());
+    }
+
+    // ── Mount health ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mount_health_default_is_healthy() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h, MountHealth::default());
+        assert_eq!(h.consecutive_hydration_failures, 0);
+        assert!(h.last_hydration_error.is_none());
+        assert!(h.last_hydration_failure_unix.is_none());
+    }
+
+    #[tokio::test]
+    async fn mount_health_failure_increments_and_records_error() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+
+        db.record_hydration_failure(mount_id, "first oops").await.unwrap();
+        db.record_hydration_failure(mount_id, "second oops").await.unwrap();
+        db.record_hydration_failure(mount_id, "third oops").await.unwrap();
+
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_hydration_failures, 3);
+        assert_eq!(h.last_hydration_error.as_deref(), Some("third oops"));
+        assert!(h.last_hydration_failure_unix.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn mount_health_success_resets_counter_but_keeps_last_error() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+
+        db.record_hydration_failure(mount_id, "blew up").await.unwrap();
+        db.record_hydration_failure(mount_id, "blew up again").await.unwrap();
+        db.record_hydration_success(mount_id).await.unwrap();
+
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_hydration_failures, 0,
+            "success must clear consecutive failures");
+        // Keep the last error so the dashboard can say "healthy now,
+        // last failure was X ago." This intentionally diverges from a
+        // pure reset — important for users who want to know there was
+        // recent trouble even after recovery.
+        assert_eq!(h.last_hydration_error.as_deref(), Some("blew up again"));
+        assert!(h.last_hydration_failure_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn mount_health_success_on_clean_mount_is_noop() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+        // Should not panic / error if no row exists yet.
+        db.record_hydration_success(mount_id).await.unwrap();
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_hydration_failures, 0);
+        assert!(h.last_hydration_error.is_none());
     }
 }
 

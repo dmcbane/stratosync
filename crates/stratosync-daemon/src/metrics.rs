@@ -156,6 +156,10 @@ pub fn render_prometheus(s: &DaemonStatus) -> String {
         "Total open() callers blocked on a hydration.",
         |m| m.hydration.waiters);
     emit_mount_gauge(&mut out, s,
+        "stratosync_mount_hydration_consecutive_failures",
+        "Hydration failures since the last success. Non-zero means downloads are stalling.",
+        |m| m.hydration.consecutive_failures as u64);
+    emit_mount_gauge(&mut out, s,
         "stratosync_mount_conflicts",
         "Number of conflict files present for this mount.",
         |m| m.conflicts);
@@ -266,7 +270,7 @@ mod tests {
                     current_interval_secs: 60,
                     last_error: None,
                 },
-                hydration:  HydrationStatus { active: 0, waiters: 0 },
+                hydration:  HydrationStatus { active: 0, waiters: 0, ..Default::default() },
                 conflicts:  3,
             }],
         }

@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.2] - 2026-05-06
+
+### Added
+- **Hydration health surfaced in tray, dashboard, and Prometheus**: when
+  downloads (FUSE `open()` hydrations) start failing, a new
+  `mount_health` table records consecutive failures and the last error
+  message. The system tray flips to a `dialog-warning` icon (and names
+  the stalled mount in its tooltip) at 3 consecutive failures so users
+  notice the problem without grepping the journal. The dashboard TUI
+  shows the same data in the poller pane (`hydration: N consecutive
+  fail(s) — …`) and folds it into the per-mount status column. A new
+  `stratosync_mount_hydration_consecutive_failures` Prometheus gauge is
+  emitted for scrape-based alerting. Successful hydrations reset the
+  counter but keep `last_hydration_error` so post-recovery diagnostics
+  still work. Schema migration `0007_mount_health.sql`.
+
+  This is a visibility fix only — the underlying "ino=… not found:
+  directory not found" error during large copies is tracked separately
+  (likely a delta-poller rename racing an in-flight download).
+
 ## [0.12.1] - 2026-04-30
 
 ### Fixed

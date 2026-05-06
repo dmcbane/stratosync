@@ -79,8 +79,21 @@ impl Default for PollerStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct HydrationStatus {
-    pub active:  u64,
-    pub waiters: u64,
+    pub active:               u64,
+    pub waiters:              u64,
+    /// Failed hydrations since the last success. Reset to 0 on any
+    /// successful download. The tray flips to a warning icon when this
+    /// is non-zero so users learn that downloads are stalling without
+    /// having to read journal logs.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// The most recent hydration error message, kept across recoveries
+    /// so the dashboard can show "healthy now, last failure was X."
+    #[serde(default)]
+    pub last_error:           Option<String>,
+    /// Unix-epoch seconds of the last failure, also kept across recoveries.
+    #[serde(default)]
+    pub last_failure_unix:    Option<i64>,
 }
 
 /// Wire envelope. The daemon always responds with one of these.
@@ -144,7 +157,11 @@ mod tests {
                     current_interval_secs: 60,
                     last_error: None,
                 },
-                hydration: HydrationStatus { active: 1, waiters: 2 },
+                hydration: HydrationStatus {
+                    active:  1,
+                    waiters: 2,
+                    ..Default::default()
+                },
                 conflicts: 3,
             }],
         }

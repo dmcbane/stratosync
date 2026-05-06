@@ -167,7 +167,7 @@ fn render(
             Constraint::Length(3), // header
             Constraint::Min(6),    // mount table
             Constraint::Length(8), // in-flight detail
-            Constraint::Length(5), // poller detail
+            Constraint::Length(7), // poller + hydration detail
             Constraint::Length(1), // help
         ])
         .split(area);
@@ -237,18 +237,29 @@ fn render(
             chunks[2],
         );
 
-        // Poller detail
+        // Poller detail (also surfaces hydration health — both are
+        // operational signals the user wants in one glance).
         let poller_text = mount.map(|m| {
             let last = m.poller.last_poll_unix.map(|u| format!("{}s ago", elapsed_secs(u)))
                 .unwrap_or_else(|| "never".to_string());
             let next = m.poller.next_poll_unix.map(|u| format!("in {}s", until_secs(u)))
                 .unwrap_or_else(|| "-".to_string());
-            format!(
+            let mut text = format!(
                 "mode: {}   last: {}   next: {}\nfailures: {}   interval: {}s{}",
                 m.poller.mode, last, next,
                 m.poller.consecutive_failures, m.poller.current_interval_secs,
                 m.poller.last_error.as_ref().map(|e| format!("\nerror: {e}")).unwrap_or_default(),
-            )
+            );
+            if m.hydration.consecutive_failures > 0 {
+                text.push_str(&format!(
+                    "\nhydration: {} consecutive fail(s){}",
+                    m.hydration.consecutive_failures,
+                    m.hydration.last_error.as_ref()
+                        .map(|e| format!(" — {e}"))
+                        .unwrap_or_default(),
+                ));
+            }
+            text
         }).unwrap_or_default();
         let ptitle = mount.map(|m| format!(" {}: poller ", m.name))
             .unwrap_or_else(|| " poller ".to_string());
@@ -269,7 +280,11 @@ fn render(
 // ── Formatting helpers ───────────────────────────────────────────────────────
 
 fn status_label(m: &MountStatus) -> String {
-    match m.poller.consecutive_failures {
+    // Worst-of poller and hydration. A stalled download is just as bad
+    // as a failing poller, and lumping them under one column keeps the
+    // overview row scannable.
+    let worst = m.poller.consecutive_failures.max(m.hydration.consecutive_failures);
+    match worst {
         0    => "● ok".to_string(),
         1..=9 => "◎ retry".to_string(),
         _    => "✕ halt".to_string(),

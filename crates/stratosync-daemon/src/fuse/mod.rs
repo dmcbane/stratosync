@@ -276,18 +276,34 @@ async fn do_hydrate(
         Ok(())
     }.await;
 
-    if result.is_err() {
-        // Roll back: reset status so a future open() retries hydration.
-        // If this fails, the inode is stuck in Hydrating until daemon restart
-        // (reset_hydrating handles that on startup).
-        if let Err(e) = db.set_status(entry.inode, SyncStatus::Remote).await {
-            warn!(inode = entry.inode, "failed to reset status after hydration error: {e}");
+    match &result {
+        Ok(()) => {
+            if let Err(e) = db.record_hydration_success(entry.mount_id).await {
+                debug!(mount_id = entry.mount_id, "record_hydration_success: {e}");
+            }
         }
-        // Clean up partial download. ENOENT is expected if the download
-        // failed before creating the file.
-        if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(inode = entry.inode, ?tmp_path, "failed to remove partial download: {e}");
+        Err(err) => {
+            // Roll back: reset status so a future open() retries hydration.
+            // If this fails, the inode is stuck in Hydrating until daemon restart
+            // (reset_hydrating handles that on startup).
+            if let Err(e) = db.set_status(entry.inode, SyncStatus::Remote).await {
+                warn!(inode = entry.inode, "failed to reset status after hydration error: {e}");
+            }
+            // Surface the failure for the dashboard / tray. Best-effort:
+            // if the write fails, we'd rather lose a health update than
+            // mask the underlying error from the read path.
+            if let Err(e) = db
+                .record_hydration_failure(entry.mount_id, &err.to_string())
+                .await
+            {
+                debug!(mount_id = entry.mount_id, "record_hydration_failure: {e}");
+            }
+            // Clean up partial download. ENOENT is expected if the download
+            // failed before creating the file.
+            if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(inode = entry.inode, ?tmp_path, "failed to remove partial download: {e}");
+                }
             }
         }
     }
@@ -1147,6 +1163,108 @@ pub fn mount(
     let _ = notifier_slot.set(session.notifier());
     session.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod hydrate_tests {
+    use super::*;
+    use stratosync_core::{
+        backend::mock::MockBackend,
+        base_store::BaseStore,
+        config::SyncConfig,
+        state::{NewFileEntry, StateDb},
+        types::{FileKind, FUSE_ROOT_INODE},
+        Backend,
+    };
+
+    async fn setup() -> (Arc<StateDb>, Arc<dyn Backend>, MockBackend, Arc<BaseStore>,
+                        Arc<SyncConfig>, tempfile::TempDir, u32) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(StateDb::in_memory().unwrap());
+        db.migrate().await.unwrap();
+        let mount_id = db.upsert_mount(
+            "test", "mock:/", "/mnt/test",
+            dir.path().to_str().unwrap(), 5 << 30, 60,
+        ).await.unwrap();
+        db.insert_root(&NewFileEntry {
+            mount_id, parent: 0,
+            name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+        let mock = MockBackend::default();
+        let backend: Arc<dyn Backend> = Arc::new(mock.clone());
+        let base = Arc::new(BaseStore::new(dir.path().join(".bases")).unwrap());
+        let sync = Arc::new(SyncConfig::default());
+        // do_hydrate writes temp files under .meta/partial.
+        std::fs::create_dir_all(dir.path().join(".meta").join("partial")).unwrap();
+        (db, backend, mock, base, sync, dir, mount_id)
+    }
+
+    #[tokio::test]
+    async fn do_hydrate_success_records_health_recovery() {
+        let (db, backend, mock, base, sync, dir, mid) = setup().await;
+        mock.seed_file("/foo.txt", b"hello world");
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "foo.txt".into(), remote_path: "/foo.txt".into(),
+            kind: FileKind::File, size: 11,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        // Simulate a prior failure so we can verify the counter resets.
+        db.record_hydration_failure(mid, "earlier blow-up").await.unwrap();
+        assert_eq!(
+            db.get_mount_health(mid).await.unwrap().consecutive_hydration_failures, 1);
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let cache_dir = dir.path().to_path_buf();
+        do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync)
+            .await.expect("hydrate must succeed for seeded file");
+
+        let h = db.get_mount_health(mid).await.unwrap();
+        assert_eq!(h.consecutive_hydration_failures, 0,
+            "successful hydration must zero the counter");
+        // last_hydration_error survives so the dashboard can still show
+        // "recovered after a failure."
+        assert_eq!(h.last_hydration_error.as_deref(), Some("earlier blow-up"));
+    }
+
+    #[tokio::test]
+    async fn do_hydrate_failure_increments_health_counter() {
+        let (db, backend, mock, base, sync, dir, mid) = setup().await;
+        // Seed metadata but no file body — backend will return NotFound.
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "ghost.bin".into(), remote_path: "/ghost.bin".into(),
+            kind: FileKind::File, size: 100,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+        // Forcing failure even if seeded — keeps the test independent of
+        // mock NotFound behavior.
+        mock.fail_on("/ghost.bin");
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let cache_dir = dir.path().to_path_buf();
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        assert!(res.is_err(), "hydrate must fail when backend errors");
+
+        let h = db.get_mount_health(mid).await.unwrap();
+        assert_eq!(h.consecutive_hydration_failures, 1,
+            "failed hydration must record exactly one failure");
+        assert!(h.last_hydration_error.as_deref().unwrap().contains("ghost.bin"),
+            "last error should include the failing path; got {:?}",
+            h.last_hydration_error);
+        assert!(h.last_hydration_failure_unix.is_some());
+    }
 }
 
 #[cfg(test)]

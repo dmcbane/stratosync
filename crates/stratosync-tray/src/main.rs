@@ -12,6 +12,12 @@ use tracing_subscriber::EnvFilter;
 
 // ── Mount status snapshot ────────────────────────────────────────────────────
 
+/// Number of consecutive hydration failures at which the tray flips into
+/// the "downloads stalled" warning state. Single transient errors are
+/// frequent on flaky networks and would just cause icon flicker; a small
+/// run of failures is what users actually want to know about.
+const HYDRATION_DEGRADED_THRESHOLD: u32 = 3;
+
 #[derive(Clone, Default)]
 struct MountStatus {
     name:       String,
@@ -22,6 +28,18 @@ struct MountStatus {
     conflicts:  u64,
     pinned:     u64,
     mounted:    bool,
+    /// Consecutive hydration (download) failures since the last success.
+    /// Sourced from the `mount_health` table written by the daemon.
+    hydration_failures: u32,
+    /// Most recent hydration error message, kept across recoveries so the
+    /// menu can still show "last download error: …" after things settle.
+    last_hydration_error: Option<String>,
+}
+
+impl MountStatus {
+    fn is_degraded(&self) -> bool {
+        self.hydration_failures >= HYDRATION_DEGRADED_THRESHOLD
+    }
 }
 
 #[derive(Clone, Default)]
@@ -31,7 +49,12 @@ struct GlobalStatus {
 
 impl GlobalStatus {
     fn icon_name(&self) -> &'static str {
+        // Order matters: a "stalled download" or active conflict is louder
+        // than a normal in-flight sync. Conflicts win over hydration so a
+        // user with both still gets the conflict-aware menu first.
         if self.mounts.iter().any(|m| m.conflicts > 0) {
+            "dialog-warning"
+        } else if self.mounts.iter().any(|m| m.is_degraded()) {
             "dialog-warning"
         } else if self.mounts.iter().any(|m| m.syncing > 0) {
             "sync-synchronizing"
@@ -45,9 +68,20 @@ impl GlobalStatus {
     fn tooltip(&self) -> String {
         let total_syncing: u64 = self.mounts.iter().map(|m| m.syncing).sum();
         let total_conflicts: u64 = self.mounts.iter().map(|m| m.conflicts).sum();
+        let stalled: Vec<&MountStatus> = self.mounts.iter()
+            .filter(|m| m.is_degraded()).collect();
 
         if total_conflicts > 0 {
             format!("stratosync: {} conflict(s)", total_conflicts)
+        } else if !stalled.is_empty() {
+            // One mount stalled is the common case — name it. Multi-mount
+            // stalls roll up to a count to keep the tooltip short.
+            if stalled.len() == 1 {
+                format!("stratosync: download stalled on {} ({} fail(s))",
+                    stalled[0].name, stalled[0].hydration_failures)
+            } else {
+                format!("stratosync: downloads stalled on {} mount(s)", stalled.len())
+            }
         } else if total_syncing > 0 {
             format!("stratosync: syncing {} file(s)", total_syncing)
         } else {
@@ -128,6 +162,19 @@ fn poll_mount(mount: &stratosync_core::config::MountConfig) -> MountStatus {
         rusqlite::params![mount_id],
         |r| r.get::<_, i64>(0),
     ).unwrap_or(0) as u64;
+
+    // Hydration health — written by the daemon's FUSE layer. Absent on a
+    // freshly migrated DB that has never had a hydration; treat that as
+    // healthy (zero failures).
+    if let Ok((failures, last_error)) = conn.query_row(
+        "SELECT consecutive_hydration_failures, last_hydration_error
+         FROM mount_health WHERE mount_id = ?1",
+        rusqlite::params![mount_id],
+        |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, Option<String>>(1)?)),
+    ) {
+        ms.hydration_failures = failures;
+        ms.last_hydration_error = last_error;
+    }
 
     ms
 }
@@ -215,6 +262,20 @@ impl ksni::Tray for StratoSyncTray {
                     ..Default::default()
                 }));
             }
+            if mount.is_degraded() {
+                let err = mount.last_hydration_error.as_deref()
+                    .unwrap_or("(unknown error)");
+                // Truncate long errors so the menu stays readable; the
+                // dashboard / logs are the authoritative place for full
+                // diagnostics.
+                let short: String = err.chars().take(80).collect();
+                items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                    label: format!("  download stalled ({} fail(s)): {}",
+                        mount.hydration_failures, short),
+                    enabled: false,
+                    ..Default::default()
+                }));
+            }
             if mount.pinned > 0 {
                 items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
                     label: format!("  {} pinned", mount.pinned),
@@ -268,5 +329,74 @@ fn main() {
             eprintln!("Ensure a StatusNotifierItem host is running (KDE, GNOME with extension, etc.)");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount(name: &str) -> MountStatus {
+        MountStatus { name: name.into(), enabled: true, mounted: true, ..Default::default() }
+    }
+
+    #[test]
+    fn idle_mount_shows_folder_cloud() {
+        let g = GlobalStatus { mounts: vec![mount("a")] };
+        assert_eq!(g.icon_name(), "folder-cloud");
+    }
+
+    #[test]
+    fn one_or_two_failures_do_not_flip_to_degraded() {
+        let mut m = mount("a");
+        m.hydration_failures = HYDRATION_DEGRADED_THRESHOLD - 1;
+        let g = GlobalStatus { mounts: vec![m] };
+        assert_eq!(g.icon_name(), "folder-cloud",
+            "single transient failures should not warn the user");
+        assert_eq!(g.tooltip(), "stratosync: idle");
+    }
+
+    #[test]
+    fn hydration_failures_at_threshold_warn() {
+        let mut m = mount("gdrive");
+        m.hydration_failures = HYDRATION_DEGRADED_THRESHOLD;
+        m.last_hydration_error = Some("not found: ino=2179".into());
+        let g = GlobalStatus { mounts: vec![m] };
+        assert_eq!(g.icon_name(), "dialog-warning");
+        let tip = g.tooltip();
+        assert!(tip.contains("gdrive"), "tooltip names the stalled mount: {tip}");
+        assert!(tip.contains("stalled"));
+    }
+
+    #[test]
+    fn conflicts_take_priority_over_hydration_warning() {
+        let mut m = mount("a");
+        m.hydration_failures = HYDRATION_DEGRADED_THRESHOLD;
+        m.conflicts = 2;
+        let g = GlobalStatus { mounts: vec![m] };
+        assert_eq!(g.icon_name(), "dialog-warning");
+        // Conflicts win the tooltip — they require user action; a stalled
+        // download often resolves on its own as the network recovers.
+        assert!(g.tooltip().contains("conflict"));
+    }
+
+    #[test]
+    fn multiple_stalled_mounts_roll_up_in_tooltip() {
+        let mut a = mount("a"); a.hydration_failures = HYDRATION_DEGRADED_THRESHOLD;
+        let mut b = mount("b"); b.hydration_failures = HYDRATION_DEGRADED_THRESHOLD + 5;
+        let g = GlobalStatus { mounts: vec![a, b] };
+        let tip = g.tooltip();
+        assert!(tip.contains("2 mount"), "tip rolls up: {tip}");
+    }
+
+    #[test]
+    fn syncing_overrides_idle_but_not_hydration_warning() {
+        let mut m = mount("a");
+        m.syncing = 5;
+        m.hydration_failures = HYDRATION_DEGRADED_THRESHOLD;
+        let g = GlobalStatus { mounts: vec![m] };
+        // Stalled downloads outrank "syncing" — the user should see the
+        // warning, not the spinner.
+        assert_eq!(g.icon_name(), "dialog-warning");
     }
 }

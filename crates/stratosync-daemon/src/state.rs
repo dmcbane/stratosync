@@ -73,9 +73,13 @@ async fn collect_mount_status(m: &MountHandle) -> MountStatus {
     let hydration_waiters: u64 = m.hydration_waiters.iter()
         .map(|r| r.value().len() as u64)
         .sum();
+    let health = m.db.get_mount_health(m.mount_id).await.unwrap_or_default();
     let hydration = HydrationStatus {
-        active:  hydration_active,
-        waiters: hydration_waiters,
+        active:               hydration_active,
+        waiters:              hydration_waiters,
+        consecutive_failures: health.consecutive_hydration_failures,
+        last_error:           health.last_hydration_error,
+        last_failure_unix:    health.last_hydration_failure_unix,
     };
 
     let conflicts = m.db.count_conflicts(m.mount_id).await.unwrap_or(0);
