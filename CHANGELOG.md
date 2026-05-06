@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.3] - 2026-05-06
+
+### Fixed
+- **Large-file copy from a renamed-on-remote folder loops EAGAIN
+  forever**: when a file's parent directory was renamed on the remote
+  via OneDrive (and other delta-style providers), our DB row kept its
+  old `remote_path` because the delta channel emits Modified-with-new-
+  path for renames *without* a paired Deleted-old-path event. The
+  user's `cp` then saw the FUSE `read()` retry indefinitely with
+  EAGAIN as `do_hydrate` kept calling rclone with a stale path that
+  returned "directory not found." `do_hydrate` now does a one-shot
+  `backend.stat()` whenever a download fails NotFound; if stat
+  confirms the path is gone, the row is pruned and the FUSE read
+  fails ENOENT cleanly. The kernel's next directory lookup
+  repopulates from a fresh listing under the file's new path. Stat-
+  succeeds (transient backend glitch) keeps the row intact and the
+  retry path unchanged. Error messages now include the offending
+  `remote_path` so future occurrences are diagnosable from a journal
+  glance.
+
 ## [0.12.2] - 2026-05-06
 
 ### Added

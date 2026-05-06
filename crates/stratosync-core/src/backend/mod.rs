@@ -584,6 +584,12 @@ pub mod mock {
     struct MockInner {
         files:           HashMap<String, (RemoteMetadata, Vec<u8>)>,
         fail_paths:      std::collections::HashSet<String>,
+        /// Paths whose `download` and `download_range` should return
+        /// `SyncError::NotFound` even if the file is seeded. Lets tests
+        /// simulate "stat says the path exists, but the actual download
+        /// blob is missing on the backend" — the exact divergence we
+        /// see in real life when a OneDrive delta missed a rename.
+        download_not_found_paths: std::collections::HashSet<String>,
         call_log:        Vec<String>,
         delta_enabled:   bool,
         pending_changes: Vec<RemoteChange>,
@@ -632,6 +638,15 @@ pub mod mock {
             self.inner.lock().unwrap().fail_paths.insert(path.to_owned());
         }
 
+        /// Make `download` / `download_range` return `NotFound` for this
+        /// path while leaving `stat` / `list` working normally. Models
+        /// the post-rename state where our cached `remote_path` is
+        /// out-of-date but the file still exists at a different path.
+        pub fn fail_download_not_found(&self, path: &str) {
+            self.inner.lock().unwrap()
+                .download_not_found_paths.insert(path.to_owned());
+        }
+
         pub fn call_log(&self) -> Vec<String> {
             self.inner.lock().unwrap().call_log.clone()
         }
@@ -676,6 +691,9 @@ pub mod mock {
         async fn download(&self, remote: &str, local: &Path) -> Result<(), SyncError> {
             let data = {
                 let inner = self.inner.lock().unwrap();
+                if inner.download_not_found_paths.contains(remote) {
+                    return Err(SyncError::NotFound(remote.to_owned()));
+                }
                 inner.files.get(remote)
                     .map(|(_, d)| d.clone())
                     .ok_or_else(|| SyncError::NotFound(remote.to_owned()))?
@@ -689,6 +707,9 @@ pub mod mock {
             &self, remote: &str, offset: u64, len: u64,
         ) -> Result<Vec<u8>, SyncError> {
             let inner = self.inner.lock().unwrap();
+            if inner.download_not_found_paths.contains(remote) {
+                return Err(SyncError::NotFound(remote.to_owned()));
+            }
             let (_, data) = inner.files.get(remote)
                 .ok_or_else(|| SyncError::NotFound(remote.to_owned()))?;
             let start = (offset as usize).min(data.len());

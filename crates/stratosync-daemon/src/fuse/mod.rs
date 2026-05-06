@@ -276,6 +276,59 @@ async fn do_hydrate(
         Ok(())
     }.await;
 
+    // Self-healing: if download failed with NotFound, the row may be
+    // stale. Verify with a one-shot stat — if the path is genuinely
+    // gone, drop the row so reads stop looping forever and the next
+    // lookup repopulates from a fresh listing. We only act on NotFound
+    // (not Transient/Network) because:
+    //   1. NotFound is unambiguous — the backend looked and the path
+    //      isn't there. Other errors might recover on retry.
+    //   2. Pruning on a transient glitch would wipe a user's metadata
+    //      row mid-edit; keeping it lets retries succeed.
+    // The trigger for this is OneDrive delta (and similar) emitting
+    // Modified-with-new-path for renames without a paired Deleted-old-
+    // path event. The old row sits in the DB pointing at a path the
+    // remote no longer recognizes; without this verification the
+    // user's `cp` retried EAGAIN forever.
+    let mut stale_path_pruned = false;
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(SyncError::NotFound(orig_msg)) => {
+            match backend.stat(&entry.remote_path).await {
+                Err(SyncError::NotFound(_)) => {
+                    // Confirmed: the path is gone from the remote.
+                    // Delete the row so subsequent reads fail with
+                    // ENOENT (not EAGAIN) and the kernel-level
+                    // lookup re-fetches.
+                    warn!(
+                        inode = entry.inode,
+                        path  = %entry.remote_path,
+                        "stale DB row — remote confirms path is gone; pruning",
+                    );
+                    if let Err(e) = db.delete_entry(entry.inode).await {
+                        warn!(inode = entry.inode, "failed to prune stale entry: {e}");
+                    } else {
+                        stale_path_pruned = true;
+                    }
+                    Err(SyncError::NotFound(format!(
+                        "{} (path: {})", orig_msg, entry.remote_path,
+                    )))
+                }
+                _ => {
+                    // stat succeeded OR errored for another reason —
+                    // the row is probably fine, treat the original
+                    // download failure as transient and let a retry
+                    // sort it out. Enriching the message with the path
+                    // helps diagnose recurring per-path failures.
+                    Err(SyncError::NotFound(format!(
+                        "{} (path: {})", orig_msg, entry.remote_path,
+                    )))
+                }
+            }
+        }
+        Err(e) => Err(e),
+    };
+
     match &result {
         Ok(()) => {
             if let Err(e) = db.record_hydration_success(entry.mount_id).await {
@@ -283,11 +336,15 @@ async fn do_hydrate(
             }
         }
         Err(err) => {
-            // Roll back: reset status so a future open() retries hydration.
-            // If this fails, the inode is stuck in Hydrating until daemon restart
-            // (reset_hydrating handles that on startup).
-            if let Err(e) = db.set_status(entry.inode, SyncStatus::Remote).await {
-                warn!(inode = entry.inode, "failed to reset status after hydration error: {e}");
+            // Roll back the Hydrating status so a future open() retries.
+            // Skip the rollback when we just deleted the row — the row no
+            // longer exists, so set_status would silently affect zero rows
+            // (harmless but misleading in logs). reset_hydrating on
+            // daemon restart handles any inode left stuck.
+            if !stale_path_pruned {
+                if let Err(e) = db.set_status(entry.inode, SyncStatus::Remote).await {
+                    warn!(inode = entry.inode, "failed to reset status after hydration error: {e}");
+                }
             }
             // Surface the failure for the dashboard / tray. Best-effort:
             // if the write fails, we'd rather lose a health update than
@@ -1264,6 +1321,80 @@ mod hydrate_tests {
             "last error should include the failing path; got {:?}",
             h.last_hydration_error);
         assert!(h.last_hydration_failure_unix.is_some());
+    }
+
+    // ── Stale-path self-heal ────────────────────────────────────────────
+    //
+    // OneDrive delta (and any provider that emits Modified-with-new-path
+    // for renames without a matching Deleted-old-path) leaves stale
+    // rows in our index when a file's parent directory is renamed
+    // remotely. The user's open() then loops EAGAIN forever because
+    // download against the stale path keeps returning "directory not
+    // found" but the row stays in the DB. The fix: when download fails
+    // NotFound, do a one-shot stat to verify; if the path is genuinely
+    // gone, drop the row so the next lookup repopulates from a fresh
+    // listing.
+
+    #[tokio::test]
+    async fn do_hydrate_stale_path_is_pruned_after_notfound() {
+        let (db, backend, _mock, base, sync, dir, mid) = setup().await;
+        // Insert a row pointing at a path the backend has never heard
+        // of — both download and stat will return NotFound. This is
+        // the post-rename situation: our DB still says
+        // /old-parent/file.iso, the remote has nothing there.
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "stale.iso".into(),
+            remote_path: "/old-parent/stale.iso".into(),
+            kind: FileKind::File, size: 1234,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let cache_dir = dir.path().to_path_buf();
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        assert!(matches!(res, Err(SyncError::NotFound(_))),
+            "stale-path hydrate must return NotFound (so FUSE replies ENOENT, not EAGAIN); got {res:?}");
+
+        // The DB row is gone — the kernel's next lookup will repopulate
+        // from a fresh listing, picking up the new path with a fresh inode.
+        assert!(db.get_by_inode(inode).await.unwrap().is_none(),
+            "stale entry must be deleted so retries don't loop forever");
+    }
+
+    #[tokio::test]
+    async fn do_hydrate_keeps_entry_when_remote_still_has_path() {
+        let (db, backend, mock, base, sync, dir, mid) = setup().await;
+        // Seed metadata so stat succeeds, but force download to fail
+        // NotFound. Real-world equivalent: a transient backend bug or a
+        // sliver of inconsistency between rclone's metadata cache and
+        // its data fetch. Either way, our row is NOT actually stale —
+        // we must NOT prune it.
+        mock.seed_file("/present.iso", b"some bytes");
+        mock.fail_download_not_found("/present.iso");
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "present.iso".into(),
+            remote_path: "/present.iso".into(),
+            kind: FileKind::File, size: 10,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let cache_dir = dir.path().to_path_buf();
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        assert!(res.is_err(), "hydrate fails when download fails");
+        // Critical: the row survives so the next read can retry. If we
+        // pruned it, a transient server-side glitch would wipe the
+        // user's cached metadata — much worse than just retrying.
+        assert!(db.get_by_inode(inode).await.unwrap().is_some(),
+            "row must survive when stat shows the remote still has the path");
     }
 }
 
