@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version     = "0.12.4"
+version     = "0.13.0-beta.1"
 edition     = "2021"
 authors     = ["Dale McBane"]
 license     = "MIT OR Apache-2.0"
@@ -16,7 +16,7 @@ repository  = "https://github.com/dmcbane/stratosync"
 
 [workspace.dependencies]
 tokio               = { version = "1",       features = ["full"] }
-fuser               = { version = "0.14", features = ["abi-7-12"] }
+fuser               = { version = "0.15", features = ["abi-7-12"] }
 notify              = "6.1.1"
 rusqlite            = { version = "0.31",    features = ["bundled"] }
 serde               = { version = "1",       features = ["derive"] }
@@ -28,16 +28,15 @@ tracing             = "0.1"
 tracing-subscriber  = { version = "0.3",     features = ["env-filter", "fmt"] }
 chrono              = { version = "0.4",     features = ["serde"] }
 dashmap             = "6"
-clap                = { version = "=4.5.57", features = ["derive", "env", "unstable-ext"] }
-clap_complete       = { version = "=4.5.59", features = ["unstable-dynamic"] }
+clap                = { version = "4.5", features = ["derive", "env", "unstable-ext"] }
+clap_complete       = { version = "4.5", features = ["unstable-dynamic"] }
 sha2                = "0.10"
 dirs                = "5"
 bytesize            = "1"
 libc                = "0.2"
 urlencoding         = "2"
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# toml 0.7.2 + toml_edit 0.19.9 → indexmap 1.x → works on Rust 1.63+
-toml                = "=0.7.2"
-toml_edit           = "=0.19.9"
+toml                = "0.8"
+toml_edit           = "0.22"
 ratatui             = "0.29"
 crossterm           = "0.28"

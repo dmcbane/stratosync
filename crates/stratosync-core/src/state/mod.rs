@@ -230,6 +230,10 @@ impl StateDb {
     }
 
     /// Upsert by (mount_id, remote_path) — used during remote listing.
+    /// Thin wrapper around `upsert_remote_file_by_id_or_path` with no
+    /// `item_id`. Kept for back-compat with tests and any caller that
+    /// genuinely doesn't have an ID; production poll paths use the
+    /// id-aware method directly so renames update in place.
     pub async fn upsert_remote_file(
         &self,
         mount_id:    u32,
@@ -241,10 +245,14 @@ impl StateDb {
         mtime:       SystemTime,
         etag:        Option<&str>,
     ) -> Result<Inode> {
-        self.upsert_remote_file_gen(mount_id, parent, name, remote_path, kind, size, mtime, etag, 0).await
+        self.upsert_remote_file_by_id_or_path(
+            mount_id, parent, name, remote_path,
+            kind, size, mtime, etag, None, 0,
+        ).await
     }
 
-    /// Upsert with explicit poll_generation.
+    /// Upsert with explicit poll_generation. Same back-compat shim
+    /// pattern as `upsert_remote_file`.
     pub async fn upsert_remote_file_gen(
         &self,
         mount_id:        u32,
@@ -257,37 +265,10 @@ impl StateDb {
         etag:            Option<&str>,
         poll_generation: u64,
     ) -> Result<Inode> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO file_index
-               (mount_id, parent_inode, name, remote_path, kind, size, mtime, etag, status, poll_generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote', ?9)
-             ON CONFLICT(mount_id, remote_path) DO UPDATE SET
-               parent_inode    = excluded.parent_inode,
-               name            = excluded.name,
-               kind            = excluded.kind,
-               size            = excluded.size,
-               mtime           = excluded.mtime,
-               etag            = excluded.etag,
-               poll_generation = excluded.poll_generation,
-               status          = CASE
-                 WHEN status IN ('dirty','uploading') THEN status
-                 ELSE 'stale'
-               END",
-            params![
-                mount_id, parent, name, remote_path,
-                kind.as_str(), size as i64, to_unix(mtime), etag,
-                poll_generation as i64,
-            ],
-        )?;
-
-        let inode: Inode = conn.query_row(
-            "SELECT inode FROM file_index WHERE mount_id=?1 AND remote_path=?2",
-            params![mount_id, remote_path],
-            |r| r.get::<_, i64>(0),
-        ).map(|i| i as u64)?;
-
-        Ok(inode)
+        self.upsert_remote_file_by_id_or_path(
+            mount_id, parent, name, remote_path,
+            kind, size, mtime, etag, None, poll_generation,
+        ).await
     }
 
     // ── File index: reads ─────────────────────────────────────────────────────
@@ -870,6 +851,27 @@ impl StateDb {
         ).map(|i| i as u64)?;
 
         Ok(inode)
+    }
+
+    /// Set `remote_item_id` only when the existing value is NULL. Used
+    /// by the lazy-backfill path in `do_hydrate`'s self-heal: when a
+    /// stat() succeeds for a row that doesn't yet have an item_id, we
+    /// can safely fill it in from the stat result. The IS NULL guard
+    /// ensures we never overwrite a previously-known ID with whatever
+    /// stat returned (which could differ if the row just got renamed
+    /// — though in that case the item-ID-aware upsert would have
+    /// detected the rename already).
+    pub async fn set_item_id_if_absent(
+        &self, inode: Inode, item_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE file_index
+             SET remote_item_id = ?2
+             WHERE inode = ?1 AND remote_item_id IS NULL",
+            params![inode as i64, item_id],
+        )?;
+        Ok(n > 0)
     }
 
     // ── Mount health (hydration) ─────────────────────────────────────────────
@@ -1815,6 +1817,52 @@ mod tests {
         ).unwrap();
         assert_eq!(stored.as_deref(), Some("od-y"),
             "item_id must backfill onto the pre-existing row");
+    }
+
+    // ── Lazy item_id backfill (v0.13 milestone 2) ────────────────────────
+
+    #[tokio::test]
+    async fn set_item_id_if_absent_fills_null_row() {
+        let (db, mid, root) = setup_db_with_mount().await;
+        // Row inserted without an ID (legacy / pre-v0.13 path).
+        let inode = db.upsert_remote_file_by_id_or_path(
+            mid, root, "y.txt", "y.txt", FileKind::File,
+            3, SystemTime::UNIX_EPOCH, None, None, 0,
+        ).await.unwrap();
+
+        let updated = db.set_item_id_if_absent(inode, "od-y").await.unwrap();
+        assert!(updated, "must report the update happened");
+
+        let conn = db.raw_conn().await;
+        let stored: Option<String> = conn.query_row(
+            "SELECT remote_item_id FROM file_index WHERE inode = ?1",
+            params![inode as i64], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored.as_deref(), Some("od-y"));
+    }
+
+    #[tokio::test]
+    async fn set_item_id_if_absent_does_not_overwrite_existing() {
+        // The IS NULL guard is the whole point. If a row already has
+        // an ID (e.g. set by a prior delta event), a stale stat
+        // result from the self-heal path must not clobber it — the
+        // delta event is the more authoritative source.
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode = db.upsert_remote_file_by_id_or_path(
+            mid, root, "z.txt", "z.txt", FileKind::File,
+            3, SystemTime::UNIX_EPOCH, None, Some("real-id"), 0,
+        ).await.unwrap();
+
+        let updated = db.set_item_id_if_absent(inode, "should-be-ignored").await.unwrap();
+        assert!(!updated, "must report no-op when ID already set");
+
+        let conn = db.raw_conn().await;
+        let stored: Option<String> = conn.query_row(
+            "SELECT remote_item_id FROM file_index WHERE inode = ?1",
+            params![inode as i64], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored.as_deref(), Some("real-id"),
+            "existing ID must be preserved");
     }
 
     #[tokio::test]

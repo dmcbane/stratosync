@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Stratosync is a Linux cloud sync daemon providing on-demand virtual filesystem via FUSE3, with multi-backend support through rclone. Files appear immediately with metadata-only placeholders, hydrate on `open()`, and uploads propagate automatically with conflict detection.
 
-**Status**: Beta (v0.12.4). Phases 1–6 functionally complete; encrypted caching is the only Phase 5 item deferred (to v0.13.0+). v0.11.0 was the last alpha release. v0.12.0 added: dashboard TUI (`stratosync dashboard`), file versioning (`stratosync versions`), selective sync via per-mount `ignore_patterns`, bandwidth scheduling, Prometheus `/metrics`, multi-FM integration (Nemo / Caja extensions and Dolphin emblem-overlay plugin alongside the existing Nautilus extension; KDE/Thunar/PCManFM context-menu actions), conflicts cleanup CLI, conflict-namespace isolation under `.stratosync-conflicts/`, and the `stratosync daemon` subcommand wrapping `systemctl --user` / `journalctl`. v0.12.1 fixes Dolphin/Nautilus interop: `statfs` reports real host-fs totals (Dolphin paste no longer reports "no space"), copy-overwrite no longer races the upload-finalizer into clobbering `cache_path`, and directory mutations invalidate the kernel readdir cache so new entries show up in Dolphin without re-entering the folder. v0.12.2 surfaces hydration (download) health to the tray, dashboard, and Prometheus via a new `mount_health` table — the tray flips to `dialog-warning` after 3 consecutive failures so users notice stalled downloads without grepping the journal. v0.12.3 self-heals stale `remote_path` rows left by OneDrive delta missing renames: `do_hydrate` stats the path on a NotFound download, and if the remote agrees, prunes the row so reads stop looping EAGAIN forever. v0.12.4 is **v0.13 milestone 1**: rows now carry the backend's stable item ID (Microsoft Graph / Google Drive); the new `upsert_remote_file_by_id_or_path` matches by ID first so OneDrive `Modified`-with-new-path renames update the existing row in place instead of leaving stale paths around. Backfill of pre-v0.13 rows + removal of the v0.12.3 self-heal band-aid lands in milestone 2.
+**Status**: Beta (v0.13.0-beta.1). Phases 1–6 functionally complete; encrypted caching is the only Phase 5 item deferred. v0.11.0 was the last alpha release. v0.12.0 added: dashboard TUI (`stratosync dashboard`), file versioning (`stratosync versions`), selective sync via per-mount `ignore_patterns`, bandwidth scheduling, Prometheus `/metrics`, multi-FM integration (Nemo / Caja extensions and Dolphin emblem-overlay plugin alongside the existing Nautilus extension; KDE/Thunar/PCManFM context-menu actions), conflicts cleanup CLI, conflict-namespace isolation under `.stratosync-conflicts/`, and the `stratosync daemon` subcommand wrapping `systemctl --user` / `journalctl`. v0.12.1 fixes Dolphin/Nautilus interop: `statfs` reports real host-fs totals, copy-overwrite no longer races the upload-finalizer into clobbering `cache_path`, and directory mutations invalidate the kernel readdir cache. v0.12.2 surfaces hydration health to the tray/dashboard/Prometheus via a new `mount_health` table. v0.12.3 self-heals stale `remote_path` rows left by OneDrive delta missing renames. v0.12.4 (v0.13 milestone 1) gives every row a backend-stable `remote_item_id` and routes the poller through `upsert_remote_file_by_id_or_path` so OneDrive renames update in place. **v0.13.0-beta.1 (milestone 2)** bumps MSRV to Rust 1.85 (all dep pins lifted), and the v0.12.3 self-heal now lazily backfills `remote_item_id` from the verifying `stat()` so pre-v0.13 rows graduate into the id-aware path on first failure.
 
 ## Build & Test Commands
 
@@ -58,20 +58,14 @@ The CLI binary is `stratosync`. There is no `init` subcommand. `daemon` *is* a r
 
 ## Prerequisites
 
-- Rust 1.80+
+- Rust 1.85+
 - `libfuse3-dev` (`sudo apt install libfuse3-dev` on Debian/Ubuntu)
 - `rclone` for runtime backend access (not needed for tests)
 
-## Dependency Pinning
+## Dependency Versions
 
-Project MSRV is **Rust 1.80** (declared in `install.sh` and the Prerequisites
-section above). CI uses `dtolnay/rust-toolchain@stable`, which floats well
-above the MSRV; the pins below exist to keep the build working *for users*
-on a 1.80 toolchain, not to keep CI happy.
-
-- `clap = "=4.5.57"` — 4.6+ requires `edition2024` (Rust 1.85)
-- `toml = "=0.7.2"`, `toml_edit = "=0.19.9"` — later versions pull `indexmap` 2.12+ which needs Rust 1.82
-- `fuser = "0.14"` — 0.15+ adds `clap` as a non-dev dep, which collides with our `clap` pin's exact-version resolution. Not MSRV-driven, but unpinning needs the `clap` pin lifted first.
-
-Bumping MSRV to 1.85 (planned for v0.13.0+) lifts every constraint above and
-the pins can come out together.
+Project MSRV is **Rust 1.85** (declared in `install.sh` and the
+Prerequisites section above). v0.12.5 lifted the v0.12.x pins (`clap`,
+`toml`, `toml_edit`, `fuser`) when the MSRV bumped — there are no
+exact-version pins left. Add new dependencies at their latest minor
+release; bump MSRV explicitly if a new dep requires a newer toolchain.

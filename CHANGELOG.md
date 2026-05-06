@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.1] - 2026-05-06
+
+### Changed
+- **MSRV bumped to Rust 1.85** (was 1.80). All exact-version dep pins
+  removed: `clap`, `toml`, `toml_edit`, `fuser`. `fuser` 0.15 changed
+  the `getattr` callback signature — adapted (`Option<u64>` fh added).
+  Update with `rustup update stable` if you're below 1.85.
+
+### Added
+- **v0.13 milestone 2: lazy item_id backfill in the self-heal**. When
+  `do_hydrate`'s download fails NotFound and the verifying `stat()`
+  succeeds, the stat result's `item_id` (if any) is written onto the
+  DB row via the new `set_item_id_if_absent` API. The IS NULL guard
+  ensures we never overwrite an authoritative ID with a possibly-
+  stale stat value. Effect: pre-v0.13 rows graduate into the id-aware
+  upsert path the first time they trigger the band-aid, so the *next*
+  rename event for the same item gets handled in place by milestone 1
+  instead of looping through the band-aid forever.
+
+### Notes
+- The v0.12.3 stat-on-NotFound self-heal stays in place as defense-
+  in-depth for backends without stable IDs (WebDAV, raw S3) and for
+  not-yet-backfilled rows. It also now does the lazy backfill described
+  above. Removal of the band-aid awaits a future release once the
+  installed base is fully migrated.
+- Legacy `upsert_remote_file` / `upsert_remote_file_gen` are now thin
+  wrappers around `upsert_remote_file_by_id_or_path` (one source of
+  truth). Their public signatures are unchanged for back-compat with
+  existing test fixtures and any downstream caller.
+
 ## [0.12.4] - 2026-05-06
 
 ### Added

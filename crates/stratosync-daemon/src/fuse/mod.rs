@@ -314,12 +314,31 @@ async fn do_hydrate(
                         "{} (path: {})", orig_msg, entry.remote_path,
                     )))
                 }
-                _ => {
-                    // stat succeeded OR errored for another reason —
-                    // the row is probably fine, treat the original
-                    // download failure as transient and let a retry
-                    // sort it out. Enriching the message with the path
-                    // helps diagnose recurring per-path failures.
+                Ok(meta) => {
+                    // stat succeeded — the row is *not* stale; treat
+                    // the original failure as transient and let a
+                    // retry sort it out. While we have the stat result
+                    // in hand, lazily backfill `remote_item_id` if
+                    // the row didn't already have one. This is how
+                    // pre-v0.13 rows graduate into the id-aware
+                    // upsert path: any time the band-aid fires for
+                    // them, they pick up an ID for free, and the
+                    // *next* rename event for that item gets handled
+                    // in place by milestone 1's upsert. Without this,
+                    // legacy rows would loop through the band-aid on
+                    // every rename forever.
+                    if let Some(id) = meta.item_id.as_deref() {
+                        if let Err(e) = db.set_item_id_if_absent(entry.inode, id).await {
+                            debug!(inode = entry.inode, "lazy item_id backfill: {e}");
+                        }
+                    }
+                    Err(SyncError::NotFound(format!(
+                        "{} (path: {})", orig_msg, entry.remote_path,
+                    )))
+                }
+                Err(_) => {
+                    // stat errored for another reason — keep the row,
+                    // surface as transient, let retry handle it.
                     Err(SyncError::NotFound(format!(
                         "{} (path: {})", orig_msg, entry.remote_path,
                     )))
@@ -658,7 +677,7 @@ impl Filesystem for StratoFs {
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let (db, cfg) = (Arc::clone(&self.db), self.cfg.clone());
         match self.rt.block_on(db.get_by_inode(ino)) {
             Ok(Some(e)) => reply.attr(&cfg.attr_timeout(), &entry_to_attr(&e)),
@@ -1395,6 +1414,54 @@ mod hydrate_tests {
         // user's cached metadata — much worse than just retrying.
         assert!(db.get_by_inode(inode).await.unwrap().is_some(),
             "row must survive when stat shows the remote still has the path");
+    }
+
+    #[tokio::test]
+    async fn do_hydrate_backfills_item_id_from_stat_on_recovery() {
+        // Pre-v0.13 row: NULL item_id. A failing download triggers the
+        // self-heal stat, which succeeds and reports the stable ID.
+        // We backfill it onto the row so that a *future* OneDrive
+        // delta rename event for this item gets in-place handling
+        // instead of leaving a stale row again. (Without backfill, the
+        // self-heal would have to fire AGAIN after each rename forever
+        // — defeating the point of milestone 1's id-aware upsert.)
+        let (db, backend, mock, base, sync, dir, mid) = setup().await;
+        mock.seed_file_with_id("/legacy.iso", b"hello", Some("od-id-legacy"));
+        mock.fail_download_not_found("/legacy.iso");
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "legacy.iso".into(),
+            remote_path: "/legacy.iso".into(),
+            kind: FileKind::File, size: 5,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+        // Sanity check: the row starts with NULL item_id.
+        {
+            let conn = db.raw_conn().await;
+            let stored: Option<String> = conn.query_row(
+                "SELECT remote_item_id FROM file_index WHERE inode = ?1",
+                rusqlite::params![inode as i64], |r| r.get(0),
+            ).unwrap();
+            assert!(stored.is_none(), "row must start with NULL item_id");
+        }
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let cache_dir = dir.path().to_path_buf();
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        assert!(res.is_err(), "hydrate fails when download fails NotFound");
+
+        // The row survives (stat said it's there), AND the stat-
+        // returned item_id is now persisted.
+        let conn = db.raw_conn().await;
+        let stored: Option<String> = conn.query_row(
+            "SELECT remote_item_id FROM file_index WHERE inode = ?1",
+            rusqlite::params![inode as i64], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored.as_deref(), Some("od-id-legacy"),
+            "stat result must lazily backfill the row's item_id");
     }
 }
 

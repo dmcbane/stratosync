@@ -44,8 +44,8 @@ check_dep rclone "Install from https://rclone.org/install/"
 RUST_VERSION=$(rustc --version | grep -oE '[0-9]+\.[0-9]+' | head -1)
 RUST_MAJOR=$(echo "$RUST_VERSION" | cut -d. -f1)
 RUST_MINOR=$(echo "$RUST_VERSION" | cut -d. -f2)
-if [[ $RUST_MAJOR -lt 1 ]] || [[ $RUST_MAJOR -eq 1 && $RUST_MINOR -lt 80 ]]; then
-    echo "ERROR: Rust 1.80+ required (found ${RUST_VERSION})"
+if [[ $RUST_MAJOR -lt 1 ]] || [[ $RUST_MAJOR -eq 1 && $RUST_MINOR -lt 85 ]]; then
+    echo "ERROR: Rust 1.85+ required (found ${RUST_VERSION})"
     echo "Run: rustup update stable"
     exit 1
 fi
