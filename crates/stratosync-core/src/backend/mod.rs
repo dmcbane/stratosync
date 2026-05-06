@@ -600,6 +600,15 @@ pub mod mock {
 
     impl MockBackend {
         pub fn seed_file(&self, path: &str, content: &[u8]) {
+            self.seed_file_with_id(path, content, None);
+        }
+
+        /// Seed a file with an explicit backend item ID. Use this in
+        /// tests that exercise rename-detection — same item_id, different
+        /// path simulates the OneDrive delta rename event.
+        pub fn seed_file_with_id(
+            &self, path: &str, content: &[u8], item_id: Option<&str>,
+        ) {
             let mut inner = self.inner.lock().unwrap();
             inner.files.insert(path.to_owned(), (
                 RemoteMetadata {
@@ -613,6 +622,7 @@ pub mod mock {
                     etag:      Some(format!("mock-{}", content.len())),
                     checksum:  None,
                     mime_type: None,
+                    item_id:   item_id.map(str::to_owned),
                 },
                 content.to_vec(),
             ));
@@ -735,6 +745,7 @@ pub mod mock {
                 etag:      Some(format!("mock-{}", data.len())),
                 checksum:  None,
                 mime_type: None,
+                item_id:   None,
             };
             self.inner.lock().unwrap().files.insert(remote.to_owned(), (meta.clone(), data));
             Ok(meta)

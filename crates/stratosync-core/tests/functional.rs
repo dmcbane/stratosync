@@ -1314,6 +1314,7 @@ async fn delta_mock_changes_since_drains_pending() {
             etag: Some("etag-1".into()),
             checksum: None,
             mime_type: None,
+            item_id: None,
         },
     });
     backend.push_change(RemoteChange::Deleted {
@@ -1364,6 +1365,7 @@ async fn delta_apply_additions_to_db() {
             etag: Some("etag-new".into()),
             checksum: None,
             mime_type: None,
+            item_id: None,
         },
     });
 
@@ -1474,6 +1476,7 @@ async fn delta_full_workflow() {
             etag: Some("etag-c".into()),
             checksum: None,
             mime_type: None,
+            item_id: None,
         },
     });
 

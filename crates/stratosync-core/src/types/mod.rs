@@ -151,6 +151,15 @@ pub struct RemoteMetadata {
     pub etag:      Option<String>,
     pub checksum:  Option<String>,
     pub mime_type: Option<String>,
+    /// Backend-stable identifier — Microsoft Graph item ID, Google
+    /// Drive file ID, etc. Survives renames and moves: same item, same
+    /// ID. None for backends without a stable ID concept (S3, plain
+    /// WebDAV) or for items returned by paths that don't expose one.
+    /// The poller uses this (when present) to detect renames as
+    /// in-place updates of the existing row instead of "delete old +
+    /// insert new" — which avoids the OneDrive-delta stale-row class
+    /// of bugs that drove the v0.12.3 self-heal band-aid.
+    pub item_id:   Option<String>,
 }
 
 impl TryFrom<RcloneLsJsonEntry> for RemoteMetadata {
@@ -184,6 +193,14 @@ impl TryFrom<RcloneLsJsonEntry> for RemoteMetadata {
             etag,
             checksum,
             mime_type: e.mime_type,
+            // We forward the rclone ID as item_id even though it's
+            // already serving as the etag fallback above. The two roles
+            // are different: etag is "did the content change?", item_id
+            // is "is this the same item across renames?". Using the
+            // same value for both is a transitional convenience —
+            // backends with real etags get to keep them, and item_id
+            // still serves rename detection.
+            item_id:   e.id,
         })
     }
 }

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.4] - 2026-05-06
+
+### Added
+- **v0.13 milestone 1: ID-aware rename detection**. The DB now stores
+  the backend's stable item ID (Microsoft Graph item ID, Google Drive
+  file ID) alongside each row's `remote_path`. A new
+  `StateDb::upsert_remote_file_by_id_or_path` matches on the ID first,
+  so a OneDrive `Modified`-with-new-path event for a renamed file
+  updates the existing row in place instead of leaving a stale row at
+  the old path. The full-poll path uses the same upsert so item IDs get
+  populated even for backends that aren't running on the delta channel
+  yet. Schema migration `0008_remote_item_id.sql` adds a nullable
+  `remote_item_id` column with a partial unique index. Backends that
+  don't expose stable IDs (WebDAV, plain S3) keep the legacy path-based
+  behavior — fall-through is automatic.
+
+  This is the proper fix for the bug v0.12.3 self-healed via stat-on-
+  NotFound. The self-heal stays in place as defense-in-depth for any
+  pre-v0.13 row whose ID hasn't been backfilled yet, and for backends
+  without a stable-ID concept. Backfill of existing rows + removal of
+  the band-aid lands in milestone 2.
+
 ## [0.12.3] - 2026-05-06
 
 ### Fixed

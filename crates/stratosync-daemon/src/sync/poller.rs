@@ -289,9 +289,16 @@ impl RemotePoller {
                 None => FUSE_ROOT_INODE,
             };
 
-            let inode = self.db.upsert_remote_file_gen(
+            // Full-poll path also goes through the ID-aware upsert.
+            // Generation sweep already prunes stale rows here, so the
+            // immediate win is smaller than in delta mode, but we
+            // still want item_id populated when the backend supplies
+            // one (Google Drive file IDs, etc.) so a later switch to
+            // delta-mode for that backend doesn't see NULLs.
+            let inode = self.db.upsert_remote_file_by_id_or_path(
                 self.mount_id, parent, &meta.name, &meta.path,
                 kind, meta.size, meta.mtime, meta.etag.as_deref(),
+                meta.item_id.as_deref(),
                 generation,
             ).await?;
 
@@ -498,9 +505,16 @@ impl RemotePoller {
                         None => FUSE_ROOT_INODE,
                     };
 
-                    let inode = self.db.upsert_remote_file_gen(
+                    // Use the item-ID-aware upsert so renames update
+                    // the existing row in place instead of leaving a
+                    // stale path behind. OneDrive delta always sends a
+                    // stable item ID; falling back to the path match is
+                    // a no-op for fresh data and back-compat for any
+                    // pre-v0.13 row that hasn't been touched yet.
+                    let inode = self.db.upsert_remote_file_by_id_or_path(
                         self.mount_id, parent, &meta.name, &meta.path,
                         kind, meta.size, meta.mtime, meta.etag.as_deref(),
+                        meta.item_id.as_deref(),
                         0, // generation is not used in delta mode
                     ).await?;
 
@@ -755,5 +769,67 @@ mod tests {
             db.get_by_remote_path(mid, "trace.log").await.unwrap().is_none(),
             "modification of an ignored remote must not insert it"
         );
+    }
+
+    // ── Delta-mode rename detection (v0.13 milestone 1) ────────────────────
+
+    #[tokio::test]
+    async fn delta_rename_updates_existing_row_in_place() {
+        // The exact scenario v0.12.3 self-healed: OneDrive emits
+        // Modified-with-new-path for a renamed file (and its parent
+        // dir) without a paired Deleted-old-path event. With the new
+        // ID-aware upsert, the existing row's remote_path moves in
+        // place — the inode survives, no stale row is left behind, no
+        // hydration self-heal is needed.
+        use stratosync_core::types::{RemoteChange, RemoteMetadata};
+
+        let (db, mid, backend, _) = setup(&[]).await;
+        backend.enable_delta();
+
+        // Pre-seed the DB with the file at its OLD path AND tell the
+        // backend that's the current state (so the initial poll
+        // converges before our rename test).
+        backend.seed_file_with_id(
+            "old-parent/big.iso", b"contents",
+            Some("od-id-iso"),
+        );
+        // Boostrap delta — first poll consumes a start token, then
+        // we'll feed a rename event.
+        let p = poller(mid, Arc::clone(&db), backend.clone(), Arc::new(GlobSet::empty()));
+        p.poll_once().await.unwrap();
+        db.set_change_token(mid, "mock-bootstrap").await.unwrap();
+
+        // Verify the bootstrap state.
+        let before = db.get_by_remote_path(mid, "old-parent/big.iso").await
+            .unwrap().expect("file must be indexed at the old path after bootstrap");
+        let inode_before = before.inode;
+
+        // Now simulate the rename: backend emits Modified-with-new-path
+        // (the bug is that there's no Deleted for the old path).
+        backend.push_change(RemoteChange::Modified {
+            old_etag: None,
+            meta: RemoteMetadata {
+                path:      "new-parent/big.iso".into(),
+                name:      "big.iso".into(),
+                size:      8,
+                mtime:     SystemTime::UNIX_EPOCH,
+                is_dir:    false,
+                etag:      Some("mock-8".into()),
+                checksum:  None,
+                mime_type: None,
+                item_id:   Some("od-id-iso".into()),
+            },
+        });
+
+        p.poll_once_delta().await.unwrap();
+
+        // The OLD row must NOT survive — that was the bug. The NEW
+        // path must point to the SAME inode (proving in-place rename).
+        assert!(db.get_by_remote_path(mid, "old-parent/big.iso").await.unwrap().is_none(),
+            "stale row at old path must be gone");
+        let after = db.get_by_remote_path(mid, "new-parent/big.iso").await
+            .unwrap().expect("renamed file must be indexed at the new path");
+        assert_eq!(after.inode, inode_before,
+            "rename detected by item_id must preserve the inode");
     }
 }

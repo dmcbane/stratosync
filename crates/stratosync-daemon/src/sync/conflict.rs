@@ -222,6 +222,7 @@ pub async fn resolve(
                 etag:      None,
                 checksum:  None,
                 mime_type: None,
+                item_id:   None,
             }
         }
     };

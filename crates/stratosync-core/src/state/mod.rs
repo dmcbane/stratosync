@@ -747,6 +747,131 @@ impl StateDb {
         Ok(n)
     }
 
+    // ── ID-aware upsert (v0.13 rename-detection) ─────────────────────────────
+
+    /// Upsert a remote file using its backend-stable item ID when present.
+    /// This is the rename-aware replacement for `upsert_remote_file_gen`:
+    ///
+    /// - If `item_id` is `Some(id)` and a row already exists with that ID
+    ///   for this mount, update that row in place — same inode, new
+    ///   `remote_path`/`parent`/`name`. This is how OneDrive (and any
+    ///   other backend with stable IDs) gets rename detection without
+    ///   leaving stale rows around.
+    /// - If no item-ID match (or `item_id` is `None`), fall back to the
+    ///   legacy `(mount_id, remote_path)` match. When an `item_id` is
+    ///   supplied and the matched row has none yet, the ID is lazily
+    ///   backfilled.
+    /// - If neither match, insert a new row with the supplied ID.
+    ///
+    /// Status handling mirrors `upsert_remote_file_gen`:
+    /// `dirty`/`uploading` are preserved; everything else moves to
+    /// `stale` so a re-hydration is triggered.
+    ///
+    /// **Rename target collision**: when an in-place rename would land on
+    /// a path another row already holds, that other row is deleted
+    /// first. This handles "rename overwrites existing file" cleanly;
+    /// the obscure A↔B swap case may still need a poll cycle to settle.
+    pub async fn upsert_remote_file_by_id_or_path(
+        &self,
+        mount_id:        u32,
+        parent:          Inode,
+        name:            &str,
+        remote_path:     &str,
+        kind:            FileKind,
+        size:            u64,
+        mtime:           SystemTime,
+        etag:            Option<&str>,
+        item_id:         Option<&str>,
+        poll_generation: u64,
+    ) -> Result<Inode> {
+        let conn = self.conn.lock().await;
+
+        // Step 1: try matching by item_id first. This is the rename-
+        // detection path.
+        let existing_inode_by_id: Option<(Inode, String)> = match item_id {
+            Some(id) => conn.query_row(
+                "SELECT inode, remote_path FROM file_index
+                 WHERE mount_id = ?1 AND remote_item_id = ?2",
+                params![mount_id, id],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+            ).optional()?,
+            None => None,
+        };
+
+        if let Some((inode, current_path)) = existing_inode_by_id {
+            if current_path != remote_path {
+                // Rename: the row's new path may collide with another
+                // row (e.g. a `mv old new` where `new` previously held
+                // a different item). Drop the colliding row first so
+                // the UPDATE doesn't violate UNIQUE(mount_id, remote_path).
+                conn.execute(
+                    "DELETE FROM file_index
+                     WHERE mount_id = ?1 AND remote_path = ?2 AND inode != ?3",
+                    params![mount_id, remote_path, inode as i64],
+                )?;
+            }
+            conn.execute(
+                "UPDATE file_index SET
+                     parent_inode    = ?1,
+                     name            = ?2,
+                     remote_path     = ?3,
+                     kind            = ?4,
+                     size            = ?5,
+                     mtime           = ?6,
+                     etag            = ?7,
+                     poll_generation = ?8,
+                     status          = CASE
+                         WHEN status IN ('dirty','uploading') THEN status
+                         ELSE 'stale'
+                     END
+                 WHERE inode = ?9",
+                params![
+                    parent as i64, name, remote_path,
+                    kind.as_str(), size as i64, to_unix(mtime), etag,
+                    poll_generation as i64, inode as i64,
+                ],
+            )?;
+            return Ok(inode);
+        }
+
+        // Step 2: no item-ID match. Upsert by path, the legacy way,
+        // but also carry the item_id through (NULL stays NULL; provided
+        // IDs lazily backfill onto the existing row).
+        conn.execute(
+            "INSERT INTO file_index
+               (mount_id, parent_inode, name, remote_path, kind, size, mtime,
+                etag, status, poll_generation, remote_item_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'remote', ?9, ?10)
+             ON CONFLICT(mount_id, remote_path) DO UPDATE SET
+               parent_inode    = excluded.parent_inode,
+               name            = excluded.name,
+               kind            = excluded.kind,
+               size            = excluded.size,
+               mtime           = excluded.mtime,
+               etag            = excluded.etag,
+               poll_generation = excluded.poll_generation,
+               remote_item_id  = COALESCE(file_index.remote_item_id,
+                                          excluded.remote_item_id),
+               status          = CASE
+                 WHEN status IN ('dirty','uploading') THEN status
+                 ELSE 'stale'
+               END",
+            params![
+                mount_id, parent, name, remote_path,
+                kind.as_str(), size as i64, to_unix(mtime), etag,
+                poll_generation as i64, item_id,
+            ],
+        )?;
+
+        let inode: Inode = conn.query_row(
+            "SELECT inode FROM file_index WHERE mount_id=?1 AND remote_path=?2",
+            params![mount_id, remote_path],
+            |r| r.get::<_, i64>(0),
+        ).map(|i| i as u64)?;
+
+        Ok(inode)
+    }
+
     // ── Mount health (hydration) ─────────────────────────────────────────────
 
     /// Increment the failure counter and stash the latest error / timestamp.
@@ -955,6 +1080,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0005", include_str!("migrations/0005_version_history.sql")),
     ("0006", include_str!("migrations/0006_dedupe_file_index.sql")),
     ("0007", include_str!("migrations/0007_mount_health.sql")),
+    ("0008", include_str!("migrations/0008_remote_item_id.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -1572,6 +1698,155 @@ mod tests {
         let h = db.get_mount_health(mount_id).await.unwrap();
         assert_eq!(h.consecutive_hydration_failures, 0);
         assert!(h.last_hydration_error.is_none());
+    }
+
+    // ── upsert_remote_file_by_id_or_path (v0.13 rename detection) ──────────
+
+    #[tokio::test]
+    async fn upsert_by_id_inserts_new_row_with_item_id() {
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode = db.upsert_remote_file_by_id_or_path(
+            mid, root, "doc.txt", "doc.txt", FileKind::File,
+            42, SystemTime::UNIX_EPOCH, Some("etag-1"),
+            Some("od-id-doc"), 0,
+        ).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        assert_eq!(entry.remote_path, "doc.txt");
+        // The stored item_id is round-tripped through SQL — verify via
+        // raw query since FileEntry doesn't expose it yet.
+        let conn = db.raw_conn().await;
+        let stored: Option<String> = conn.query_row(
+            "SELECT remote_item_id FROM file_index WHERE inode = ?1",
+            params![inode as i64], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored.as_deref(), Some("od-id-doc"));
+    }
+
+    #[tokio::test]
+    async fn upsert_by_id_same_path_updates_in_place() {
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode1 = db.upsert_remote_file_by_id_or_path(
+            mid, root, "doc.txt", "doc.txt", FileKind::File,
+            10, SystemTime::UNIX_EPOCH, Some("etag-v1"),
+            Some("od-id-doc"), 0,
+        ).await.unwrap();
+        // Same item, same path, modified content (new etag/size).
+        let inode2 = db.upsert_remote_file_by_id_or_path(
+            mid, root, "doc.txt", "doc.txt", FileKind::File,
+            999, SystemTime::UNIX_EPOCH, Some("etag-v2"),
+            Some("od-id-doc"), 0,
+        ).await.unwrap();
+        assert_eq!(inode1, inode2, "same item must keep the same inode");
+        let entry = db.get_by_inode(inode1).await.unwrap().unwrap();
+        assert_eq!(entry.size, 999);
+        assert_eq!(entry.etag.as_deref(), Some("etag-v2"));
+    }
+
+    #[tokio::test]
+    async fn upsert_by_id_different_path_renames_in_place() {
+        // The bug v0.12.3 self-healed: a OneDrive Modified-with-new-path
+        // event used to insert a new row at the new path while the old
+        // row stayed at the old path. With ID matching, the row must
+        // simply move — same inode, new remote_path. No stale rows,
+        // no orphan inodes for FUSE handles to wedge on.
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode_before = db.upsert_remote_file_by_id_or_path(
+            mid, root, "old.txt", "old.txt", FileKind::File,
+            10, SystemTime::UNIX_EPOCH, Some("etag-1"),
+            Some("od-id-stable"), 0,
+        ).await.unwrap();
+        let inode_after = db.upsert_remote_file_by_id_or_path(
+            mid, root, "new.txt", "subdir/new.txt", FileKind::File,
+            10, SystemTime::UNIX_EPOCH, Some("etag-1"),
+            Some("od-id-stable"), 0,
+        ).await.unwrap();
+        assert_eq!(inode_before, inode_after,
+            "rename detected by item_id must keep the same inode");
+        let entry = db.get_by_inode(inode_before).await.unwrap().unwrap();
+        assert_eq!(entry.remote_path, "subdir/new.txt");
+        assert_eq!(entry.name, "new.txt");
+
+        // Critical: no row remains at the OLD path. This is the
+        // regression we couldn't kill via path-based upsert.
+        assert!(db.get_by_remote_path(mid, "old.txt").await.unwrap().is_none(),
+            "old path must no longer reference any row");
+    }
+
+    #[tokio::test]
+    async fn upsert_without_item_id_falls_back_to_path_match() {
+        // Backends without stable IDs (WebDAV, raw S3) must keep
+        // working — the new method gracefully degrades to legacy
+        // path-based upsert.
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode1 = db.upsert_remote_file_by_id_or_path(
+            mid, root, "x.txt", "x.txt", FileKind::File,
+            5, SystemTime::UNIX_EPOCH, None, None, 0,
+        ).await.unwrap();
+        let inode2 = db.upsert_remote_file_by_id_or_path(
+            mid, root, "x.txt", "x.txt", FileKind::File,
+            7, SystemTime::UNIX_EPOCH, Some("etag"), None, 0,
+        ).await.unwrap();
+        assert_eq!(inode1, inode2);
+        assert_eq!(db.get_by_inode(inode1).await.unwrap().unwrap().size, 7);
+    }
+
+    #[tokio::test]
+    async fn upsert_lazily_backfills_item_id_on_path_match() {
+        // Existing rows from before v0.13 have NULL remote_item_id.
+        // First time we see the same path with an ID attached, the ID
+        // should land on the existing row so future renames work.
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode = db.upsert_remote_file_by_id_or_path(
+            mid, root, "y.txt", "y.txt", FileKind::File,
+            3, SystemTime::UNIX_EPOCH, None, None, 0,
+        ).await.unwrap();
+        // Second call carries the ID for the first time.
+        let inode2 = db.upsert_remote_file_by_id_or_path(
+            mid, root, "y.txt", "y.txt", FileKind::File,
+            3, SystemTime::UNIX_EPOCH, None, Some("od-y"), 0,
+        ).await.unwrap();
+        assert_eq!(inode, inode2, "path match must reuse the row");
+
+        let conn = db.raw_conn().await;
+        let stored: Option<String> = conn.query_row(
+            "SELECT remote_item_id FROM file_index WHERE inode = ?1",
+            params![inode as i64], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored.as_deref(), Some("od-y"),
+            "item_id must backfill onto the pre-existing row");
+    }
+
+    #[tokio::test]
+    async fn rename_target_path_collision_evicts_old_row() {
+        // Two unrelated items A and B. Then A is renamed to overwrite
+        // B's path. Without collision-eviction the UPDATE would
+        // violate UNIQUE(mount_id, remote_path); without rename
+        // detection we'd end up with two rows pointing at the same
+        // place. The right answer: A's row moves to B's path, B's row
+        // is dropped. A's content (and inode) survive; B's row
+        // doesn't, because the remote no longer has anything at that
+        // path with B's old identity.
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode_a = db.upsert_remote_file_by_id_or_path(
+            mid, root, "a.txt", "a.txt", FileKind::File,
+            1, SystemTime::UNIX_EPOCH, Some("eA"), Some("id-A"), 0,
+        ).await.unwrap();
+        let inode_b = db.upsert_remote_file_by_id_or_path(
+            mid, root, "b.txt", "b.txt", FileKind::File,
+            2, SystemTime::UNIX_EPOCH, Some("eB"), Some("id-B"), 0,
+        ).await.unwrap();
+        assert_ne!(inode_a, inode_b);
+
+        // Rename A → b.txt (overwriting B's path).
+        let inode_after = db.upsert_remote_file_by_id_or_path(
+            mid, root, "b.txt", "b.txt", FileKind::File,
+            1, SystemTime::UNIX_EPOCH, Some("eA"), Some("id-A"), 0,
+        ).await.unwrap();
+        assert_eq!(inode_after, inode_a,
+            "the surviving row at b.txt must be A's row (renamed)");
+        assert!(db.get_by_inode(inode_b).await.unwrap().is_none(),
+            "B's row must be evicted by the collision");
     }
 }
 

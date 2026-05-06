@@ -400,6 +400,7 @@ impl DeltaProvider for GoogleDriveDelta {
                 etag: file.md5_checksum.clone(),
                 checksum: None,
                 mime_type: file.mime_type.clone(),
+                item_id: Some(file.id.clone()),
             };
 
             changes.push(RemoteChange::Added { meta });
@@ -796,6 +797,7 @@ impl DeltaProvider for OneDriveDelta {
                     checksum: None,
                     mime_type: item.file.as_ref()
                         .and_then(|f| f.mime_type.clone()),
+                    item_id: Some(item.id.clone()),
                 };
 
                 changes.push(RemoteChange::Added { meta });
@@ -836,6 +838,12 @@ struct OneDriveDeltaResponse {
 
 #[derive(Deserialize)]
 struct OneDriveItem {
+    /// Microsoft Graph item ID — stable across renames and moves. We
+    /// rely on this for rename detection in `RemoteChange` consumers
+    /// (see v0.13 milestone 1). Required by the Graph API; treating
+    /// it as required is safe.
+    id: String,
+
     /// Optional because Microsoft Graph occasionally omits this field on
     /// delta-channel items — observed live on a real account, where a
     /// page of ~25 items contained one stub with `id` + `createdDateTime`
@@ -1165,6 +1173,7 @@ mod tests {
         let json = r#"{
             "value": [
                 {
+                    "id": "01ABCDEFG",
                     "name": "report.docx",
                     "size": 51200,
                     "lastModifiedDateTime": "2026-04-10T14:30:00Z",
@@ -1188,6 +1197,7 @@ mod tests {
         assert!(resp.next_link.is_none());
 
         let item = &resp.value[0];
+        assert_eq!(item.id, "01ABCDEFG");
         assert_eq!(item.name.as_deref(), Some("report.docx"));
         assert_eq!(item.size.unwrap(), 51200);
         assert!(item.folder.is_none());
@@ -1200,6 +1210,7 @@ mod tests {
     fn test_parse_onedrive_deleted_item() {
         let json = r#"{
             "value": [{
+                "id": "deleted-01",
                 "name": "old.txt",
                 "parentReference": {"path": "/drive/root:"},
                 "deleted": {}
@@ -1208,11 +1219,13 @@ mod tests {
         }"#;
         let resp: OneDriveDeltaResponse = serde_json::from_str(json).unwrap();
         assert!(resp.value[0].deleted.is_some());
+        assert_eq!(resp.value[0].id, "deleted-01");
     }
 
     #[test]
     fn test_parse_onedrive_folder_item() {
         let json = r#"{
+            "id": "folder-01",
             "name": "Photos",
             "parentReference": {"path": "/drive/root:"},
             "folder": {"childCount": 42}
@@ -1220,6 +1233,7 @@ mod tests {
         let item: OneDriveItem = serde_json::from_str(json).unwrap();
         assert!(item.folder.is_some());
         assert!(item.file.is_none());
+        assert_eq!(item.id, "folder-01");
     }
 
     #[test]
@@ -1255,6 +1269,7 @@ mod tests {
 
     fn make_onedrive_item(name: &str, parent_path: &str) -> OneDriveItem {
         OneDriveItem {
+            id: format!("od-id-{name}"),
             name: Some(name.into()),
             size: Some(100),
             last_modified_date_time: Some("2026-04-10T12:00:00Z".into()),
@@ -1345,6 +1360,7 @@ mod tests {
     fn test_onedrive_resolve_no_parent() {
         let delta = make_onedrive_delta("");
         let item = OneDriveItem {
+            id: "od-root-id".into(),
             name: Some("root".into()),
             size: None,
             last_modified_date_time: None,

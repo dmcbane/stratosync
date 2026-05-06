@@ -173,6 +173,12 @@ impl Backend for WebDavBackend {
             etag,
             checksum: None,
             mime_type: None,
+            // WebDAV has no stable item ID concept; rename detection
+            // for WebDAV mounts continues to rely on path matching
+            // (which is fine because WebDAV doesn't have a delta API
+            // at all — rclone's path-based full-poll handles renames
+            // via the existing generation sweep).
+            item_id: None,
         })
     }
 
@@ -270,6 +276,7 @@ fn parse_propfind_single(path: &str, xml: &str) -> Result<RemoteMetadata, SyncEr
         etag,
         checksum: None,
         mime_type: extract_xml_value(xml, "getcontenttype"),
+        item_id: None,
     })
 }
 
@@ -324,6 +331,7 @@ fn parse_propfind_list(parent_path: &str, xml: &str) -> Result<Vec<RemoteMetadat
             etag,
             checksum: None,
             mime_type: extract_xml_value(chunk, "getcontenttype"),
+            item_id: None,
         });
     }
 
