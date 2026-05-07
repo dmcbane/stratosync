@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.3] - 2026-05-07
+
+### Added
+- **`stratosync cache clear` subcommand** — operator escape hatch for
+  when local state has drifted out of sync with the remote. Drops
+  hydrated cache files and reverts their `file_index` rows from
+  `cached`/`stale` back to `remote`, so the next `open()` re-hydrates
+  fresh from the cloud.
+  - `--mount NAME` to clear a single mount; `--all` to do every
+    enabled mount.
+  - **Unsynced work is preserved**: rows in `dirty`, `uploading`, or
+    `conflict` status are never touched. Pinned files are also
+    preserved unless `--include-pinned` is passed.
+  - Refuses to run while the daemon is up (probes the IPC socket);
+    pass `--force` to override at your own risk. Interactive
+    confirmation by default; `-y/--yes` for scripts.
+  - New core helper `StateDb::clear_cache_for_mount(...)` returns a
+    `CacheClearReport` with files cleared, bytes freed, and the cache
+    paths the caller must unlink.
+
 ## [0.13.0-beta.2] - 2026-05-06
 
 ### Added

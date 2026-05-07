@@ -59,6 +59,11 @@ enum Command {
         #[command(subcommand)]
         action: VersionsAction,
     },
+    /// Cache management — clear local hydrated files when state drifts out of sync
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Print shell completion setup instructions
     Completions,
     /// Print version
@@ -104,6 +109,32 @@ enum DaemonAction {
         /// Number of trailing lines to show (default 200 unless --follow)
         #[arg(short = 'n', long)]
         lines: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Drop hydrated cache files and force re-download on next access.
+    /// Dirty/Uploading/Conflict rows are always preserved (unsynced work
+    /// is not lost). Pinned files are preserved unless `--include-pinned`
+    /// is passed.
+    Clear {
+        /// Clear cache for a single mount by name.
+        #[arg(long, value_name = "NAME", conflicts_with = "all")]
+        mount: Option<String>,
+        /// Clear cache for every enabled mount.
+        #[arg(long)]
+        all: bool,
+        /// Also clear pinned files (pins normally protect files from clearing).
+        #[arg(long)]
+        include_pinned: bool,
+        /// Skip the running-daemon safety check. The daemon must really be
+        /// quiescent — clearing under live FUSE handles risks dangling reads.
+        #[arg(long)]
+        force: bool,
+        /// Skip interactive confirmation. Implied by piped/non-tty stdin.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -216,6 +247,13 @@ async fn main() -> Result<()> {
                 commands::versions::list(&config_path, &path).await?,
             VersionsAction::Restore { path, index } =>
                 commands::versions::restore(&config_path, &path, index).await?,
+        },
+        Command::Cache { action } => match action {
+            CacheAction::Clear { mount, all, include_pinned, force, yes } =>
+                commands::cache::clear(
+                    &config_path, mount.as_deref(), all,
+                    include_pinned, force, yes,
+                ).await?,
         },
         Command::Completions => {
             println!("Add one of the following to your shell config:\n");

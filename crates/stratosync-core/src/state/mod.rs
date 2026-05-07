@@ -582,6 +582,92 @@ impl StateDb {
         Ok(rows)
     }
 
+    // ── Cache clear (operator recovery) ───────────────────────────────────────
+
+    /// Mass-revert cached/stale rows for a mount back to `remote`, returning
+    /// the cache file paths that were detached so the caller can unlink them
+    /// from disk. Designed for `stratosync cache clear` — a recovery escape
+    /// hatch when things drift out of sync.
+    ///
+    /// Always preserved (never touched here) regardless of options:
+    /// - rows with `status IN ('dirty','uploading')` — unsynced local work
+    /// - rows with `status='conflict'` — managed via `stratosync conflicts`
+    /// - rows with `status='hydrating'` — an in-flight download; only safe
+    ///   to clear with the daemon stopped, in which case startup recovery
+    ///   resets these to `remote` already
+    /// - directory rows (no cache file to drop)
+    ///
+    /// Options:
+    /// - `include_pinned`: also clear rows whose `cache_lru.pinned = 1`.
+    ///   Off by default — pins are an explicit user request to keep a file
+    ///   offline-available.
+    pub async fn clear_cache_for_mount(
+        &self,
+        mount_id:       u32,
+        include_pinned: bool,
+    ) -> Result<CacheClearReport> {
+        let conn = self.conn.lock().await;
+
+        // Predicate built once and reused for the SELECT and UPDATE so
+        // both touch exactly the same set of rows.
+        let pin_clause = if include_pinned {
+            ""
+        } else {
+            " AND inode NOT IN (SELECT inode FROM cache_lru WHERE pinned = 1)"
+        };
+        let select_sql = format!(
+            "SELECT inode, cache_path, COALESCE(cache_size, 0) FROM file_index
+             WHERE mount_id = ?1
+               AND kind = 'file'
+               AND status IN ('cached','stale')
+               AND cache_path IS NOT NULL
+               {pin_clause}"
+        );
+        let update_sql = format!(
+            "UPDATE file_index
+             SET status = 'remote', cache_path = NULL, cache_size = NULL,
+                 cache_mtime = NULL
+             WHERE mount_id = ?1
+               AND kind = 'file'
+               AND status IN ('cached','stale')
+               AND cache_path IS NOT NULL
+               {pin_clause}"
+        );
+
+        let mut stmt = conn.prepare(&select_sql)?;
+        let cleared: Vec<(Inode, PathBuf, u64)> = stmt
+            .query_map(params![mount_id], |r| Ok((
+                r.get::<_, i64>(0)? as Inode,
+                PathBuf::from(r.get::<_, String>(1)?),
+                r.get::<_, i64>(2)? as u64,
+            )))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let bytes_freed: u64 = cleared.iter().map(|(_, _, sz)| *sz).sum();
+        let cache_paths: Vec<PathBuf> = cleared.iter().map(|(_, p, _)| p.clone()).collect();
+        let inodes: Vec<Inode> = cleared.iter().map(|(i, _, _)| *i).collect();
+
+        let updated = conn.execute(&update_sql, params![mount_id])?;
+
+        // Drop LRU rows for cleared inodes so they don't show up as
+        // eviction candidates with stale last_access values. Pinned rows
+        // are excluded by the predicate above when `include_pinned=false`,
+        // so we never touch a pin record we shouldn't.
+        for inode in &inodes {
+            conn.execute(
+                "DELETE FROM cache_lru WHERE inode = ?1",
+                params![*inode as i64],
+            )?;
+        }
+
+        Ok(CacheClearReport {
+            files_cleared: updated as u64,
+            bytes_freed,
+            cache_paths,
+        })
+    }
+
     // ── Pinning ───────────────────────────────────────────────────────────────
 
     /// Pin a file — prevents LRU eviction.
@@ -995,6 +1081,15 @@ pub struct EvictionCandidate {
     pub inode:      Inode,
     pub cache_path: PathBuf,
     pub cache_size: u64,
+}
+
+/// Result of `clear_cache_for_mount`. `cache_paths` is what the caller
+/// must unlink from disk — the DB has already forgotten them.
+#[derive(Debug, Default)]
+pub struct CacheClearReport {
+    pub files_cleared: u64,
+    pub bytes_freed:   u64,
+    pub cache_paths:   Vec<PathBuf>,
 }
 
 /// A single entry in `version_history`.
@@ -1958,6 +2053,175 @@ mod tests {
             "the surviving row at b.txt must be A's row (renamed)");
         assert!(db.get_by_inode(inode_b).await.unwrap().is_none(),
             "B's row must be evicted by the collision");
+    }
+
+    // ── clear_cache_for_mount ────────────────────────────────────────────
+
+    async fn seed_for_clear(
+        db: &StateDb,
+        mount_id: u32,
+        root: Inode,
+        name: &str,
+        status: SyncStatus,
+        cache_path: Option<&str>,
+    ) -> Inode {
+        db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: root,
+            name: name.into(),
+            remote_path: format!("/{name}"),
+            kind: FileKind::File,
+            size: 100,
+            mtime: SystemTime::UNIX_EPOCH,
+            etag: Some("etag".into()),
+            status,
+            cache_path: cache_path.map(PathBuf::from),
+            cache_size: cache_path.map(|_| 100),
+        }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn clear_cache_drops_cached_and_stale_only() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let cached  = seed_for_clear(&db, mount_id, root, "a.txt",
+            SyncStatus::Cached,    Some("/cache/a.txt")).await;
+        let stale   = seed_for_clear(&db, mount_id, root, "b.txt",
+            SyncStatus::Stale,     Some("/cache/b.txt")).await;
+        let dirty   = seed_for_clear(&db, mount_id, root, "c.txt",
+            SyncStatus::Dirty,     Some("/cache/c.txt")).await;
+        let upload  = seed_for_clear(&db, mount_id, root, "d.txt",
+            SyncStatus::Uploading, Some("/cache/d.txt")).await;
+        let confl   = seed_for_clear(&db, mount_id, root, "e.txt",
+            SyncStatus::Conflict,  Some("/cache/e.txt")).await;
+        let remote  = seed_for_clear(&db, mount_id, root, "f.txt",
+            SyncStatus::Remote,    None).await;
+
+        let report = db.clear_cache_for_mount(mount_id, false).await.unwrap();
+
+        assert_eq!(report.files_cleared, 2,
+            "only cached + stale rows should clear");
+        assert_eq!(report.bytes_freed, 200);
+        let mut paths: Vec<_> = report.cache_paths
+            .iter().map(|p| p.to_string_lossy().to_string()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/cache/a.txt", "/cache/b.txt"]);
+
+        for (inode, expected) in [
+            (cached,  SyncStatus::Remote),
+            (stale,   SyncStatus::Remote),
+            (dirty,   SyncStatus::Dirty),     // protected
+            (upload,  SyncStatus::Uploading), // protected
+            (confl,   SyncStatus::Conflict),  // protected
+            (remote,  SyncStatus::Remote),    // unchanged
+        ] {
+            let e = db.get_by_inode(inode).await.unwrap().unwrap();
+            assert_eq!(e.status, expected, "inode {inode}");
+        }
+
+        // Cleared rows had cache_path nulled out.
+        assert!(db.get_by_inode(cached).await.unwrap().unwrap().cache_path.is_none());
+        assert!(db.get_by_inode(stale).await.unwrap().unwrap().cache_path.is_none());
+        // Protected rows kept their cache_path.
+        assert!(db.get_by_inode(dirty).await.unwrap().unwrap().cache_path.is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_cache_skips_pinned_by_default() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let pinned = seed_for_clear(&db, mount_id, root, "p.txt",
+            SyncStatus::Cached, Some("/cache/p.txt")).await;
+        let normal = seed_for_clear(&db, mount_id, root, "n.txt",
+            SyncStatus::Cached, Some("/cache/n.txt")).await;
+        db.set_pinned(pinned, true).await.unwrap();
+
+        let report = db.clear_cache_for_mount(mount_id, false).await.unwrap();
+        assert_eq!(report.files_cleared, 1);
+        assert_eq!(report.cache_paths, vec![PathBuf::from("/cache/n.txt")]);
+
+        assert_eq!(db.get_by_inode(pinned).await.unwrap().unwrap().status,
+            SyncStatus::Cached, "pinned row preserved");
+        assert_eq!(db.get_by_inode(normal).await.unwrap().unwrap().status,
+            SyncStatus::Remote);
+        assert!(db.is_pinned(pinned).await.unwrap(),
+            "pin record itself must survive");
+    }
+
+    #[tokio::test]
+    async fn clear_cache_include_pinned_clears_everything() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let pinned = seed_for_clear(&db, mount_id, root, "p.txt",
+            SyncStatus::Cached, Some("/cache/p.txt")).await;
+        db.set_pinned(pinned, true).await.unwrap();
+
+        let report = db.clear_cache_for_mount(mount_id, true).await.unwrap();
+        assert_eq!(report.files_cleared, 1);
+        assert_eq!(db.get_by_inode(pinned).await.unwrap().unwrap().status,
+            SyncStatus::Remote);
+    }
+
+    #[tokio::test]
+    async fn clear_cache_isolates_other_mounts() {
+        let (db, mount_a, root_a) = setup_db_with_mount().await;
+        let mount_b = db.upsert_mount(
+            "other", "gdrive:/", "/mnt/other",
+            "/tmp/cache-b", 5 * 1024 * 1024 * 1024, 60,
+        ).await.unwrap();
+        // Each mount needs its own root row (cache_clear filters by mount_id).
+        let _root_b = db.insert_file(&NewFileEntry {
+            mount_id: mount_b,
+            parent: root_a, // any inode is fine for this test — fk constraint is on parent_inode
+            name: "/".into(),
+            remote_path: "/".into(),
+            kind: FileKind::Directory,
+            size: 0,
+            mtime: SystemTime::UNIX_EPOCH,
+            etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap();
+
+        let _ = seed_for_clear(&db, mount_a, root_a, "a.txt",
+            SyncStatus::Cached, Some("/cache/a.txt")).await;
+        let b_file = db.insert_file(&NewFileEntry {
+            mount_id: mount_b,
+            parent: root_a,
+            name: "b.txt".into(),
+            remote_path: "/b.txt".into(),
+            kind: FileKind::File,
+            size: 50,
+            mtime: SystemTime::UNIX_EPOCH,
+            etag: Some("etag".into()),
+            status: SyncStatus::Cached,
+            cache_path: Some(PathBuf::from("/cache-b/b.txt")),
+            cache_size: Some(50),
+        }).await.unwrap();
+
+        let report = db.clear_cache_for_mount(mount_a, false).await.unwrap();
+        assert_eq!(report.files_cleared, 1);
+
+        // Mount B's cached file must be untouched.
+        let e = db.get_by_inode(b_file).await.unwrap().unwrap();
+        assert_eq!(e.status, SyncStatus::Cached);
+        assert!(e.cache_path.is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_cache_drops_lru_for_cleared_inodes() {
+        let (db, mount_id, root) = setup_db_with_mount().await;
+
+        let inode = seed_for_clear(&db, mount_id, root, "a.txt",
+            SyncStatus::Cached, Some("/cache/a.txt")).await;
+        db.touch_lru(inode).await.unwrap();
+
+        db.clear_cache_for_mount(mount_id, false).await.unwrap();
+
+        let candidates = db.lru_eviction_candidates(mount_id, 10).await.unwrap();
+        assert!(candidates.is_empty(),
+            "cleared rows should not appear as eviction candidates");
     }
 }
 
