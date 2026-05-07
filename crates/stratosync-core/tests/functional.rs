@@ -1319,6 +1319,7 @@ async fn delta_mock_changes_since_drains_pending() {
     });
     backend.push_change(RemoteChange::Deleted {
         path: "old.txt".into(),
+        item_id: None,
     });
 
     let (changes, token) = backend.changes_since("mock-start-0").await.unwrap();
@@ -1500,13 +1501,14 @@ async fn delta_full_workflow() {
     // Step 3: Delta poll — a.txt deleted
     backend.push_change(RemoteChange::Deleted {
         path: "/a.txt".into(),
+        item_id: None,
     });
 
     let token = db.get_change_token(mid).await.unwrap().unwrap();
     let (changes, next_token) = backend.changes_since(&token).await.unwrap();
 
     for change in &changes {
-        if let RemoteChange::Deleted { path } = change {
+        if let RemoteChange::Deleted { path, .. } = change {
             db.delete_remote_entry_by_path(mid, path).await.unwrap();
         }
     }

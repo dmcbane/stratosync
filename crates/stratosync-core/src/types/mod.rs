@@ -211,7 +211,13 @@ impl TryFrom<RcloneLsJsonEntry> for RemoteMetadata {
 pub enum RemoteChange {
     Added    { meta: RemoteMetadata },
     Modified { meta: RemoteMetadata, old_etag: Option<String> },
-    Deleted  { path: String },
+    /// `item_id` is the backend's stable identifier, when known. The
+    /// poller prefers ID-based deletion (so renamed-then-deleted items
+    /// still resolve to the right row even if our cached `path` is
+    /// stale) and falls back to path matching when None. OneDrive and
+    /// Google Drive both expose IDs on delete events; backends without
+    /// a stable-ID concept pass None and the path fallback handles them.
+    Deleted  { path: String, item_id: Option<String> },
 }
 
 // ── Sync queue operations ─────────────────────────────────────────────────────

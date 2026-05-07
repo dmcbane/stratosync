@@ -300,11 +300,35 @@ async fn do_hydrate(
                     // Delete the row so subsequent reads fail with
                     // ENOENT (not EAGAIN) and the kernel-level
                     // lookup re-fetches.
-                    warn!(
-                        inode = entry.inode,
-                        path  = %entry.remote_path,
-                        "stale DB row — remote confirms path is gone; pruning",
-                    );
+                    //
+                    // Distinguish two cases for soak telemetry:
+                    //  - NULL item_id: a pre-v0.13 row hitting the
+                    //    band-aid for the first time. Expected and
+                    //    declining over time as legacy rows get
+                    //    pruned (or, when stat succeeds, backfilled).
+                    //  - Known item_id: the id-aware upsert path
+                    //    *should* have caught any rename for this
+                    //    item; pruning here means a delta event was
+                    //    missed somewhere. Worth investigating —
+                    //    log louder.
+                    let had_id = db.get_item_id(entry.inode).await
+                        .ok().flatten();
+                    if had_id.is_some() {
+                        warn!(
+                            inode  = entry.inode,
+                            path   = %entry.remote_path,
+                            item_id = ?had_id,
+                            "stale DB row WITH known item_id pruned — \
+                             id-aware upsert may have missed a delta event",
+                        );
+                    } else {
+                        warn!(
+                            inode = entry.inode,
+                            path  = %entry.remote_path,
+                            "stale DB row (legacy null-id) — pruning; \
+                             this is expected and tapers as IDs backfill",
+                        );
+                    }
                     if let Err(e) = db.delete_entry(entry.inode).await {
                         warn!(inode = entry.inode, "failed to prune stale entry: {e}");
                     } else {

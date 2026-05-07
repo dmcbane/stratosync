@@ -853,6 +853,22 @@ impl StateDb {
         Ok(inode)
     }
 
+    /// Read just the `remote_item_id` column for an inode. Used by the
+    /// self-heal log enrichment to distinguish "pruning a legacy row
+    /// (expected, taper-down signal)" from "pruning a row that already
+    /// had an ID (unexpected — suggests a delta event was missed by
+    /// the id-aware upsert path)." Cheaper than a full `get_by_inode`
+    /// since the daemon already has the entry it needs.
+    pub async fn get_item_id(&self, inode: Inode) -> Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let id: Option<Option<String>> = conn.query_row(
+            "SELECT remote_item_id FROM file_index WHERE inode = ?1",
+            params![inode as i64],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(id.flatten())
+    }
+
     /// Set `remote_item_id` only when the existing value is NULL. Used
     /// by the lazy-backfill path in `do_hydrate`'s self-heal: when a
     /// stat() succeeds for a row that doesn't yet have an item_id, we
@@ -1865,6 +1881,53 @@ mod tests {
             "existing ID must be preserved");
     }
 
+    // ── delete_remote_entry_by_item_id (v0.13 milestone 3) ────────────────
+
+    #[tokio::test]
+    async fn delete_by_item_id_finds_row_with_stale_path() {
+        // The reason this method exists: a delete event arrives carrying
+        // the original item ID, but our DB row's `remote_path` has
+        // since been updated by a rename-modified event. Path-based
+        // delete would miss it; ID-based finds it cleanly.
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode = db.upsert_remote_file_by_id_or_path(
+            mid, root, "current.txt", "current.txt", FileKind::File,
+            5, SystemTime::UNIX_EPOCH, None, Some("od-id-1"), 0,
+        ).await.unwrap();
+
+        let result = db.delete_remote_entry_by_item_id(mid, "od-id-1").await.unwrap();
+        let (deleted_inode, _) = result.expect("must find the row by ID");
+        assert_eq!(deleted_inode, inode);
+        assert!(db.get_by_inode(inode).await.unwrap().is_none(),
+            "row must be gone after delete");
+    }
+
+    #[tokio::test]
+    async fn delete_by_item_id_returns_none_for_unknown_id() {
+        let (db, mid, _root) = setup_db_with_mount().await;
+        let result = db.delete_remote_entry_by_item_id(mid, "no-such-id").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_by_item_id_protects_dirty_rows() {
+        // Local edits in flight must never be wiped by a remote delete
+        // event — the conflict resolution path handles that case
+        // separately. Same protection contract as the path-based
+        // variant.
+        let (db, mid, root) = setup_db_with_mount().await;
+        let inode = db.upsert_remote_file_by_id_or_path(
+            mid, root, "live.txt", "live.txt", FileKind::File,
+            5, SystemTime::UNIX_EPOCH, None, Some("od-id-live"), 0,
+        ).await.unwrap();
+        db.set_status(inode, SyncStatus::Dirty).await.unwrap();
+
+        let result = db.delete_remote_entry_by_item_id(mid, "od-id-live").await.unwrap();
+        assert!(result.is_none(), "dirty rows must be protected from delete");
+        assert!(db.get_by_inode(inode).await.unwrap().is_some(),
+            "row must survive the protected delete");
+    }
+
     #[tokio::test]
     async fn rename_target_path_collision_evicts_old_row() {
         // Two unrelated items A and B. Then A is renamed to overwrite
@@ -2432,6 +2495,39 @@ impl StateDb {
              WHERE mount_id = ?1 AND remote_path = ?2
                AND status NOT IN ('dirty', 'uploading')",
             params![mount_id, remote_path],
+            |r| Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, Option<String>>(1)?.map(PathBuf::from),
+            )),
+        ).optional()?;
+
+        if let Some((inode, _)) = &row {
+            conn.execute(
+                "DELETE FROM file_index WHERE inode = ?1",
+                params![*inode as i64],
+            )?;
+        }
+
+        Ok(row)
+    }
+
+    /// Delete a row matching `(mount_id, remote_item_id)`. Same
+    /// dirty/uploading protection as the path-based variant. The
+    /// poller calls this first when handling a `RemoteChange::Deleted`
+    /// with a known `item_id`, so a delete event for a row whose
+    /// `remote_path` we have stale (renamed-then-deleted) still finds
+    /// the right row to drop.
+    pub async fn delete_remote_entry_by_item_id(
+        &self,
+        mount_id: u32,
+        item_id:  &str,
+    ) -> Result<Option<(Inode, Option<PathBuf>)>> {
+        let conn = self.conn.lock().await;
+        let row: Option<(Inode, Option<PathBuf>)> = conn.query_row(
+            "SELECT inode, cache_path FROM file_index
+             WHERE mount_id = ?1 AND remote_item_id = ?2
+               AND status NOT IN ('dirty', 'uploading')",
+            params![mount_id, item_id],
             |r| Ok((
                 r.get::<_, i64>(0)? as u64,
                 r.get::<_, Option<String>>(1)?.map(PathBuf::from),

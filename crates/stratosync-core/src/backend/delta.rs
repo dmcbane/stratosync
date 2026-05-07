@@ -357,7 +357,10 @@ impl DeltaProvider for GoogleDriveDelta {
                 // For now, we try to resolve the path from id_map if available.
                 if let Some((name, parents)) = id_map.get(&change.file_id) {
                     if let Some(path) = self.resolve_path(&change.file_id, name, parents, &id_map) {
-                        changes.push(RemoteChange::Deleted { path });
+                        changes.push(RemoteChange::Deleted {
+                            path,
+                            item_id: Some(change.file_id.clone()),
+                        });
                     }
                 }
                 continue;
@@ -372,7 +375,10 @@ impl DeltaProvider for GoogleDriveDelta {
                 // Trashed = deleted
                 let parents = file.parents.as_deref().unwrap_or(&[]);
                 if let Some(path) = self.resolve_path(&file.id, &file.name, parents, &id_map) {
-                    changes.push(RemoteChange::Deleted { path });
+                    changes.push(RemoteChange::Deleted {
+                        path,
+                        item_id: Some(file.id.clone()),
+                    });
                 }
                 continue;
             }
@@ -752,7 +758,10 @@ impl DeltaProvider for OneDriveDelta {
                 // Deleted items
                 if item.deleted.is_some() {
                     if let Some(path) = self.resolve_item_path(&item) {
-                        changes.push(RemoteChange::Deleted { path });
+                        changes.push(RemoteChange::Deleted {
+                            path,
+                            item_id: Some(item.id.clone()),
+                        });
                     }
                     continue;
                 }

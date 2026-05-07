@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.2] - 2026-05-06
+
+### Added
+- **v0.13 milestone 3: ID-aware delete events**. `RemoteChange::Deleted`
+  now carries `item_id: Option<String>` alongside `path`. OneDrive and
+  Google Drive populate it from their respective stable IDs. The
+  poller's delta-mode delete handler tries
+  `delete_remote_entry_by_item_id` first and falls back to the
+  path-based variant. Closes the renamed-then-deleted-in-the-same-
+  delta-page case where the delete event's path could be stale —
+  ID-based matching still finds the right row.
+- **Self-heal log enrichment**: when `do_hydrate` prunes a stale row,
+  the warn! line now distinguishes legacy NULL-id rows ("expected,
+  tapers as IDs backfill") from rows that already had a known
+  item_id ("id-aware upsert may have missed a delta event"). Soak
+  signal: known-id pruning should be very rare; if it isn't, the
+  upsert path needs investigation.
+
+### Notes
+- Backends without stable IDs (WebDAV, raw S3) keep delivering
+  `Deleted { item_id: None }`; the path fallback handles them as
+  before — no behavior change.
+- The v0.12.3 self-heal stays in place as defense-in-depth.
+  Removal awaits soak data showing the new-warning rate is near
+  zero across real workloads.
+
 ## [0.13.0-beta.1] - 2026-05-06
 
 ### Changed

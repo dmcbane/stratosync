@@ -524,10 +524,35 @@ impl RemotePoller {
                     path_to_inode.insert(meta.path.clone(), inode);
                     added += 1;
                 }
-                RemoteChange::Deleted { path } => {
-                    if let Some((inode, cache_path)) = self.db
-                        .delete_remote_entry_by_path(self.mount_id, path).await?
-                    {
+                RemoteChange::Deleted { path, item_id } => {
+                    // Try item_id first when available — handles the
+                    // renamed-then-deleted case where our cached
+                    // remote_path is stale. Fall through to the
+                    // path-based variant for backends that don't
+                    // expose IDs (or events from before milestone 1
+                    // landed an ID for this row).
+                    let result = match item_id.as_deref() {
+                        Some(id) => {
+                            let by_id = self.db
+                                .delete_remote_entry_by_item_id(self.mount_id, id)
+                                .await?;
+                            if by_id.is_some() {
+                                by_id
+                            } else {
+                                // No row with that ID — try path. Common
+                                // for pre-milestone-1 rows that have NULL
+                                // remote_item_id but a known path.
+                                self.db
+                                    .delete_remote_entry_by_path(self.mount_id, path)
+                                    .await?
+                            }
+                        }
+                        None => self.db
+                            .delete_remote_entry_by_path(self.mount_id, path)
+                            .await?,
+                    };
+
+                    if let Some((inode, cache_path)) = result {
                         info!(inode, path = %path, "remote deletion detected (delta)");
                         if let Some(cp) = cache_path {
                             let _ = tokio::fs::remove_file(cp).await;
@@ -831,5 +856,61 @@ mod tests {
             .unwrap().expect("renamed file must be indexed at the new path");
         assert_eq!(after.inode, inode_before,
             "rename detected by item_id must preserve the inode");
+    }
+
+    #[tokio::test]
+    async fn delta_delete_by_item_id_handles_renamed_then_deleted() {
+        // The robustness fix from milestone 3. Sequence:
+        //   1. Initial state: file at /old-name.txt with item_id "od-id-tmp"
+        //   2. Delta event 1 (Modified): same item moved to /new-name.txt
+        //   3. Delta event 2 (Deleted): for the same item, but the
+        //      backend includes the item_id; the path it carries may
+        //      be stale (whichever path the backend last knew). Without
+        //      ID-based delete, our path-based match would miss the row
+        //      because the row's remote_path is now "new-name.txt".
+        //   ⇒ With ID-based delete, we find and remove the right row.
+        use stratosync_core::types::{RemoteChange, RemoteMetadata};
+
+        let (db, mid, backend, _) = setup(&[]).await;
+        backend.enable_delta();
+        backend.seed_file_with_id("old-name.txt", b"x", Some("od-id-tmp"));
+        let p = poller(mid, Arc::clone(&db), backend.clone(), Arc::new(GlobSet::empty()));
+        p.poll_once().await.unwrap();
+        db.set_change_token(mid, "mock-bootstrap").await.unwrap();
+
+        let inode_before = db.get_by_remote_path(mid, "old-name.txt").await
+            .unwrap().expect("file indexed").inode;
+
+        // Rename then delete in the same delta page.
+        backend.push_change(RemoteChange::Modified {
+            old_etag: None,
+            meta: RemoteMetadata {
+                path:      "new-name.txt".into(),
+                name:      "new-name.txt".into(),
+                size:      1,
+                mtime:     SystemTime::UNIX_EPOCH,
+                is_dir:    false,
+                etag:      Some("mock-1".into()),
+                checksum:  None,
+                mime_type: None,
+                item_id:   Some("od-id-tmp".into()),
+            },
+        });
+        backend.push_change(RemoteChange::Deleted {
+            // The backend may report whichever path it last knew. Pass
+            // the OLD path here on purpose — the test asserts that
+            // ID-based matching saves us when the path is stale.
+            path:    "old-name.txt".into(),
+            item_id: Some("od-id-tmp".into()),
+        });
+
+        p.poll_once_delta().await.unwrap();
+
+        // No row remains at either path — the item is gone, regardless
+        // of which path the delete event carried.
+        assert!(db.get_by_inode(inode_before).await.unwrap().is_none(),
+            "the item's row must be deleted via item_id match");
+        assert!(db.get_by_remote_path(mid, "new-name.txt").await.unwrap().is_none(),
+            "no stale row should remain at the new path either");
     }
 }
