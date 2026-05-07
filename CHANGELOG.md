@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.4] - 2026-05-07
+
+### Fixed
+- **OneDrive delta: skip items with unrecognized `parentReference.path`
+  shapes** instead of passing the raw string through as the parent
+  path. The pass-through fallback could land items at the mount root
+  or store malformed `drives/{id}/items/...` strings as `remote_path`,
+  the same class of bug as the SharePoint duplicate-folder issue
+  (v0.12.x). Live items dropped on the delta channel are picked up on
+  the next rclone poll cycle; deletes are caught by the id-aware
+  dispatcher (milestone 3) or the verifying-stat self-heal. The warn!
+  line gained `id`, `name`, `deleted`, `is_folder`, `is_file` fields
+  so unexpected shapes can be diagnosed from journal logs without
+  inferring identity from the raw path alone. Soak target: this warn
+  should be very rare; rising rates point at a real shape Graph is
+  emitting that we should add explicit support for.
+
 ## [0.13.0-beta.3] - 2026-05-07
 
 ### Added

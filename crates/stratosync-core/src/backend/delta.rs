@@ -581,6 +581,21 @@ impl OneDriveDelta {
     /// relative path, the DB ended up with two rows per entry and
     /// directories duplicated in the listing. Returns `None` if outside
     /// our `root_path`.
+    ///
+    /// **Unknown shapes are skipped, not passed through.** If Graph hands
+    /// us a `parentReference.path` that matches neither documented form
+    /// (`/drives/{id}/items/{id}` item-ID references, recyclebin paths,
+    /// shared-with-me items, missing path, future API additions), the
+    /// raw string is *not* a safe parent path — using it would let the
+    /// item land somewhere wrong (mount root or a malformed
+    /// `drives/{id}/root:/…` row, see the duplicate-folder regression
+    /// test). The unknown case logs a diagnostic warn and returns
+    /// `None`. Live items get re-discovered on the next rclone poll
+    /// cycle; deletes are caught either by the id-aware dispatcher
+    /// (milestone 3) on the next event, or by the verifying-stat
+    /// self-heal on the next hydration. Soak target: this warn should
+    /// be very rare; rising rates mean a real shape we should add
+    /// support for.
     fn resolve_item_path(&self, item: &OneDriveItem) -> Option<String> {
         // Items without a name (rare, but they exist on the delta channel)
         // can't be turned into a path; skip them upstream.
@@ -594,11 +609,17 @@ impl OneDriveDelta {
                     Some(rest) => rest,
                     None => {
                         warn!(
-                            raw_path = %raw,
-                            "OneDrive parentReference.path has unexpected format; \
-                             passing through unchanged",
+                            raw_path  = %raw,
+                            id        = %item.id,
+                            name      = %name,
+                            deleted   = item.deleted.is_some(),
+                            is_folder = item.folder.is_some(),
+                            is_file   = item.file.is_some(),
+                            "OneDrive parentReference.path has unrecognized \
+                             shape; skipping item — rclone poller will \
+                             pick it up on its next cycle if it's real",
                         );
-                        raw.to_string()
+                        return None;
                     }
                 }
             }
@@ -1455,6 +1476,80 @@ mod tests {
         );
         let path = delta.resolve_item_path(&item);
         assert_eq!(path.as_deref(), Some("Work/report.pdf"));
+    }
+
+    // ── Unknown parentReference.path shapes (skip-not-root) ───────────────
+    //
+    // Microsoft Graph documents only the two shapes we handle, but reality
+    // has a habit of producing surprises (recyclebin, shared-with-me,
+    // future API additions, malformed responses). Pre-fix, an unknown
+    // shape passed through and the raw string became the parent path —
+    // which lets a genuinely-nested item land at our mount root, the same
+    // class of bug as the SharePoint duplicate-folder issue. Skipping is
+    // strictly safer: live items get re-discovered on the next rclone
+    // poll cycle, and deletes are caught either by the id-aware dispatch
+    // (milestone 3) or the verifying-stat self-heal on next hydration.
+
+    #[test]
+    fn test_onedrive_resolve_unknown_prefix_skipped() {
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item(
+            "weird.txt",
+            "/special/recyclebin/items/abc",
+        );
+        assert_eq!(
+            delta.resolve_item_path(&item), None,
+            "unrecognized parent path shape must NOT silently root the item",
+        );
+    }
+
+    #[test]
+    fn test_onedrive_resolve_empty_parent_path_skipped() {
+        // parentReference.path is missing entirely (the field is None on
+        // OneDriveParentRef). Pre-fix this fell through with raw="" and
+        // the item landed at the mount root.
+        let delta = make_onedrive_delta("");
+        let item = OneDriveItem {
+            id: "od-id".into(),
+            name: Some("orphan.txt".into()),
+            size: Some(1),
+            last_modified_date_time: None,
+            parent_reference: Some(OneDriveParentRef { path: None }),
+            folder: None,
+            file: None,
+            deleted: None,
+        };
+        assert_eq!(
+            delta.resolve_item_path(&item), None,
+            "missing parent path is not a valid mount-root signal",
+        );
+    }
+
+    #[test]
+    fn test_onedrive_resolve_drives_items_id_form_skipped() {
+        // Graph occasionally returns parent path as an item-ID reference
+        // (`/drives/{drive_id}/items/{item_id}`) instead of a logical
+        // path. We can't translate item IDs to paths without an extra
+        // round-trip, so skip and let the next poll handle the item.
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item(
+            "file.txt",
+            "/drives/4139BC84D0721EB5/items/01ABC123",
+        );
+        assert_eq!(delta.resolve_item_path(&item), None);
+    }
+
+    #[test]
+    fn test_onedrive_resolve_unknown_prefix_does_not_crash_with_special_chars() {
+        // The parent path can contain anything — the warn! line includes
+        // it as a tracing field, which must not panic on quotes, control
+        // characters, or non-ASCII. Just verify None and no panic.
+        let delta = make_onedrive_delta("");
+        let item = make_onedrive_item(
+            "x",
+            "/some/weird/path/with \"quotes\" and \n newlines",
+        );
+        assert_eq!(delta.resolve_item_path(&item), None);
     }
 
     // ── OneDrive HTTP error mapping tests ────────────────────────────────
