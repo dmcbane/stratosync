@@ -49,9 +49,33 @@ pub struct QueueStatus {
 pub struct ActiveUpload {
     pub inode:           u64,
     pub path:            String,
+    /// Total file size — what we're trying to upload.
     pub size_bytes:      u64,
+    /// Unix-epoch seconds when the *current* rclone attempt began.
+    /// Resets each retry. The dashboard's "elapsed" column is `now -
+    /// started_at_unix`.
     pub started_at_unix: i64,
+    /// Unix-epoch seconds when this inode *first* entered the in-flight
+    /// state — preserved across retryable errors. Lets the dashboard
+    /// distinguish "fresh upload, started 12s ago" from "retry loop,
+    /// first attempt was 40 minutes ago." Defaults to `started_at_unix`
+    /// for old daemons that don't populate it.
+    #[serde(default)]
+    pub first_started_unix: i64,
+    /// 1 on the initial attempt, 2 on the first retry, etc. Reset to 1
+    /// when the inode leaves the queue successfully (or fatally) and
+    /// re-enters later. Defaults to 1 for old daemons.
+    #[serde(default = "default_attempt")]
+    pub attempt:         u32,
+    /// Bytes the backend reports as transferred so far for the current
+    /// attempt, parsed from `rclone --stats=1s` output. `None` when the
+    /// backend doesn't surface progress (mock, webdav). Resets to
+    /// `None`/0 each retry.
+    #[serde(default)]
+    pub bytes_uploaded:  Option<u64>,
 }
+
+fn default_attempt() -> u32 { 1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PollerStatus {
@@ -147,6 +171,9 @@ mod tests {
                         path: "docs/book.pdf".into(),
                         size_bytes: 4_200_000,
                         started_at_unix: 1_700_000_000,
+                        first_started_unix: 1_699_999_700,
+                        attempt: 3,
+                        bytes_uploaded: Some(1_500_000),
                     }],
                 },
                 poller: PollerStatus {
@@ -191,5 +218,28 @@ mod tests {
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("unknown op"));
         assert!(!json.contains("\"data\""));
+    }
+
+    /// An older daemon serializing without the new fields must still
+    /// deserialize against the new struct. The IPC socket is local so
+    /// daemon and CLI usually move in lockstep, but during a partial
+    /// upgrade (new CLI, old daemon still running) the dashboard must
+    /// keep working — even if it has to render `attempt=1` and "no
+    /// progress info" placeholders.
+    #[test]
+    fn active_upload_deserializes_legacy_payload() {
+        let legacy = r#"{
+            "inode": 42,
+            "path": "old.txt",
+            "size_bytes": 1000,
+            "started_at_unix": 1700000000
+        }"#;
+        let up: ActiveUpload = serde_json::from_str(legacy).unwrap();
+        assert_eq!(up.inode, 42);
+        assert_eq!(up.attempt, 1, "missing attempt defaults to 1");
+        assert_eq!(up.first_started_unix, 0,
+            "missing first_started_unix defaults to 0; consumer should fall \
+             back to started_at_unix when it sees 0");
+        assert_eq!(up.bytes_uploaded, None);
     }
 }

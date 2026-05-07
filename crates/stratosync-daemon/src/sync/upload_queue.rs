@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use dashmap::DashMap;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -155,10 +156,24 @@ async fn upload_loop(
     // New triggers push the deadline forward (Write) or shorten it (Close/Fsync).
     let mut pending: HashMap<Inode, PendingUpload> = HashMap::new();
     let mut in_flight: JoinSet<(Inode, Result<(), SyncError>)> = JoinSet::new();
-    // Parallel to `in_flight`: tracks when each upload was spawned so the
-    // dashboard can show elapsed time. Kept in sync with in_flight inserts
-    // and removals.
+    // Parallel to `in_flight`: tracks when the *current attempt* started
+    // (resets each retry) and supports the dashboard's "elapsed" column.
     let mut in_flight_started: HashMap<Inode, Instant> = HashMap::new();
+    // When the inode *first* entered the in-flight state. Preserved
+    // across retryable errors so the dashboard can distinguish "fresh
+    // 12s upload" from "20-minute retry loop." Cleared on success,
+    // fatal, or conflict (i.e. when the inode actually leaves the
+    // queue).
+    let mut in_flight_first_started: HashMap<Inode, Instant> = HashMap::new();
+    // Attempt counter per inode. 1 on the initial spawn, +1 on each
+    // retryable error → re-spawn. Same lifecycle as `in_flight_first_started`.
+    let mut attempts: HashMap<Inode, u32> = HashMap::new();
+    // Live byte-progress for the current attempt, written by the
+    // spawned upload task as rclone emits `--stats=1s` lines. Shared
+    // (Arc<DashMap>) so the snapshot path can read without contending
+    // with active uploads. Resets on every spawn (a new attempt is a
+    // new transfer that re-uploads from byte zero).
+    let in_flight_progress: Arc<DashMap<Inode, u64>> = Arc::new(DashMap::new());
 
     loop {
         // Bandwidth schedule: how long until the window reopens (0 if open
@@ -183,7 +198,12 @@ async fn upload_loop(
                 // touch the pending map.
                 if let UploadTrigger::Snapshot { reply } = trigger {
                     let snapshot = build_queue_snapshot(
-                        &pending, &in_flight_started, &db,
+                        &pending,
+                        &in_flight_started,
+                        &in_flight_first_started,
+                        &attempts,
+                        &in_flight_progress,
+                        &db,
                     ).await;
                     let _ = reply.send(snapshot);
                     continue;
@@ -264,23 +284,68 @@ async fn upload_loop(
                     let bs_c  = Arc::clone(&base_store);
                     let sc_c  = Arc::clone(&sync_config);
 
+                    // Set up the per-attempt progress channel. The
+                    // upload task pushes raw bytes-uploaded counts; a
+                    // small forwarder task copies those into the shared
+                    // DashMap the dashboard reads. Bounded channel so a
+                    // hung dashboard can never back up rclone's stderr
+                    // pipe — we drop progress updates instead.
+                    let (prog_tx, mut prog_rx) = mpsc::channel::<u64>(8);
+                    let progress_map = Arc::clone(&in_flight_progress);
+                    progress_map.insert(inode, 0);
+                    tokio::spawn(async move {
+                        while let Some(bytes) = prog_rx.recv().await {
+                            progress_map.insert(inode, bytes);
+                        }
+                    });
+
                     in_flight.spawn(async move {
-                        let result = run_upload(inode, mount_id, &db_c, &be_c, &bs_c, &sc_c, version_retention).await;
+                        let result = run_upload(
+                            inode, mount_id, &db_c, &be_c, &bs_c, &sc_c,
+                            version_retention, prog_tx,
+                        ).await;
                         (inode, result)
                     });
-                    in_flight_started.insert(inode, Instant::now());
+                    let now = Instant::now();
+                    in_flight_started.insert(inode, now);
+                    // first_started is preserved across retries: only
+                    // record on the first entry into the queue.
+                    in_flight_first_started.entry(inode).or_insert(now);
+                    *attempts.entry(inode).or_insert(0) += 1;
                 }
             }
 
             // Completed upload
             Some(result) = in_flight.join_next() => {
+                // Helper: the inode has truly left the queue (success,
+                // conflict, or fatal — anything that doesn't reschedule
+                // a retry). Drops the current-attempt timer, the
+                // first-started timer, the attempt counter, and the
+                // progress entry. The forwarder task on the prog
+                // channel exits naturally when its sender is dropped
+                // by `run_upload`'s task ending.
+                let clear_all = |inode: Inode,
+                                     in_flight_started: &mut HashMap<Inode, Instant>,
+                                     in_flight_first_started: &mut HashMap<Inode, Instant>,
+                                     attempts: &mut HashMap<Inode, u32>,
+                                     in_flight_progress: &Arc<DashMap<Inode, u64>>| {
+                    in_flight_started.remove(&inode);
+                    in_flight_first_started.remove(&inode);
+                    attempts.remove(&inode);
+                    in_flight_progress.remove(&inode);
+                };
+
                 match result {
                     Ok((inode, Ok(()))) => {
-                        in_flight_started.remove(&inode);
+                        clear_all(inode, &mut in_flight_started,
+                                  &mut in_flight_first_started,
+                                  &mut attempts, &in_flight_progress);
                         debug!(inode, "upload complete");
                     }
                     Ok((inode, Err(SyncError::Conflict { local, remote }))) => {
-                        in_flight_started.remove(&inode);
+                        clear_all(inode, &mut in_flight_started,
+                                  &mut in_flight_first_started,
+                                  &mut attempts, &in_flight_progress);
                         warn!(inode, ?local, ?remote, "upload conflict — invoking resolver");
                         if let Ok(Some(entry)) = db.get_by_inode(inode).await {
                             let has_git = super::conflict::git_available();
@@ -293,8 +358,15 @@ async fn upload_loop(
                         }
                     }
                     Ok((inode, Err(e))) if e.is_retryable() => {
+                        // Retryable: drop the *current attempt* timer
+                        // and progress, but preserve `first_started`
+                        // and `attempts` so the dashboard can show
+                        // "attempt 3, started 4m ago, retrying".
                         in_flight_started.remove(&inode);
-                        warn!(inode, "upload transient error: {e} — will retry");
+                        in_flight_progress.remove(&inode);
+                        let n = attempts.get(&inode).copied().unwrap_or(1);
+                        warn!(inode, attempt = n,
+                              "upload transient error: {e} — will retry");
                         if let Err(db_err) = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await {
                             warn!(inode, "failed to record retry backoff: {db_err}");
                         }
@@ -307,7 +379,9 @@ async fn upload_loop(
                         });
                     }
                     Ok((inode, Err(e))) => {
-                        in_flight_started.remove(&inode);
+                        clear_all(inode, &mut in_flight_started,
+                                  &mut in_flight_first_started,
+                                  &mut attempts, &in_flight_progress);
                         warn!(inode, "upload fatal: {e}");
                         if let Err(db_err) = db.set_status(inode, SyncStatus::Dirty).await {
                             warn!(inode, "failed to reset status to Dirty: {db_err}");
@@ -334,12 +408,22 @@ async fn upload_loop(
 }
 
 /// Build a QueueStatus snapshot for the dashboard IPC. Looks up each
-/// in-flight inode in the DB to fetch its path and size.
+/// in-flight inode in the DB to fetch its path and size, then folds in
+/// the per-attempt timers, the first-attempt timer, attempt count, and
+/// live byte progress.
 async fn build_queue_snapshot(
     pending: &HashMap<Inode, PendingUpload>,
     in_flight_started: &HashMap<Inode, Instant>,
+    in_flight_first_started: &HashMap<Inode, Instant>,
+    attempts: &HashMap<Inode, u32>,
+    in_flight_progress: &Arc<DashMap<Inode, u64>>,
     db: &Arc<StateDb>,
 ) -> QueueStatus {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
     let mut in_flight: Vec<ActiveUpload> = Vec::with_capacity(in_flight_started.len());
     for (&inode, &started) in in_flight_started {
         let (path, size) = match db.get_by_inode(inode).await {
@@ -347,15 +431,28 @@ async fn build_queue_snapshot(
             _ => (String::from("(unknown)"), 0),
         };
         let elapsed = started.elapsed().as_secs() as i64;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // first_started is preserved across retries; if for some reason
+        // it's missing (race with completion), fall back to the current
+        // attempt's start.
+        let first_elapsed = in_flight_first_started.get(&inode)
+            .map(|t| t.elapsed().as_secs() as i64)
+            .unwrap_or(elapsed);
+        let attempt = attempts.get(&inode).copied().unwrap_or(1);
+        // bytes_uploaded = None when the backend hasn't reported any
+        // progress yet — distinguishes "0 bytes uploaded" from "we
+        // don't know." rclone takes 1s for its first stats tick, so
+        // sub-second uploads complete with no progress entry.
+        let bytes_uploaded = in_flight_progress.get(&inode)
+            .map(|v| *v.value());
+
         in_flight.push(ActiveUpload {
             inode,
             path,
             size_bytes: size,
             started_at_unix: now - elapsed,
+            first_started_unix: now - first_elapsed,
+            attempt,
+            bytes_uploaded,
         });
     }
     QueueStatus {
@@ -372,6 +469,7 @@ async fn run_upload(
     base_store:  &Arc<BaseStore>,
     sync_config: &Arc<SyncConfig>,
     version_retention: u32,
+    progress:    mpsc::Sender<u64>,
 ) -> Result<(), SyncError> {
     // Load the job spec from DB
     let entry = db.get_by_inode(inode).await
@@ -419,10 +517,11 @@ async fn run_upload(
 
     info!(inode, path = %entry.remote_path, "uploading");
 
-    let meta = backend.upload(
+    let meta = backend.upload_with_progress(
         &cache_path,
         &entry.remote_path,
         entry.etag.as_deref(),
+        progress,
     ).await?;
 
     // Success — update etag and mark CACHED. Use `set_uploaded` (not
@@ -552,5 +651,118 @@ mod tests {
         // 12:00–12:00 is the degenerate "always open" form.
         let w = Some(window(12 * 60, 12 * 60));
         assert_eq!(secs_until_window_opens(w), 0);
+    }
+
+    // ── build_queue_snapshot semantics ────────────────────────────────
+
+    use stratosync_core::state::{NewFileEntry, StateDb};
+    use stratosync_core::types::{FileKind, SyncStatus};
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    async fn make_db_with_inode(remote_path: &str, size: u64) -> (Arc<StateDb>, u32, Inode) {
+        let db = StateDb::in_memory().unwrap();
+        db.migrate().await.unwrap();
+        let mount_id = db.upsert_mount(
+            "test", "gdrive:/", "/mnt/test", "/tmp/cache",
+            5 * 1024 * 1024 * 1024, 60,
+        ).await.unwrap();
+        let root = db.insert_root(&NewFileEntry {
+            mount_id, parent: 0, name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0, mtime: SystemTime::UNIX_EPOCH,
+            etag: None, status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id, parent: root,
+            name: remote_path.trim_start_matches('/').into(),
+            remote_path: remote_path.into(),
+            kind: FileKind::File, size, mtime: SystemTime::UNIX_EPOCH,
+            etag: None, status: SyncStatus::Uploading,
+            cache_path: Some(PathBuf::from("/tmp/cache/x")),
+            cache_size: Some(size),
+        }).await.unwrap();
+        (Arc::new(db), mount_id, inode)
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_attempt_and_first_started_for_retry() {
+        let (db, _mid, inode) = make_db_with_inode("/big.iso", 50_000_000).await;
+
+        // Simulate: first attempt began ~120s ago, current attempt
+        // (after retry) began 10s ago, this is attempt #3, and the
+        // backend has reported 5 MiB transferred for the current go.
+        let now = Instant::now();
+        let mut started = HashMap::new();
+        started.insert(inode, now - Duration::from_secs(10));
+        let mut first = HashMap::new();
+        first.insert(inode, now - Duration::from_secs(120));
+        let mut attempts = HashMap::new();
+        attempts.insert(inode, 3);
+        let progress: Arc<DashMap<Inode, u64>> = Arc::new(DashMap::new());
+        progress.insert(inode, 5 * 1024 * 1024);
+
+        let snap = build_queue_snapshot(
+            &HashMap::new(), &started, &first, &attempts, &progress, &db,
+        ).await;
+
+        assert_eq!(snap.in_flight.len(), 1);
+        let up = &snap.in_flight[0];
+        assert_eq!(up.inode, inode);
+        assert_eq!(up.attempt, 3);
+        assert_eq!(up.size_bytes, 50_000_000);
+        assert_eq!(up.bytes_uploaded, Some(5 * 1024 * 1024));
+        // The current-attempt timer says ~10s elapsed, the first-attempt
+        // timer says ~120s. Allow ±2s slop for test scheduling.
+        let cur_elapsed   = (up.size_bytes as i64).max(0); // suppress unused on size in case
+        let _ = cur_elapsed;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert!((now_unix - up.started_at_unix - 10).abs() <= 2,
+                "current-attempt elapsed should be ~10s, got {}",
+                now_unix - up.started_at_unix);
+        assert!((now_unix - up.first_started_unix - 120).abs() <= 2,
+                "first-attempt elapsed should be ~120s, got {}",
+                now_unix - up.first_started_unix);
+    }
+
+    #[tokio::test]
+    async fn snapshot_defaults_attempt_to_one_when_map_is_empty() {
+        let (db, _mid, inode) = make_db_with_inode("/x.txt", 100).await;
+        let mut started = HashMap::new();
+        started.insert(inode, Instant::now());
+        let progress: Arc<DashMap<Inode, u64>> = Arc::new(DashMap::new());
+
+        let snap = build_queue_snapshot(
+            &HashMap::new(), &started,
+            &HashMap::new(),    // first_started missing — fall back path
+            &HashMap::new(),    // attempts missing — defaults to 1
+            &progress, &db,
+        ).await;
+        let up = &snap.in_flight[0];
+        assert_eq!(up.attempt, 1);
+        // first_started falls back to current-attempt start when missing
+        assert_eq!(up.first_started_unix, up.started_at_unix);
+        assert_eq!(up.bytes_uploaded, None,
+            "no progress entry → bytes_uploaded is None, not Some(0)");
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_zero_bytes_when_progress_is_explicitly_zero() {
+        // Distinguishes "we just inserted the progress entry, no bytes
+        // moved yet" from "no progress reporting at all (sub-second
+        // upload, mock backend, etc)."
+        let (db, _mid, inode) = make_db_with_inode("/x.txt", 100).await;
+        let mut started = HashMap::new();
+        started.insert(inode, Instant::now());
+        let progress: Arc<DashMap<Inode, u64>> = Arc::new(DashMap::new());
+        progress.insert(inode, 0);
+
+        let snap = build_queue_snapshot(
+            &HashMap::new(), &started,
+            &HashMap::new(), &HashMap::new(),
+            &progress, &db,
+        ).await;
+        assert_eq!(snap.in_flight[0].bytes_uploaded, Some(0));
     }
 }

@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.5] - 2026-05-07
+
+### Changed
+- **Dashboard in-flight view now distinguishes a healthy upload from a
+  retry loop.** The previous view showed only path/size/elapsed —
+  identical for "fresh 12s upload" and "retry #5 of a 40-minute
+  failure spiral." Each in-flight row now also shows attempt count
+  (when > 1), first-seen elapsed, and live byte progress (`5.2
+  MB/100 MB 5%`) parsed from `rclone --stats=1s` output. The
+  current-attempt elapsed remains the primary clock; the rest are
+  conditional add-ons that only render when meaningful.
+
+### Added
+- `Backend::upload_with_progress` (default-implemented to fall back to
+  plain `upload`). `RcloneBackend` overrides with a streaming
+  `run_with_progress` that pipes rclone's stderr line-by-line and
+  forwards `Transferred: X / Y` quantities through a `Sender<u64>`.
+- `ipc::ActiveUpload` gains `first_started_unix`, `attempt`, and
+  `bytes_uploaded` fields. All three default-deserialize for legacy
+  daemons during partial-upgrade rollouts.
+
+### Notes
+- Cycle observed by users where the timer "fluctuates between 0 and
+  60 seconds" was a transient-error retry loop. The 60s cadence comes
+  from `mount.poll_interval` being reused as the upload-retry
+  debounce in `main.rs:209` — that's a separate quirk and not
+  changed here. The dashboard now makes the loop visible so it's
+  diagnosable without reading journal logs.
+
 ## [0.13.0-beta.4] - 2026-05-07
 
 ### Fixed

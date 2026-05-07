@@ -84,9 +84,7 @@ fn print_plain(s: &DaemonStatus) {
             println!();
             println!("{}: in-flight uploads:", m.name);
             for up in &m.queue.in_flight {
-                println!("  {:<40} {:>10}  {}s",
-                    up.path, format!("{}", ByteSize(up.size_bytes)),
-                    elapsed_secs(up.started_at_unix));
+                println!("  {}", fmt_active_upload(up));
             }
         }
     }
@@ -292,10 +290,52 @@ fn status_label(m: &MountStatus) -> String {
 }
 
 fn fmt_active_upload(up: &ActiveUpload) -> String {
-    format!("{:<40} {:>10}  {}s",
+    // Path | progress (uploaded/total) | attempt# | first-seen | this-attempt
+    //
+    // first_started_unix is 0 on legacy daemons that don't populate it
+    // — fall back to started_at_unix so the column reads as "just
+    // started" instead of "57 years ago" (epoch).
+    let first = if up.first_started_unix == 0 {
+        up.started_at_unix
+    } else {
+        up.first_started_unix
+    };
+    let cur_elapsed   = elapsed_secs(up.started_at_unix);
+    let total_elapsed = elapsed_secs(first);
+    let attempt_str = if up.attempt <= 1 {
+        String::new()
+    } else {
+        format!("  attempt#{}", up.attempt)
+    };
+    let total_str = if total_elapsed > cur_elapsed + 1 {
+        // Only show "first-seen" when it's meaningfully different from
+        // the current-attempt clock (i.e. we're actually in a retry).
+        format!("  first-seen {}", fmt_duration(total_elapsed as u64))
+    } else {
+        String::new()
+    };
+    format!("{:<40} {:>11}  {:>4}s{}{}",
         truncate(&up.path, 40),
-        ByteSize(up.size_bytes).to_string(),
-        elapsed_secs(up.started_at_unix))
+        fmt_progress(up),
+        cur_elapsed,
+        attempt_str,
+        total_str)
+}
+
+/// Render the progress column. Falls back gracefully:
+///   - Some(b) and total>0 → `"5.2 MB/100 MB 5%"`
+///   - Some(b) but total=0 (rare) → `"5.2 MB"`
+///   - None (no progress reporting yet) → `"100 MB"` (just total)
+fn fmt_progress(up: &ActiveUpload) -> String {
+    let total = ByteSize(up.size_bytes).to_string();
+    match up.bytes_uploaded {
+        Some(b) if up.size_bytes > 0 => {
+            let p = (b as f64 / up.size_bytes as f64 * 100.0) as u64;
+            format!("{}/{} {}%", ByteSize(b), total, p)
+        }
+        Some(b) => ByteSize(b).to_string(),
+        None    => total,
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

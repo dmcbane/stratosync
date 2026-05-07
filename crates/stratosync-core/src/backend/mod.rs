@@ -73,6 +73,23 @@ pub trait Backend: Send + Sync + 'static {
         if_match: Option<&str>,
     ) -> Result<RemoteMetadata, SyncError>;
 
+    /// Upload with periodic progress callbacks. Each call to `progress`
+    /// reports total bytes transferred so far for this attempt. The
+    /// default implementation falls back to `upload` and never fires
+    /// the callback — backends that can't surface progress (mock,
+    /// webdav-via-PUT) inherit this. RcloneBackend overrides to pipe
+    /// rclone's `--stats=1s --stats-one-line` output through the
+    /// callback.
+    async fn upload_with_progress(
+        &self,
+        local:    &Path,
+        remote:   &str,
+        if_match: Option<&str>,
+        _progress: tokio::sync::mpsc::Sender<u64>,
+    ) -> Result<RemoteMetadata, SyncError> {
+        self.upload(local, remote, if_match).await
+    }
+
     /// Create a remote directory (and any missing parents).
     async fn mkdir(&self, path: &str) -> Result<(), SyncError>;
 
@@ -136,6 +153,38 @@ fn parse_rclone_error(stderr: &str) -> String {
     } else {
         first.to_string()
     }
+}
+
+/// Parse the bytes-uploaded value from a single line of `rclone --stats=1s
+/// --stats-one-line` output. Returns `None` for lines that aren't
+/// transfer-progress lines (rclone emits other log lines too — debug,
+/// info about the transfer plan, errors).
+///
+/// The line we care about looks like one of:
+///   `Transferred:   	    1.234 MiB / 5.678 MiB, 22%, 100 KiB/s, ETA 1m`
+///   `2026/05/07 12:34:56 INFO  : Transferred:   1 MiB / 1 MiB, 100%, ...`
+///   `Transferred:        0 / 0 Bytes, -, 0 B/s, ETA -`
+///
+/// We extract the first quantity (left of the `/`), reusing the project's
+/// `parse_size` so byte/KiB/MiB/GiB/TiB units are handled the same way as
+/// the rest of the config pipeline. Bare unit-less numbers (rclone's "0
+/// / 0 Bytes" case before any transfer has happened) parse as bytes.
+pub(crate) fn parse_rclone_progress_line(line: &str) -> Option<u64> {
+    let (_, after) = line.split_once("Transferred:")?;
+    let after = after.trim_start();
+    // Some rclone output forms put a count of files here (e.g.
+    // "Transferred:           5 / 10, 50%" — the multi-file overall
+    // line). We only care about the *byte* line, which always has a
+    // unit on the second quantity. Detect by scanning for "Bytes",
+    // "iB", or "B/" — if the line doesn't contain a byte-unit at all,
+    // it's a file-count line and we skip.
+    if !after.contains("Bytes") && !after.contains("iB") && !after.contains(" B,") {
+        return None;
+    }
+    let (qty, _) = after.split_once('/')?;
+    let qty = qty.trim();
+    // rclone occasionally pads with tabs; `trim` handles that.
+    crate::config::parse_size(qty).ok()
 }
 
 // ── RcloneBackend ─────────────────────────────────────────────────────────────
@@ -368,6 +417,130 @@ impl RcloneBackend {
         }
     }
 
+    /// Run an rclone command and stream byte-progress through `progress`
+    /// while the subprocess runs. Identical exit-code mapping to `run`,
+    /// but stderr is captured line-by-line so each `Transferred:` line
+    /// fires a `progress.send(bytes_uploaded)`. Best-effort: if the
+    /// channel is closed (dashboard disconnected), progress sends are
+    /// silently dropped — we never block the upload on a slow consumer.
+    ///
+    /// Used by `upload_with_progress`. Other rclone calls (lsjson,
+    /// download, mkdir, …) don't need progress and stay on plain `run`.
+    async fn run_with_progress(
+        &self,
+        args: &[&str],
+        progress: tokio::sync::mpsc::Sender<u64>,
+    ) -> Result<Vec<u8>, SyncError> {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command as TokioCommand;
+
+        let mut cmd = TokioCommand::new(&self.rclone_bin);
+        cmd.args(args);
+        for f in &self.extra_flags {
+            cmd.arg(f);
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        debug!(args = ?args, "rclone invocation (with progress)");
+
+        let mut child = cmd.spawn()
+            .map_err(|e| SyncError::Fatal(format!("failed to spawn rclone: {e}")))?;
+
+        let stdout = child.stdout.take()
+            .ok_or_else(|| SyncError::Fatal("rclone stdout pipe missing".into()))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| SyncError::Fatal("rclone stderr pipe missing".into()))?;
+
+        // Drain stdout into memory in parallel so the pipe doesn't fill
+        // and block rclone (it's normally small for `copyto` but we
+        // want to be safe).
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut rd = BufReader::new(stdout);
+            tokio::io::AsyncReadExt::read_to_end(&mut rd, &mut buf).await
+                .map(|_| buf)
+        });
+
+        // Drain stderr line-by-line; emit progress on transfer lines,
+        // collect everything for error mapping if the process fails.
+        let stderr_task = tokio::spawn(async move {
+            let mut full = String::new();
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(bytes) = parse_rclone_progress_line(&line) {
+                    // Channel closed = consumer gone; drop the value.
+                    let _ = progress.try_send(bytes);
+                }
+                full.push_str(&line);
+                full.push('\n');
+            }
+            full
+        });
+
+        let status = match tokio::time::timeout(self.timeout, child.wait()).await {
+            Ok(Ok(s))  => s,
+            Ok(Err(e)) => return Err(SyncError::Fatal(format!("rclone wait: {e}"))),
+            Err(_)     => return Err(SyncError::Network("rclone timed out".into())),
+        };
+
+        let stdout_bytes = stdout_task.await
+            .map_err(|e| SyncError::Fatal(format!("stdout reader join: {e}")))?
+            .map_err(SyncError::Io)?;
+        let stderr_str = stderr_task.await
+            .map_err(|e| SyncError::Fatal(format!("stderr reader join: {e}")))?;
+
+        // Output-size cap mirrors `run`.
+        const MAX_OUTPUT: usize = 256 * 1024 * 1024;
+        if stdout_bytes.len() > MAX_OUTPUT {
+            return Err(SyncError::Fatal(format!(
+                "rclone output exceeded {}MB limit", MAX_OUTPUT / (1024 * 1024),
+            )));
+        }
+
+        if status.success() {
+            return Ok(stdout_bytes);
+        }
+
+        let code = status.code().unwrap_or(-1);
+        let msg  = parse_rclone_error(&stderr_str);
+        debug!(code, stderr = %msg, "rclone non-zero exit (with-progress)");
+        // Same exit-code mapping as `run` — keep these in sync if `run`
+        // ever grows new cases.
+        match code {
+            3 | 4 => Err(SyncError::NotFound(msg)),
+            5 | 6 => Err(SyncError::Transient(msg)),
+            8     => Err(SyncError::QuotaExceeded),
+            _     => {
+                let lower = msg.to_lowercase();
+                if lower.contains("didn't match") || lower.contains("sourcemd5") {
+                    warn!("ETag conflict detected: {msg}");
+                    Err(SyncError::Conflict { local: None, remote: Some(msg) })
+                } else if lower.contains("invalid_grant") || (lower.contains("token")
+                       && (lower.contains("expired") || lower.contains("revoked")))
+                {
+                    Err(SyncError::PermissionDenied(msg))
+                } else if lower.contains("403") || lower.contains("permission denied") {
+                    Err(SyncError::PermissionDenied(msg))
+                } else if lower.contains("timeout") || lower.contains("deadline")
+                       || lower.contains("connection refused") || lower.contains("dns")
+                {
+                    Err(SyncError::Network(msg))
+                } else if lower.contains("doesn't exist") || lower.contains("not found")
+                       || lower.contains("404")
+                {
+                    Err(SyncError::NotFound(msg))
+                } else if lower.contains("quota") || lower.contains("storage full") {
+                    Err(SyncError::QuotaExceeded)
+                } else {
+                    Err(SyncError::Fatal(msg))
+                }
+            }
+        }
+    }
+
     /// Parse rclone lsjson output into `Vec<RemoteMetadata>`.
     fn parse_lsjson(bytes: &[u8]) -> Result<Vec<RemoteMetadata>, SyncError> {
         let entries: Vec<RcloneLsJsonEntry> = serde_json::from_slice(bytes)
@@ -474,6 +647,55 @@ impl Backend for RcloneBackend {
         self.stat(remote).await
     }
 
+    /// Same as `upload` but pipes byte-progress through the channel.
+    /// Adds `--stats=1s --stats-one-line --stats-log-level=NOTICE` so
+    /// rclone emits one transfer-summary line per second at NOTICE level
+    /// (the default log level), without the noise that bumping to INFO
+    /// would produce. The if_match phase and post-stat are unchanged.
+    async fn upload_with_progress(
+        &self,
+        local:    &Path,
+        remote:   &str,
+        if_match: Option<&str>,
+        progress: tokio::sync::mpsc::Sender<u64>,
+    ) -> Result<RemoteMetadata, SyncError> {
+        let local_str = local.to_str()
+            .ok_or_else(|| SyncError::Fatal("non-UTF8 local path".into()))?;
+        let rp = self.rpath(remote);
+
+        if let Some(expected_etag) = if_match {
+            match self.stat(remote).await {
+                Ok(meta) => {
+                    if let Some(ref remote_etag) = meta.etag {
+                        if remote_etag != expected_etag {
+                            return Err(SyncError::Conflict {
+                                local:  Some(expected_etag.to_owned()),
+                                remote: Some(remote_etag.clone()),
+                            });
+                        }
+                    }
+                }
+                Err(SyncError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.run_with_progress(
+            &[
+                "copyto",
+                local_str,
+                &rp,
+                "--checksum",
+                "--stats=1s",
+                "--stats-one-line",
+                "--stats-log-level=NOTICE",
+            ],
+            progress,
+        ).await?;
+
+        self.stat(remote).await
+    }
+
     async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
         let rp = self.rpath(path);
         self.run(&["mkdir", &rp]).await?;
@@ -564,6 +786,73 @@ fn which_rclone() -> Result<std::path::PathBuf> {
         "rclone not found. Install from https://rclone.org/install/ \
          or set STRATOSYNC_RCLONE=/path/to/rclone"
     )
+}
+
+// ── Tests for pure helpers ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod parse_progress_tests {
+    use super::*;
+
+    #[test]
+    fn parses_basic_byte_progress() {
+        let line = "Transferred:   	    1.234 MiB / 5.678 MiB, 22%, 100 KiB/s, ETA 1m";
+        let n = parse_rclone_progress_line(line).unwrap();
+        // 1.234 * 2^20 = 1_293_942.784, truncated to u64 → 1_293_942
+        assert!(n >= 1_290_000 && n <= 1_295_000, "got {n}");
+    }
+
+    #[test]
+    fn parses_with_log_prefix() {
+        let line = "2026/05/07 12:34:56 INFO  : Transferred:   100 MiB / 200 MiB, 50%, 5 MiB/s, ETA 20s";
+        assert_eq!(parse_rclone_progress_line(line).unwrap(), 100u64 << 20);
+    }
+
+    #[test]
+    fn parses_zero_bytes_initial_state() {
+        // The very first --stats tick before any bytes have moved.
+        let line = "Transferred:        0 / 0 Bytes, -, 0 B/s, ETA -";
+        assert_eq!(parse_rclone_progress_line(line).unwrap(), 0);
+    }
+
+    #[test]
+    fn parses_completed_transfer() {
+        let line = "Transferred:   42 MiB / 42 MiB, 100%, 5 MiB/s, ETA 0s";
+        assert_eq!(parse_rclone_progress_line(line).unwrap(), 42u64 << 20);
+    }
+
+    #[test]
+    fn parses_gib_units() {
+        let line = "Transferred:   2.5 GiB / 10 GiB, 25%, 50 MiB/s, ETA 2m30s";
+        let n = parse_rclone_progress_line(line).unwrap();
+        // 2.5 GiB ≈ 2_684_354_560
+        assert!(n >= 2_684_000_000 && n <= 2_685_000_000, "got {n}");
+    }
+
+    #[test]
+    fn ignores_file_count_lines() {
+        // rclone also emits "Transferred:   5 / 10," for total file counts
+        // when transferring multiple files. We only care about the byte
+        // line — the count line has no byte units.
+        let line = "Transferred:           5 / 10, 50%";
+        assert_eq!(parse_rclone_progress_line(line), None);
+    }
+
+    #[test]
+    fn ignores_unrelated_lines() {
+        assert_eq!(parse_rclone_progress_line("Checks:                 1 / 1, 100%"), None);
+        assert_eq!(parse_rclone_progress_line("Errors:                 0"), None);
+        assert_eq!(parse_rclone_progress_line(""), None);
+        assert_eq!(parse_rclone_progress_line("garbage"), None);
+    }
+
+    #[test]
+    fn ignores_malformed_lines() {
+        // Has "Transferred:" but no '/' separator
+        assert_eq!(parse_rclone_progress_line("Transferred: nothing useful"), None);
+        // No quantity at all
+        assert_eq!(parse_rclone_progress_line("Transferred:    /  Bytes"), None);
+    }
 }
 
 // ── Mock backend for testing ──────────────────────────────────────────────────

@@ -259,7 +259,11 @@ mod tests {
                 queue:      QueueStatus {
                     pending: 2,
                     in_flight: vec![ActiveUpload {
-                        inode: 1, path: "x".into(), size_bytes: 100, started_at_unix: 1,
+                        inode: 1, path: "x".into(), size_bytes: 100,
+                        started_at_unix: 1,
+                        first_started_unix: 1,
+                        attempt: 1,
+                        bytes_uploaded: None,
                     }],
                 },
                 poller:     PollerStatus {
