@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.9] - 2026-05-09
+
+### Added
+- **`stratosync push <path>` — force-upload now.** Mirror of `pin` for
+  the upload direction, second item from the symmetry audit. Triggered
+  by the question "if my editor saved a file but it's stuck in a 60s
+  retry-backoff window and I'm about to close my laptop, how do I make
+  it upload right now?" Previously the only mechanism was an editor's
+  built-in `fsync()` (and not all editors expose one).
+  - Single-file form: `stratosync push my-doc.md` opens the file
+    through the FUSE mount and calls `sync_all()`. The kernel forwards
+    the fsync to the daemon's FUSE callback, which already enqueues
+    `UploadTrigger::Fsync` (window=ZERO, immediate=true) — so all the
+    bypass machinery already lives in the daemon and we don't need a
+    new IPC route. No daemon-side changes required.
+  - Directory form: `stratosync push <dir>` recurses (matching `pin`'s
+    behavior) and pushes every Dirty/Uploading descendant; already-
+    synced files are silently skipped. Refused files (Remote /
+    Hydrating / Stale / Conflict) are reported in a tail block.
+  - Status-classification matrix:
+    - `Dirty`/`Uploading` → fsync (the whole point).
+    - `Cached` → friendly "already synced" message; exit 0.
+    - `Remote`/`Hydrating` → refuse: "file is not downloaded locally".
+    - `Stale` → refuse: pushing the older local copy would clobber
+      remote changes.
+    - `Conflict` → refuse: point at `stratosync conflicts`.
+
 ## [0.13.0-beta.8] - 2026-05-09
 
 ### Added

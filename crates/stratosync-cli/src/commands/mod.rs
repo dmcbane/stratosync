@@ -5,5 +5,6 @@ pub mod daemon;
 pub mod dashboard;
 pub mod ls;
 pub mod pin;
+pub mod push;
 pub mod status;
 pub mod versions;

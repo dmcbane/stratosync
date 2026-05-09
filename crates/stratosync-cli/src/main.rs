@@ -38,6 +38,10 @@ enum Command {
     Pin { path: PathBuf },
     /// Remove an offline pin
     Unpin { path: PathBuf },
+    /// Force-upload a file (or directory of files) right now,
+    /// bypassing the per-write debounce and bandwidth window. The
+    /// upload-side mirror of `pin`.
+    Push { path: PathBuf },
     /// List and manage conflict files
     Conflicts {
         #[command(subcommand)]
@@ -214,6 +218,9 @@ async fn main() -> Result<()> {
         }
         Command::Unpin { path } => {
             commands::pin::unpin(&config_path, &path).await?;
+        }
+        Command::Push { path } => {
+            commands::push::push(&config_path, &path).await?;
         }
         Command::Conflicts { action } => match action {
             None => commands::conflicts::list(&config_path).await?,
