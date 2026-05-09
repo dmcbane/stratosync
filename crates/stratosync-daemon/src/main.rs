@@ -264,6 +264,9 @@ async fn main() -> Result<()> {
         // Hydration waiters — created up-front so both FUSE and the dashboard
         // share the same DashMap.
         let hydration_waiters = Arc::new(DashMap::new());
+        // Hydration tracker — same wiring story: FUSE writes the in-flight
+        // rows during do_hydrate, the dashboard reads them out of the snapshot.
+        let hydration_tracker = fuse::HydrationTracker::new();
 
         // Collect a handle for the dashboard IPC aggregator.
         mount_handles.push(MountHandle {
@@ -276,6 +279,7 @@ async fn main() -> Result<()> {
             upload_queue:      Arc::clone(&upload_queue),
             poller_state,
             hydration_waiters: Arc::clone(&hydration_waiters),
+            hydration_tracker: hydration_tracker.clone(),
         });
 
         // FUSE mount (blocking thread)
@@ -288,6 +292,7 @@ async fn main() -> Result<()> {
         let base_store_c = Arc::clone(&base_store);
         let sync_cfg_c   = Arc::clone(&sync_config);
         let waiters_c    = Arc::clone(&hydration_waiters);
+        let tracker_c    = hydration_tracker.clone();
         let ignore_c     = Arc::clone(&ignore);
         // Capture the tokio Handle here (main thread has runtime context).
         // The spawned std::thread has no tokio context, so Handle::current()
@@ -301,7 +306,7 @@ async fn main() -> Result<()> {
                     &mount_name, mount_id, &mount_path,
                     cache_dir, db_c, backend_c, queue_c,
                     base_store_c, sync_cfg_c, fuse_cfg, rt_handle,
-                    waiters_c, ignore_c,
+                    waiters_c, tracker_c, ignore_c,
                 ) {
                     error!(mount = %mount_name, "FUSE error: {e}");
                 }

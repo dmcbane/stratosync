@@ -18,7 +18,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use stratosync_core::{
     config::default_runtime_socket,
-    ipc::{ActiveUpload, DaemonStatus, IpcResponse, MountStatus},
+    ipc::{ActiveHydration, ActiveUpload, DaemonStatus, IpcResponse, MountStatus},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -85,6 +85,13 @@ fn print_plain(s: &DaemonStatus) {
             println!("{}: in-flight uploads:", m.name);
             for up in &m.queue.in_flight {
                 println!("  {}", fmt_active_upload(up));
+            }
+        }
+        if !m.hydration.in_flight.is_empty() {
+            println!();
+            println!("{}: in-flight hydrations:", m.name);
+            for hy in &m.hydration.in_flight {
+                println!("  {}", fmt_active_hydration(hy));
             }
         }
     }
@@ -164,7 +171,7 @@ fn render(
         .constraints([
             Constraint::Length(3), // header
             Constraint::Min(6),    // mount table
-            Constraint::Length(8), // in-flight detail
+            Constraint::Length(10), // in-flight detail (uploads + hydrations)
             Constraint::Length(7), // poller + hydration detail
             Constraint::Length(1), // help
         ])
@@ -216,17 +223,30 @@ fn render(
             .block(Block::default().title(" mounts ").borders(Borders::ALL));
         frame.render_widget(table, chunks[1]);
 
-        // In-flight detail
+        // In-flight detail — uploads on top, hydrations below. Both
+        // sections always render so the user can immediately see "(no
+        // active downloads)" when their cp appears stuck and confirm
+        // there's nothing in flight rather than guessing.
         let mount = s.mounts.get(selected);
         let inflight_text = mount.map(|m| {
+            let mut lines = Vec::new();
+            lines.push("uploads:".to_string());
             if m.queue.in_flight.is_empty() {
-                "(no active uploads)".to_string()
+                lines.push("  (none)".to_string());
             } else {
-                m.queue.in_flight.iter()
-                    .map(fmt_active_upload)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                for up in &m.queue.in_flight {
+                    lines.push(format!("  {}", fmt_active_upload(up)));
+                }
             }
+            lines.push("hydrations:".to_string());
+            if m.hydration.in_flight.is_empty() {
+                lines.push("  (none)".to_string());
+            } else {
+                for hy in &m.hydration.in_flight {
+                    lines.push(format!("  {}", fmt_active_hydration(hy)));
+                }
+            }
+            lines.join("\n")
         }).unwrap_or_default();
         let title = mount.map(|m| format!(" {}: in-flight ", m.name))
             .unwrap_or_else(|| " in-flight ".to_string());
@@ -327,10 +347,46 @@ fn fmt_active_upload(up: &ActiveUpload) -> String {
 ///   - Some(b) but total=0 (rare) → `"5.2 MB"`
 ///   - None (no progress reporting yet) → `"100 MB"` (just total)
 fn fmt_progress(up: &ActiveUpload) -> String {
-    let total = ByteSize(up.size_bytes).to_string();
-    match up.bytes_uploaded {
-        Some(b) if up.size_bytes > 0 => {
-            let p = (b as f64 / up.size_bytes as f64 * 100.0) as u64;
+    fmt_progress_pair(up.bytes_uploaded, up.size_bytes)
+}
+
+fn fmt_active_hydration(hy: &ActiveHydration) -> String {
+    // Same row shape as fmt_active_upload, with the hydration's
+    // first-seen / attempt# semantics (preserved across the FUSE
+    // retry-via-recall loop, see HydrationTracker).
+    let first = if hy.first_started_unix == 0 {
+        hy.started_at_unix
+    } else {
+        hy.first_started_unix
+    };
+    let cur_elapsed   = elapsed_secs(hy.started_at_unix);
+    let total_elapsed = elapsed_secs(first);
+    let attempt_str = if hy.attempt <= 1 {
+        String::new()
+    } else {
+        format!("  attempt#{}", hy.attempt)
+    };
+    let total_str = if total_elapsed > cur_elapsed + 1 {
+        format!("  first-seen {}", fmt_duration(total_elapsed as u64))
+    } else {
+        String::new()
+    };
+    format!("{:<40} {:>11}  {:>4}s{}{}",
+        truncate(&hy.path, 40),
+        fmt_progress_pair(hy.bytes_downloaded, hy.size_bytes),
+        cur_elapsed,
+        attempt_str,
+        total_str)
+}
+
+/// Shared progress-column renderer. Same fall-back ladder as
+/// `fmt_progress` — kept generic so uploads and hydrations stay
+/// visually identical.
+fn fmt_progress_pair(bytes: Option<u64>, total_bytes: u64) -> String {
+    let total = ByteSize(total_bytes).to_string();
+    match bytes {
+        Some(b) if total_bytes > 0 => {
+            let p = (b as f64 / total_bytes as f64 * 100.0) as u64;
             format!("{}/{} {}%", ByteSize(b), total, p)
         }
         Some(b) => ByteSize(b).to_string(),

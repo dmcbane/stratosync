@@ -48,6 +48,21 @@ pub trait Backend: Send + Sync + 'static {
     /// The local path must be a full file path (not a directory).
     async fn download(&self, remote: &str, local: &Path) -> Result<(), SyncError>;
 
+    /// Download with periodic progress callbacks. Each call to `progress`
+    /// reports total bytes transferred so far for this attempt. Default
+    /// impl falls back to `download` and never fires the callback —
+    /// backends that can't surface progress (mock, webdav-via-GET)
+    /// inherit this. RcloneBackend overrides to pipe rclone's
+    /// `--stats=1s --stats-one-line` output through the channel.
+    async fn download_with_progress(
+        &self,
+        remote:    &str,
+        local:     &Path,
+        _progress: tokio::sync::mpsc::Sender<u64>,
+    ) -> Result<(), SyncError> {
+        self.download(remote, local).await
+    }
+
     /// Download a byte range of a remote file into memory.
     /// Returns the bytes `[offset .. offset+len]` (or fewer if past EOF).
     /// Default returns `NotSupported` — backends that don't support ranges
@@ -603,6 +618,37 @@ impl Backend for RcloneBackend {
         let offset_str = offset.to_string();
         let count_str = len.to_string();
         self.run(&["cat", &rp, "--offset", &offset_str, "--count", &count_str]).await
+    }
+
+    /// Same as `download` but pipes byte-progress through the channel.
+    /// Adds `--stats=1s --stats-one-line --stats-log-level=NOTICE` so
+    /// rclone emits one transfer-summary line per second at NOTICE level
+    /// (the default log level), matching `upload_with_progress`.
+    async fn download_with_progress(
+        &self,
+        remote:   &str,
+        local:    &Path,
+        progress: tokio::sync::mpsc::Sender<u64>,
+    ) -> Result<(), SyncError> {
+        let local_dir = local.parent()
+            .ok_or_else(|| SyncError::Fatal("download target has no parent dir".into()))?;
+        tokio::fs::create_dir_all(local_dir).await
+            .map_err(SyncError::Io)?;
+
+        let rp = self.rpath(remote);
+        self.run_with_progress(
+            &[
+                "copyto",
+                &rp,
+                local.to_str().ok_or_else(|| SyncError::Fatal("non-UTF8 path".into()))?,
+                "--no-traverse",
+                "--stats=1s",
+                "--stats-one-line",
+                "--stats-log-level=NOTICE",
+            ],
+            progress,
+        ).await?;
+        Ok(())
     }
 
     async fn upload(

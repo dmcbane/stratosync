@@ -169,6 +169,7 @@ mod tests {
             upload_queue,
             poller_state,
             hydration_waiters: Arc::new(DashMap::new()),
+            hydration_tracker: crate::fuse::HydrationTracker::default(),
         };
         (Arc::new(DaemonState::new(vec![handle])), dir)
     }

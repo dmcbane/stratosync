@@ -26,9 +26,51 @@ use tracing::{debug, error, warn};
 use stratosync_core::{
     backend::Backend, base_store::BaseStore,
     config::{FuseConfig, SyncConfig},
+    ipc::ActiveHydration,
     state::{NewFileEntry, StateDb}, types::*, GlobSet,
 };
 use crate::sync::upload_queue::{UploadQueue, UploadTrigger};
+
+/// In-memory bookkeeping for the dashboard's in-flight hydrations panel.
+///
+/// Mirrors the upload queue's approach (`upload_queue::run_loop`):
+/// `in_flight` holds the current `ActiveHydration` row for inodes that
+/// are downloading right now; `first_started` and `attempts` survive
+/// across the natural retry pattern (do_hydrate fails → DB row reverts
+/// to Remote → next FUSE open() re-enters → attempt counter goes up).
+/// All three maps are cleared on terminal exit (success, fatal error,
+/// or stale-path prune); only `in_flight` is cleared on a retryable
+/// failure so the dashboard can show "attempt#3, first-seen 12 minutes
+/// ago" until the file is finally cached.
+///
+/// `Default` is the empty tracker — fine for unit tests that don't care
+/// about progress observability.
+#[derive(Clone, Default)]
+pub struct HydrationTracker {
+    pub in_flight:     Arc<DashMap<Inode, ActiveHydration>>,
+    pub first_started: Arc<DashMap<Inode, i64>>,
+    pub attempts:      Arc<DashMap<Inode, u32>>,
+}
+
+impl HydrationTracker {
+    pub fn new() -> Self { Self::default() }
+
+    /// Snapshot the in-flight rows for the dashboard. Cheap (clones
+    /// `ActiveHydration`s out of the DashMap, no locks held across the
+    /// IPC encode).
+    pub fn snapshot(&self) -> Vec<ActiveHydration> {
+        self.in_flight.iter().map(|r| r.value().clone()).collect()
+    }
+}
+
+/// Unix-epoch seconds, used by the hydration tracker for `started_at_unix`
+/// and `first_started_unix`.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 pub struct OpenFile {
     pub inode:       Inode,
@@ -56,6 +98,7 @@ pub struct StratoFs {
     pub open_files:        Arc<DashMap<u64, OpenFile>>,
     pub next_fh:           Arc<AtomicU64>,
     pub hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    pub hydration_tracker: HydrationTracker,
     pub upload_queue:      Arc<UploadQueue>,
     pub ignore:            Arc<GlobSet>,
     /// Kernel-cache invalidator. Populated once `Session::new` is built —
@@ -179,6 +222,7 @@ pub async fn hydrate_if_needed(
     db: &Arc<StateDb>, backend: &Arc<dyn Backend>, cache_dir: &PathBuf,
     inode: Inode,
     waiters: &Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    tracker: &HydrationTracker,
     base_store: &Arc<BaseStore>, sync_config: &Arc<SyncConfig>,
 ) -> Result<(), SyncError> {
     const MAX_RETRIES: u32 = 3;
@@ -193,7 +237,7 @@ pub async fn hydrate_if_needed(
             SyncStatus::Remote | SyncStatus::Stale => {
                 db.set_status(inode, SyncStatus::Hydrating).await
                     .map_err(|e| SyncError::Fatal(e.to_string()))?;
-                return do_hydrate(db, backend, cache_dir, waiters, &entry, base_store, sync_config).await;
+                return do_hydrate(db, backend, cache_dir, waiters, tracker, &entry, base_store, sync_config).await;
             }
             SyncStatus::Hydrating => {
                 let (tx, rx) = oneshot::channel();
@@ -224,6 +268,7 @@ pub async fn hydrate_if_needed(
 async fn do_hydrate(
     db: &Arc<StateDb>, backend: &Arc<dyn Backend>, cache_dir: &PathBuf,
     waiters: &Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    tracker: &HydrationTracker,
     entry: &FileEntry,
     base_store: &Arc<BaseStore>, sync_config: &Arc<SyncConfig>,
 ) -> Result<(), SyncError> {
@@ -236,8 +281,46 @@ async fn do_hydrate(
     let tmp_path   = cache_dir.join(".meta").join("partial")
                               .join(format!("{}.{:x}.tmp", entry.inode, rand));
 
+    // Register this hydration in the in-flight tracker before kicking
+    // off the download. `first_started` is preserved across retryable
+    // failures (the row may transit Remote → Hydrating → Remote → …
+    // multiple times before finally caching) so the dashboard can show
+    // "first-seen 40m" while the current attempt elapsed shows "37s."
+    let now = now_unix();
+    let first_started = *tracker.first_started.entry(entry.inode).or_insert(now);
+    let attempt = {
+        let mut e = tracker.attempts.entry(entry.inode).or_insert(0);
+        *e += 1;
+        *e
+    };
+    tracker.in_flight.insert(entry.inode, ActiveHydration {
+        inode:           entry.inode,
+        path:            entry.remote_path.clone(),
+        size_bytes:      entry.size,
+        started_at_unix: now,
+        first_started_unix: first_started,
+        attempt,
+        bytes_downloaded: None,
+    });
+
+    // Spawn a forwarder that pumps backend-reported byte progress into
+    // the in-flight DashMap row. The channel is small (rclone fires at
+    // most once per second) and bounded so a slow consumer can never
+    // backpressure the download. When the download ends the sender side
+    // closes; the task exits naturally.
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<u64>(8);
+    let progress_inflight = Arc::clone(&tracker.in_flight);
+    let progress_inode    = entry.inode;
+    let progress_task = tokio::spawn(async move {
+        while let Some(bytes) = progress_rx.recv().await {
+            if let Some(mut row) = progress_inflight.get_mut(&progress_inode) {
+                row.bytes_downloaded = Some(bytes);
+            }
+        }
+    });
+
     let result: Result<(), SyncError> = async {
-        backend.download(&entry.remote_path, &tmp_path).await?;
+        backend.download_with_progress(&entry.remote_path, &tmp_path, progress_tx).await?;
         if let Some(p) = cache_path.parent() {
             tokio::fs::create_dir_all(p).await.map_err(SyncError::Io)?;
         }
@@ -407,6 +490,30 @@ async fn do_hydrate(
             }
         }
     }
+
+    // Drain the in-flight tracker. The progress channel was dropped by
+    // download_with_progress when its scope ended; aborting the
+    // forwarder explicitly is belt-and-suspenders. Always remove the
+    // in-flight row (the download is no longer in progress); only clear
+    // first_started + attempts on terminal exits so the next FUSE
+    // retry can show a rising attempt counter.
+    progress_task.abort();
+    tracker.in_flight.remove(&entry.inode);
+    let terminal = match &result {
+        Ok(()) => true,
+        Err(SyncError::NotFound(_)) => stale_path_pruned,
+        Err(SyncError::Fatal(_))
+        | Err(SyncError::QuotaExceeded)
+        | Err(SyncError::PermissionDenied(_))
+        | Err(SyncError::Conflict { .. }) => true,
+        // Transient / Network / Io / NotSupported — caller retries.
+        _ => false,
+    };
+    if terminal {
+        tracker.first_started.remove(&entry.inode);
+        tracker.attempts.remove(&entry.inode);
+    }
+
     if let Some((_, senders)) = waiters.remove(&entry.inode) {
         // Receiver dropped = waiter timed out or was cancelled; that's fine.
         for tx in senders { let _ = tx.send(result.as_ref().map(|_| ()).map_err(|_| libc::EIO)); }
@@ -513,6 +620,7 @@ fn spawn_prefetch_small_files(
     db: Arc<StateDb>, backend: Arc<dyn Backend>, mid: u32, parent_inode: Inode,
     cache_dir: PathBuf,
     waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    tracker: HydrationTracker,
     base_store: Arc<BaseStore>, sync_config: Arc<SyncConfig>,
 ) {
     let threshold = sync_config.prefetch_threshold_bytes();
@@ -531,6 +639,7 @@ fn spawn_prefetch_small_files(
             let backend = Arc::clone(&backend);
             let cache_dir = cache_dir.clone();
             let waiters = Arc::clone(&waiters);
+            let tracker = tracker.clone();
             let base_store = Arc::clone(&base_store);
             let sync_config = Arc::clone(&sync_config);
             let sem = Arc::clone(&sem);
@@ -539,7 +648,7 @@ fn spawn_prefetch_small_files(
                 let Ok(_permit) = sem.acquire().await else { return };
                 if db.set_status(child.inode, SyncStatus::Hydrating).await.is_err() { return; }
                 let _ = do_hydrate(
-                    &db, &backend, &cache_dir, &waiters,
+                    &db, &backend, &cache_dir, &waiters, &tracker,
                     &child, &base_store, &sync_config,
                 ).await;
             });
@@ -716,6 +825,7 @@ impl Filesystem for StratoFs {
             Arc::clone(&self.base_store), Arc::clone(&self.sync_config), self.cache_dir.clone(),
         );
         let waiters = Arc::clone(&self.hydration_waiters);
+        let tracker = self.hydration_tracker.clone();
         let inflight = Arc::clone(&self.prefetch_inflight);
         let prefetch_sem = Arc::clone(&self.prefetch_sem);
         let focus_dir = Arc::clone(&self.prefetch_focus_dir);
@@ -731,7 +841,7 @@ impl Filesystem for StratoFs {
                 // Prefetch small files in the background
                 spawn_prefetch_small_files(
                     Arc::clone(&db), Arc::clone(&backend), mid, ino,
-                    cache_dir.clone(), waiters, base_store, Arc::clone(&sync_config),
+                    cache_dir.clone(), waiters, tracker, base_store, Arc::clone(&sync_config),
                 );
             }
             // Trigger header prefetch on every readdir. Made safe by:
@@ -796,6 +906,7 @@ impl Filesystem for StratoFs {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let (db, backend, cache_dir) = (Arc::clone(&self.db), Arc::clone(&self.backend), self.cache_dir.clone());
         let (open_files, next_fh, waiters) = (Arc::clone(&self.open_files), Arc::clone(&self.next_fh), Arc::clone(&self.hydration_waiters));
+        let tracker = self.hydration_tracker.clone();
         let (base_store, sync_config) = (Arc::clone(&self.base_store), Arc::clone(&self.sync_config));
         let result = self.rt.block_on(async move {
             let entry = db.get_by_inode(ino).await?.ok_or_else(|| SyncError::NotFound(format!("{ino}")))?;
@@ -823,13 +934,14 @@ impl Filesystem for StratoFs {
                 let (db2, be2, cd2, w2) = (
                     Arc::clone(&db), Arc::clone(&backend), cache_dir.clone(), Arc::clone(&waiters),
                 );
+                let tr2 = tracker.clone();
                 let (bs2, sc2) = (Arc::clone(&base_store), Arc::clone(&sync_config));
                 tokio::spawn(async move {
                     let entry = match db2.get_by_inode(ino).await {
                         Ok(Some(e)) => e,
                         _ => return,
                     };
-                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &entry, &bs2, &sc2).await;
+                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &tr2, &entry, &bs2, &sc2).await;
                 });
             } else if !is_hydrating {
                 // Already cached/dirty — touch LRU
@@ -865,6 +977,7 @@ impl Filesystem for StratoFs {
             Arc::clone(&self.db), Arc::clone(&self.backend),
             self.cache_dir.clone(), Arc::clone(&self.hydration_waiters),
         );
+        let tracker = self.hydration_tracker.clone();
         let (base_store, sync_config) = (Arc::clone(&self.base_store), Arc::clone(&self.sync_config));
         let prefetch_inflight = Arc::clone(&self.prefetch_inflight);
         self.rt.spawn(async move {
@@ -921,13 +1034,14 @@ impl Filesystem for StratoFs {
                                     Arc::clone(&db), Arc::clone(&backend),
                                     cache_dir.clone(), Arc::clone(&waiters),
                                 );
+                                let tr2 = tracker.clone();
                                 let (bs2, sc2) = (Arc::clone(&base_store), Arc::clone(&sync_config));
                                 tokio::spawn(async move {
                                     let entry = match db2.get_by_inode(ino).await {
                                         Ok(Some(e)) => e,
                                         _ => return,
                                     };
-                                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &entry, &bs2, &sc2).await;
+                                    let _ = do_hydrate(&db2, &be2, &cd2, &w2, &tr2, &entry, &bs2, &sc2).await;
                                 });
                             }
                         }
@@ -973,7 +1087,7 @@ impl Filesystem for StratoFs {
                             }
                             Err(SyncError::NotSupported) => {
                                 // Backend doesn't support ranges — fall back to blocking wait
-                                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &base_store, &sync_config).await?;
+                                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &tracker, &base_store, &sync_config).await?;
                                 if let Some(mut entry) = open_files.get_mut(&fh) {
                                     if let Ok(Some(fe)) = db.get_by_inode(entry.inode).await {
                                         if let Some(cp) = fe.cache_path { entry.cache_path = cp; }
@@ -985,7 +1099,7 @@ impl Filesystem for StratoFs {
                             Err(e) => {
                                 // Range download failed — fall back to blocking wait
                                 warn!(ino, "range download failed, waiting for full hydration: {e}");
-                                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &base_store, &sync_config).await?;
+                                hydrate_if_needed(&db, &backend, &cache_dir, ino, &waiters, &tracker, &base_store, &sync_config).await?;
                                 if let Some(mut entry) = open_files.get_mut(&fh) {
                                     if let Ok(Some(fe)) = db.get_by_inode(entry.inode).await {
                                         if let Some(cp) = fe.cache_path { entry.cache_path = cp; }
@@ -1225,6 +1339,7 @@ pub fn mount(
     base_store: Arc<BaseStore>, sync_config: Arc<SyncConfig>,
     cfg: FuseConfig, rt: Handle,
     hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
+    hydration_tracker: HydrationTracker,
     ignore: Arc<GlobSet>,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
@@ -1240,7 +1355,7 @@ pub fn mount(
         sync_config, cache_dir, cfg: cfg.clone(), rt,
         open_files: Arc::new(DashMap::new()),
         next_fh: Arc::new(AtomicU64::new(1)),
-        hydration_waiters, upload_queue, ignore,
+        hydration_waiters, hydration_tracker, upload_queue, ignore,
         notifier: Arc::clone(&notifier_slot),
         prefetch_inflight: Arc::new(DashMap::new()),
         // Header prefetch concurrency. Each rclone-cat call is dominated
@@ -1324,7 +1439,7 @@ mod hydrate_tests {
         let entry = db.get_by_inode(inode).await.unwrap().unwrap();
         let waiters = Arc::new(DashMap::new());
         let cache_dir = dir.path().to_path_buf();
-        do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync)
+        do_hydrate(&db, &backend, &cache_dir, &waiters, &HydrationTracker::default(), &entry, &base, &sync)
             .await.expect("hydrate must succeed for seeded file");
 
         let h = db.get_mount_health(mid).await.unwrap();
@@ -1354,7 +1469,7 @@ mod hydrate_tests {
         let entry = db.get_by_inode(inode).await.unwrap().unwrap();
         let waiters = Arc::new(DashMap::new());
         let cache_dir = dir.path().to_path_buf();
-        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &HydrationTracker::default(), &entry, &base, &sync).await;
         assert!(res.is_err(), "hydrate must fail when backend errors");
 
         let h = db.get_mount_health(mid).await.unwrap();
@@ -1398,7 +1513,7 @@ mod hydrate_tests {
         let entry = db.get_by_inode(inode).await.unwrap().unwrap();
         let waiters = Arc::new(DashMap::new());
         let cache_dir = dir.path().to_path_buf();
-        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &HydrationTracker::default(), &entry, &base, &sync).await;
         assert!(matches!(res, Err(SyncError::NotFound(_))),
             "stale-path hydrate must return NotFound (so FUSE replies ENOENT, not EAGAIN); got {res:?}");
 
@@ -1431,13 +1546,141 @@ mod hydrate_tests {
         let entry = db.get_by_inode(inode).await.unwrap().unwrap();
         let waiters = Arc::new(DashMap::new());
         let cache_dir = dir.path().to_path_buf();
-        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &HydrationTracker::default(), &entry, &base, &sync).await;
         assert!(res.is_err(), "hydrate fails when download fails");
         // Critical: the row survives so the next read can retry. If we
         // pruned it, a transient server-side glitch would wipe the
         // user's cached metadata — much worse than just retrying.
         assert!(db.get_by_inode(inode).await.unwrap().is_some(),
             "row must survive when stat shows the remote still has the path");
+    }
+
+    /// Successful hydration clears every per-inode entry the tracker
+    /// holds — in_flight (always), and first_started + attempts (only on
+    /// terminal exits). Without this, a long-running daemon would
+    /// accumulate stale rows for every file ever hydrated.
+    #[tokio::test]
+    async fn do_hydrate_success_clears_tracker_state() {
+        let (db, backend, mock, base, sync, dir, mid) = setup().await;
+        mock.seed_file("/healthy.txt", b"hello");
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "healthy.txt".into(), remote_path: "/healthy.txt".into(),
+            kind: FileKind::File, size: 5,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let tracker = HydrationTracker::default();
+        let cache_dir = dir.path().to_path_buf();
+        do_hydrate(&db, &backend, &cache_dir, &waiters, &tracker, &entry, &base, &sync)
+            .await.expect("must succeed");
+
+        assert!(!tracker.in_flight.contains_key(&inode),
+            "in_flight must be cleared after success");
+        assert!(!tracker.first_started.contains_key(&inode),
+            "first_started must be cleared on terminal success");
+        assert!(!tracker.attempts.contains_key(&inode),
+            "attempts must be cleared on terminal success");
+    }
+
+    /// A retryable failure leaves the in_flight row removed (the
+    /// download is no longer running) but preserves first_started and
+    /// attempts so the dashboard's "first-seen 40 minutes ago" /
+    /// "attempt #41" badges survive across the FUSE retry pattern.
+    #[tokio::test]
+    async fn do_hydrate_transient_failure_preserves_first_started() {
+        let (db, backend, mock, base, sync, dir, mid) = setup().await;
+        // Force a Transient classification — `mock.fail_on` returns
+        // SyncError::Transient.
+        mock.fail_on("/flaky.bin");
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "flaky.bin".into(), remote_path: "/flaky.bin".into(),
+            kind: FileKind::File, size: 100,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let tracker = HydrationTracker::default();
+        let cache_dir = dir.path().to_path_buf();
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &tracker, &entry, &base, &sync).await;
+        assert!(res.is_err(), "expected transient failure");
+
+        assert!(!tracker.in_flight.contains_key(&inode),
+            "in_flight must always clear on exit");
+        assert!(tracker.first_started.contains_key(&inode),
+            "first_started must SURVIVE a transient failure so retries \
+             can show 'first-seen N minutes ago'");
+        assert_eq!(tracker.attempts.get(&inode).map(|r| *r), Some(1),
+            "attempts must persist as 1 after the first failed call");
+    }
+
+    /// Two consecutive calls into do_hydrate (modeling FUSE's
+    /// retry-via-recall pattern) must produce attempt=2 the second time.
+    #[tokio::test]
+    async fn do_hydrate_increments_attempt_on_each_call() {
+        let (db, backend, mock, base, sync, dir, mid) = setup().await;
+        mock.fail_on("/flaky2.bin");
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "flaky2.bin".into(), remote_path: "/flaky2.bin".into(),
+            kind: FileKind::File, size: 100,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let tracker = HydrationTracker::default();
+        let cache_dir = dir.path().to_path_buf();
+
+        let _ = do_hydrate(&db, &backend, &cache_dir, &waiters, &tracker, &entry, &base, &sync).await;
+        assert_eq!(tracker.attempts.get(&inode).map(|r| *r), Some(1));
+
+        // Reset DB status to Remote (the real flow does this in the err
+        // branch we just exercised; do it explicitly here too in case
+        // the previous call changed it).
+        let _ = db.set_status(inode, SyncStatus::Remote).await;
+
+        let _ = do_hydrate(&db, &backend, &cache_dir, &waiters, &tracker, &entry, &base, &sync).await;
+        assert_eq!(tracker.attempts.get(&inode).map(|r| *r), Some(2),
+            "second failed do_hydrate must bump attempt to 2");
+    }
+
+    /// Stale-path prune (NotFound that stat-verifies as gone) is
+    /// terminal — the row no longer exists, so the tracker entries for
+    /// it should be cleared just like a successful hydration.
+    #[tokio::test]
+    async fn do_hydrate_stale_path_clears_tracker() {
+        let (db, backend, _mock, base, sync, dir, mid) = setup().await;
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: FUSE_ROOT_INODE,
+            name: "ghost.iso".into(),
+            remote_path: "/old/ghost.iso".into(),
+            kind: FileKind::File, size: 1234,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+
+        let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+        let waiters = Arc::new(DashMap::new());
+        let tracker = HydrationTracker::default();
+        let cache_dir = dir.path().to_path_buf();
+        let _ = do_hydrate(&db, &backend, &cache_dir, &waiters, &tracker, &entry, &base, &sync).await;
+
+        assert!(!tracker.first_started.contains_key(&inode),
+            "stale-path prune is terminal — first_started must clear");
+        assert!(!tracker.attempts.contains_key(&inode),
+            "stale-path prune is terminal — attempts must clear");
     }
 
     #[tokio::test]
@@ -1474,7 +1717,7 @@ mod hydrate_tests {
         let entry = db.get_by_inode(inode).await.unwrap().unwrap();
         let waiters = Arc::new(DashMap::new());
         let cache_dir = dir.path().to_path_buf();
-        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &entry, &base, &sync).await;
+        let res = do_hydrate(&db, &backend, &cache_dir, &waiters, &HydrationTracker::default(), &entry, &base, &sync).await;
         assert!(res.is_err(), "hydrate fails when download fails NotFound");
 
         // The row survives (stat said it's there), AND the stat-

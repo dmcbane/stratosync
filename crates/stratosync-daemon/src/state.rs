@@ -16,6 +16,7 @@ use stratosync_core::{
     types::{Inode, SyncStatus},
 };
 
+use crate::fuse::HydrationTracker;
 use crate::sync::UploadQueue;
 
 /// A single mount's live handles. Cheap to clone (all Arcs).
@@ -29,6 +30,7 @@ pub struct MountHandle {
     pub upload_queue:      Arc<UploadQueue>,
     pub poller_state:      Arc<RwLock<PollerStatus>>,
     pub hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), c_int>>>>>,
+    pub hydration_tracker: HydrationTracker,
 }
 
 pub struct DaemonState {
@@ -80,6 +82,7 @@ async fn collect_mount_status(m: &MountHandle) -> MountStatus {
         consecutive_failures: health.consecutive_hydration_failures,
         last_error:           health.last_hydration_error,
         last_failure_unix:    health.last_hydration_failure_unix,
+        in_flight:            m.hydration_tracker.snapshot(),
     };
 
     let conflicts = m.db.count_conflicts(m.mount_id).await.unwrap_or(0);

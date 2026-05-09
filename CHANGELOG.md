@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.6] - 2026-05-09
+
+### Added
+- **Dashboard in-flight panel now also shows hydrations.** Direct
+  twin of the upload panel introduced in beta.5: each row shows path,
+  bytes-downloaded/total, current-attempt elapsed, and (when > 1)
+  attempt count plus first-seen elapsed. Triggered by the user
+  reporting "I copied 20 files from a OneDrive mount, 14 succeeded,
+  and now it appears frozen" — the dashboard had no per-file
+  visibility on the download side, so a single stalled `cp` was
+  indistinguishable from a wedged daemon. The TUI in-flight section
+  now always renders both `uploads:` and `hydrations:` headings (with
+  `(none)` when empty) so the user can confirm "yes, this download
+  is in flight" or "no, nothing is moving — investigate elsewhere."
+- `Backend::download_with_progress` mirroring `upload_with_progress`
+  (default-implemented to fall back to plain `download`).
+  `RcloneBackend` overrides with the same `--stats=1s
+  --stats-one-line --stats-log-level=NOTICE` pipeline used by uploads.
+- `HydrationStatus.in_flight: Vec<ActiveHydration>` on the IPC
+  payload. Defaults to empty for legacy daemons during partial-
+  upgrade rollouts.
+- `ActiveHydration` IPC type with the same retry-aware fields as
+  `ActiveUpload` (`first_started_unix`, `attempt`,
+  `bytes_downloaded`).
+- `fuse::HydrationTracker` — three `Arc<DashMap>`s shared between
+  `do_hydrate` and the dashboard snapshot path. `in_flight` clears
+  on every exit (success or failure); `first_started` and `attempts`
+  survive retryable failures so the dashboard's "first-seen 40
+  minutes ago" / "attempt #41" badges persist across the natural
+  FUSE retry-via-recall pattern. Cleared on terminal exits (success,
+  fatal, stale-path prune).
+
 ## [0.13.0-beta.5] - 2026-05-07
 
 ### Changed

@@ -118,6 +118,47 @@ pub struct HydrationStatus {
     /// Unix-epoch seconds of the last failure, also kept across recoveries.
     #[serde(default)]
     pub last_failure_unix:    Option<i64>,
+    /// Per-file detail for currently-hydrating inodes. Mirrors
+    /// `QueueStatus.in_flight` for uploads — gives the dashboard enough
+    /// information to distinguish a healthy download from a stalled one
+    /// without the user having to read journal logs. Defaults to empty
+    /// for old daemons that don't populate it.
+    #[serde(default)]
+    pub in_flight:            Vec<ActiveHydration>,
+}
+
+/// One row in the in-flight hydrations panel. Direct analogue of
+/// `ActiveUpload`, with the same retry-aware fields so a stalled
+/// download (long elapsed, low bytes_downloaded, attempt > 1) is
+/// visually obvious.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveHydration {
+    pub inode:           u64,
+    pub path:            String,
+    /// Total file size — what we're trying to download.
+    pub size_bytes:      u64,
+    /// Unix-epoch seconds when the *current* download attempt began.
+    /// Resets each retry. The dashboard's "elapsed" column is `now -
+    /// started_at_unix`.
+    pub started_at_unix: i64,
+    /// Unix-epoch seconds when this inode *first* entered hydration —
+    /// preserved across the retry loop in `hydrate_if_needed`. Lets the
+    /// dashboard distinguish "fresh download, started 12s ago" from
+    /// "retry loop, first attempt was 40 minutes ago." Defaults to
+    /// `started_at_unix` for old daemons that don't populate it.
+    #[serde(default)]
+    pub first_started_unix: i64,
+    /// 1 on the initial attempt, 2 on the first retry, etc. Reset to 1
+    /// when the inode leaves hydration successfully (or fatally) and
+    /// re-enters later. Defaults to 1 for old daemons.
+    #[serde(default = "default_attempt")]
+    pub attempt:           u32,
+    /// Bytes the backend reports as transferred so far for the current
+    /// attempt, parsed from `rclone --stats=1s` output. `None` when the
+    /// backend doesn't surface progress (mock, webdav). Resets to
+    /// `None`/0 each retry.
+    #[serde(default)]
+    pub bytes_downloaded:  Option<u64>,
 }
 
 /// Wire envelope. The daemon always responds with one of these.
@@ -185,8 +226,17 @@ mod tests {
                     last_error: None,
                 },
                 hydration: HydrationStatus {
-                    active:  1,
-                    waiters: 2,
+                    active:   1,
+                    waiters:  2,
+                    in_flight: vec![ActiveHydration {
+                        inode: 999,
+                        path: "videos/film.mp4".into(),
+                        size_bytes: 600_000_000,
+                        started_at_unix: 1_700_000_010,
+                        first_started_unix: 1_699_999_900,
+                        attempt: 2,
+                        bytes_downloaded: Some(150_000_000),
+                    }],
                     ..Default::default()
                 },
                 conflicts: 3,
@@ -226,6 +276,44 @@ mod tests {
     /// upgrade (new CLI, old daemon still running) the dashboard must
     /// keep working — even if it has to render `attempt=1` and "no
     /// progress info" placeholders.
+    /// HydrationStatus on an older daemon doesn't include the `in_flight`
+    /// field; deserializing must default it to an empty Vec rather than
+    /// failing the whole snapshot.
+    #[test]
+    fn hydration_status_deserializes_legacy_payload() {
+        let legacy = r#"{
+            "active": 1,
+            "waiters": 0
+        }"#;
+        let h: HydrationStatus = serde_json::from_str(legacy).unwrap();
+        assert_eq!(h.active, 1);
+        assert!(h.in_flight.is_empty(), "missing in_flight defaults to []");
+    }
+
+    /// ActiveHydration mirrors ActiveUpload's legacy-tolerance — a
+    /// payload with only the original fields (none invented yet — this
+    /// is the first version of the struct) must parse cleanly. Mostly a
+    /// guard against future field additions silently breaking partial-
+    /// upgrade clients.
+    #[test]
+    fn active_hydration_deserializes_minimal_payload() {
+        // All fields except #[serde(default)] ones present. Older daemon
+        // shape, looking forward.
+        let minimal = r#"{
+            "inode": 42,
+            "path": "old.txt",
+            "size_bytes": 1000,
+            "started_at_unix": 1700000000
+        }"#;
+        let h: ActiveHydration = serde_json::from_str(minimal).unwrap();
+        assert_eq!(h.inode, 42);
+        assert_eq!(h.attempt, 1, "missing attempt defaults to 1");
+        assert_eq!(h.first_started_unix, 0,
+            "missing first_started_unix defaults to 0; consumer falls \
+             back to started_at_unix when it sees 0");
+        assert_eq!(h.bytes_downloaded, None);
+    }
+
     #[test]
     fn active_upload_deserializes_legacy_payload() {
         let legacy = r#"{
