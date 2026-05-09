@@ -497,17 +497,22 @@ async fn do_hydrate(
     // in-flight row (the download is no longer in progress); only clear
     // first_started + attempts on terminal exits so the next FUSE
     // retry can show a rising attempt counter.
+    //
+    // Defer the retryable/terminal decision to `SyncError::is_retryable`
+    // so the upload queue and the hydration tracker stay in lockstep
+    // if the predicate ever changes. The one carve-out is `NotFound`:
+    // is_retryable() returns false for it (sensibly — most "not found"
+    // errors won't recover on retry), but our stale-path self-heal
+    // already distinguishes "row pruned" from "stat said it's still
+    // there" via `stale_path_pruned`. When the row was *not* pruned
+    // we keep first_started/attempts so the next retry shows a rising
+    // attempt count, matching the spirit of the rule.
     progress_task.abort();
     tracker.in_flight.remove(&entry.inode);
     let terminal = match &result {
-        Ok(()) => true,
+        Ok(())                      => true,
         Err(SyncError::NotFound(_)) => stale_path_pruned,
-        Err(SyncError::Fatal(_))
-        | Err(SyncError::QuotaExceeded)
-        | Err(SyncError::PermissionDenied(_))
-        | Err(SyncError::Conflict { .. }) => true,
-        // Transient / Network / Io / NotSupported — caller retries.
-        _ => false,
+        Err(e)                      => !e.is_retryable(),
     };
     if terminal {
         tracker.first_started.remove(&entry.inode);

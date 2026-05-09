@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.10] - 2026-05-09
+
+### Changed
+- **Hydration tracker reuses `SyncError::is_retryable()` for the
+  terminal-vs-retryable decision** instead of a hand-rolled match.
+  Keeps the upload queue and the hydration tracker in lockstep if the
+  retryability predicate ever changes. Behavior is the same for the
+  cases the existing tests cover (success, Transient, stale-path
+  prune); slight shift for three error variants which are now treated
+  as terminal (was: preserved across retries):
+  - `Io`: local disk/FS errors aren't going to recover by retrying
+    the cloud, so clearing the tracker is the right default.
+  - `NotSupported`: a programming bug; terminal is correct.
+  - `QuotaExceeded`: now preserved across retries (`is_retryable`
+    returns true). The dashboard's attempt counter will rise on
+    repeated quota errors instead of resetting each time, which is
+    more informative.
+  The `NotFound` case retains its carve-out (terminal iff the row
+  was pruned by the stale-path self-heal).
+
 ## [0.13.0-beta.9] - 2026-05-09
 
 ### Added
