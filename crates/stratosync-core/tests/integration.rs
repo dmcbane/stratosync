@@ -284,6 +284,8 @@ fn config_mount_cache_quota_and_poll() {
         eviction: EvictionConfig::default(),
         ignore_patterns: Vec::new(),
         upload_window:   None,
+        transfer_window: None,
+        transfer_window_direction: stratosync_core::TransferDirection::Both,
         version_retention: 0,
     };
     assert_eq!(m.cache_quota_bytes().unwrap(), 10u64 * (1 << 30));
@@ -599,6 +601,8 @@ fn mount_with_patterns(patterns: &[&str]) -> MountConfig {
         eviction: EvictionConfig::default(),
         ignore_patterns: patterns.iter().map(|s| s.to_string()).collect(),
         upload_window:   None,
+        transfer_window: None,
+        transfer_window_direction: stratosync_core::TransferDirection::Both,
         version_retention: 0,
     }
 }

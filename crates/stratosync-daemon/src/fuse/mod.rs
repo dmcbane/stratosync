@@ -25,7 +25,7 @@ use tracing::{debug, error, warn};
 
 use stratosync_core::{
     backend::Backend, base_store::BaseStore,
-    config::{FuseConfig, SyncConfig},
+    config::{FuseConfig, SyncConfig, TransferWindow},
     ipc::ActiveHydration,
     state::{NewFileEntry, StateDb}, types::*, GlobSet,
 };
@@ -99,6 +99,12 @@ pub struct StratoFs {
     pub next_fh:           Arc<AtomicU64>,
     pub hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
     pub hydration_tracker: HydrationTracker,
+    /// Bandwidth schedule gating background prefetch (see
+    /// `transfer_window` config). User-initiated `open()` always
+    /// proceeds — the gate only suppresses the speculative prefetch
+    /// work, mirroring how `fsync` always bypasses the upload-side
+    /// window. `None` means no gating.
+    pub download_window:   Option<TransferWindow>,
     pub upload_queue:      Arc<UploadQueue>,
     pub ignore:            Arc<GlobSet>,
     /// Kernel-cache invalidator. Populated once `Session::new` is built —
@@ -627,9 +633,20 @@ fn spawn_prefetch_small_files(
     waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
     tracker: HydrationTracker,
     base_store: Arc<BaseStore>, sync_config: Arc<SyncConfig>,
+    download_window: Option<TransferWindow>,
 ) {
     let threshold = sync_config.prefetch_threshold_bytes();
     if threshold == 0 { return; }
+    // Bandwidth window: prefetch is speculative — if the user has
+    // configured a download window and we're outside it, skip the
+    // background work entirely. User-initiated `open()` is unaffected
+    // (it routes through `hydrate_if_needed`, not this function).
+    if let Some(w) = download_window {
+        if !w.is_open_now() {
+            debug!("prefetch (small files) skipped: download window closed");
+            return;
+        }
+    }
 
     tokio::spawn(async move {
         let children = db.list_children(mid, parent_inode).await.unwrap_or_default();
@@ -678,10 +695,17 @@ fn spawn_prefetch_headers(
     inflight: Arc<DashMap<Inode, ()>>,
     sem: Arc<tokio::sync::Semaphore>,
     focus_dir: Arc<std::sync::atomic::AtomicU64>,
+    download_window: Option<TransferWindow>,
 ) {
     let header_size = sync_config.header_prefetch_size_bytes();
     let full_threshold = sync_config.prefetch_threshold_bytes();
     if header_size == 0 { return; }
+    if let Some(w) = download_window {
+        if !w.is_open_now() {
+            debug!("prefetch (headers) skipped: download window closed");
+            return;
+        }
+    }
 
     tokio::spawn(async move {
         let children = db.list_children(mid, parent_inode).await.unwrap_or_default();
@@ -834,6 +858,7 @@ impl Filesystem for StratoFs {
         let inflight = Arc::clone(&self.prefetch_inflight);
         let prefetch_sem = Arc::clone(&self.prefetch_sem);
         let focus_dir = Arc::clone(&self.prefetch_focus_dir);
+        let download_window = self.download_window;
         // The current readdir target becomes "the dir the user cares
         // about right now". Older queued prefetches (for sidebar / tree
         // dirs the user moved past) will see the new value and bail
@@ -847,6 +872,7 @@ impl Filesystem for StratoFs {
                 spawn_prefetch_small_files(
                     Arc::clone(&db), Arc::clone(&backend), mid, ino,
                     cache_dir.clone(), waiters, tracker, base_store, Arc::clone(&sync_config),
+                    download_window,
                 );
             }
             // Trigger header prefetch on every readdir. Made safe by:
@@ -858,6 +884,7 @@ impl Filesystem for StratoFs {
             spawn_prefetch_headers(
                 Arc::clone(&db), Arc::clone(&backend), mid, ino,
                 cache_dir, sync_config, inflight, prefetch_sem, focus_dir,
+                download_window,
             );
             db.list_children(mid, ino).await
         });
@@ -1345,6 +1372,7 @@ pub fn mount(
     cfg: FuseConfig, rt: Handle,
     hydration_waiters: Arc<DashMap<Inode, Vec<oneshot::Sender<Result<(), libc::c_int>>>>>,
     hydration_tracker: HydrationTracker,
+    download_window: Option<TransferWindow>,
     ignore: Arc<GlobSet>,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
@@ -1360,7 +1388,7 @@ pub fn mount(
         sync_config, cache_dir, cfg: cfg.clone(), rt,
         open_files: Arc::new(DashMap::new()),
         next_fh: Arc::new(AtomicU64::new(1)),
-        hydration_waiters, hydration_tracker, upload_queue, ignore,
+        hydration_waiters, hydration_tracker, download_window, upload_queue, ignore,
         notifier: Arc::clone(&notifier_slot),
         prefetch_inflight: Arc::new(DashMap::new()),
         // Header prefetch concurrency. Each rclone-cat call is dominated

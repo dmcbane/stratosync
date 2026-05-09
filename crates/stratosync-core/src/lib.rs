@@ -14,4 +14,4 @@ pub use backend::{Backend, RcloneBackend, RemoteAbout};
 pub use backend::webdav::WebDavBackend;
 
 pub use globset::{Glob, GlobSet, GlobSetBuilder};
-pub use config::UploadWindow;
+pub use config::{TransferDirection, TransferWindow};

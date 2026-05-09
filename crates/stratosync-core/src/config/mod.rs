@@ -257,13 +257,28 @@ pub struct MountConfig {
     /// children are skipped).
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
-    /// Bandwidth schedule: `"HH:MM-HH:MM"` local-time window during which
-    /// uploads are permitted. Outside the window, queued uploads wait
-    /// until the window reopens; in-flight uploads are not interrupted.
-    /// `fsync()` always bypasses the gate (user-explicit). Empty/None means
-    /// uploads run any time. Wraparound is supported: `"22:00-06:00"`.
+    /// Legacy: `"HH:MM-HH:MM"` window gating *uploads only*. Equivalent
+    /// to setting `transfer_window` with
+    /// `transfer_window_direction = "upload"`. Cannot be set together
+    /// with `transfer_window` — config-load fails with a clear message
+    /// if both are present. Kept around so existing configs keep
+    /// working without forced edits.
     #[serde(default)]
     pub upload_window: Option<String>,
+    /// Bandwidth schedule: `"HH:MM-HH:MM"` local-time window during
+    /// which the configured side(s) of transfers are permitted to run.
+    /// Outside the window, queued uploads wait until it reopens and
+    /// background prefetches skip; in-flight transfers are not
+    /// interrupted. `fsync()` and user-initiated `open()` always
+    /// bypass (user-explicit). Wraparound is supported: `"22:00-06:00"`.
+    #[serde(default)]
+    pub transfer_window: Option<String>,
+    /// Which side(s) the `transfer_window` applies to. Defaults to
+    /// `both` so a bare `transfer_window = "22:00-06:00"` does what
+    /// most users mean ("only sync at night"). Ignored when
+    /// `transfer_window` is unset.
+    #[serde(default)]
+    pub transfer_window_direction: TransferDirection,
     /// File-version retention: keep up to this many historical snapshots
     /// per file. Snapshots are captured (a) just before the poller
     /// replaces a cached file with a remote change, and (b) just after a
@@ -297,11 +312,24 @@ impl MountConfig {
         b.build().map_err(|e| anyhow::anyhow!("failed to build ignore set: {}", e))
     }
 
-    /// Parse `upload_window` if set. Returns `Ok(None)` when unset.
-    pub fn parse_upload_window(&self) -> anyhow::Result<Option<UploadWindow>> {
-        match self.upload_window.as_deref() {
-            None | Some("") => Ok(None),
-            Some(s)         => parse_upload_window(s).map(Some),
+    /// Resolve the effective bandwidth window into `(window, direction)`.
+    /// Handles both the legacy `upload_window` field (always direction =
+    /// Upload) and the new `transfer_window` + `transfer_window_direction`
+    /// pair. Returns `Ok(None)` when neither is set, and errors when
+    /// both are set (the user must pick one form).
+    pub fn parse_window(&self) -> anyhow::Result<Option<(TransferWindow, TransferDirection)>> {
+        let legacy = self.upload_window.as_deref().filter(|s| !s.is_empty());
+        let modern = self.transfer_window.as_deref().filter(|s| !s.is_empty());
+        match (legacy, modern) {
+            (None, None)        => Ok(None),
+            (Some(s), None)     => Ok(Some((parse_transfer_window(s)?, TransferDirection::Upload))),
+            (None, Some(s))     => Ok(Some((parse_transfer_window(s)?, self.transfer_window_direction))),
+            (Some(_), Some(_))  => anyhow::bail!(
+                "mount {:?}: cannot set both `upload_window` and \
+                 `transfer_window` — `upload_window` is the legacy form, \
+                 equivalent to `transfer_window` with \
+                 `transfer_window_direction = \"upload\"`. Use one or \
+                 the other.", self.name),
         }
     }
 }
@@ -361,19 +389,24 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(s.parse()?))
 }
 
-// ── Upload window ─────────────────────────────────────────────────────────────
+// ── Transfer window ──────────────────────────────────────────────────────────
 
-/// Bandwidth schedule: a daily local-time interval during which uploads
-/// are permitted. Stored as minutes-since-midnight; if `start_min ==
-/// end_min`, the window is "always open" (degenerate, but tolerated).
-/// If `start_min > end_min` the window crosses midnight (e.g. 22:00–06:00).
+/// Bandwidth schedule: a daily local-time interval during which the
+/// configured transfer side(s) are permitted to run. Stored as
+/// minutes-since-midnight; if `start_min == end_min`, the window is
+/// "always open" (degenerate, but tolerated). If `start_min > end_min`
+/// the window crosses midnight (e.g. 22:00–06:00).
+///
+/// Originally named `UploadWindow` when only uploads were gated. Renamed
+/// once `transfer_window_direction` extended the gate to downloads —
+/// the type itself is just a daily interval and isn't direction-aware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UploadWindow {
+pub struct TransferWindow {
     pub start_min: u32, // 0..1440
     pub end_min:   u32, // 0..1440
 }
 
-impl UploadWindow {
+impl TransferWindow {
     /// True if the given minute-of-day falls within the window.
     /// The window is half-open: `[start, end)` for non-wrapping, or
     /// `[start, 1440) ∪ [0, end)` when wrapping past midnight.
@@ -404,19 +437,53 @@ impl UploadWindow {
         if diff <= 0 { diff += day; }
         diff as u64
     }
+
+    /// Convenience for callers that don't already have a clock value
+    /// in hand. Used by the FUSE-side prefetch gate where every
+    /// background prefetch would otherwise have to plumb a clock down
+    /// from main.rs just to check the window.
+    pub fn is_open_now(&self) -> bool {
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        self.contains_minute(now.hour() * 60 + now.minute())
+    }
+}
+
+/// Which side(s) of a transfer the `transfer_window` should gate.
+/// Default is `Both` so a bare `transfer_window = "22:00-06:00"`
+/// behaves like the most useful interpretation ("only run transfers
+/// at night").
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferDirection {
+    /// Gate only the upload side. The legacy `upload_window` field is
+    /// equivalent to setting `transfer_window` with this direction.
+    Upload,
+    /// Gate only the download side (specifically: background prefetch.
+    /// User-initiated `open()` always proceeds, the same way `fsync`
+    /// always bypasses the upload gate).
+    Download,
+    /// Gate both sides.
+    #[default]
+    Both,
+}
+
+impl TransferDirection {
+    pub fn includes_upload(self)   -> bool { matches!(self, Self::Upload   | Self::Both) }
+    pub fn includes_download(self) -> bool { matches!(self, Self::Download | Self::Both) }
 }
 
 /// Parse an `"HH:MM-HH:MM"` time-of-day window. Times are local-time;
 /// if the start is later than the end the window crosses midnight.
-pub fn parse_upload_window(s: &str) -> anyhow::Result<UploadWindow> {
+pub fn parse_transfer_window(s: &str) -> anyhow::Result<TransferWindow> {
     let s = s.trim();
     let (start, end) = s.split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("upload window must be HH:MM-HH:MM, got {s:?}"))?;
+        .ok_or_else(|| anyhow::anyhow!("transfer window must be HH:MM-HH:MM, got {s:?}"))?;
     let start_min = parse_hhmm(start.trim())
-        .map_err(|e| anyhow::anyhow!("upload window start: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("transfer window start: {e}"))?;
     let end_min   = parse_hhmm(end.trim())
-        .map_err(|e| anyhow::anyhow!("upload window end: {e}"))?;
-    Ok(UploadWindow { start_min, end_min })
+        .map_err(|e| anyhow::anyhow!("transfer window end: {e}"))?;
+    Ok(TransferWindow { start_min, end_min })
 }
 
 fn parse_hhmm(s: &str) -> anyhow::Result<u32> {
@@ -452,23 +519,23 @@ mod tests {
 
     #[test]
     fn upload_window_basic_parse() {
-        let w = parse_upload_window("22:00-06:00").unwrap();
+        let w = parse_transfer_window("22:00-06:00").unwrap();
         assert_eq!(w.start_min, 22 * 60);
         assert_eq!(w.end_min,    6 * 60);
     }
 
     #[test]
     fn upload_window_invalid_inputs() {
-        assert!(parse_upload_window("").is_err());
-        assert!(parse_upload_window("22:00").is_err());
-        assert!(parse_upload_window("25:00-06:00").is_err());
-        assert!(parse_upload_window("22:60-06:00").is_err());
-        assert!(parse_upload_window("foo-bar").is_err());
+        assert!(parse_transfer_window("").is_err());
+        assert!(parse_transfer_window("22:00").is_err());
+        assert!(parse_transfer_window("25:00-06:00").is_err());
+        assert!(parse_transfer_window("22:60-06:00").is_err());
+        assert!(parse_transfer_window("foo-bar").is_err());
     }
 
     #[test]
     fn upload_window_non_wrapping_contains() {
-        let w = parse_upload_window("09:00-17:00").unwrap();
+        let w = parse_transfer_window("09:00-17:00").unwrap();
         assert!(!w.contains_minute(8 * 60 + 59));
         assert!( w.contains_minute(9 * 60));
         assert!( w.contains_minute(13 * 60));
@@ -478,7 +545,7 @@ mod tests {
 
     #[test]
     fn upload_window_wrapping_contains() {
-        let w = parse_upload_window("22:00-06:00").unwrap();
+        let w = parse_transfer_window("22:00-06:00").unwrap();
         assert!(!w.contains_minute(8 * 60));
         assert!(!w.contains_minute(20 * 60));
         assert!(!w.contains_minute(21 * 60 + 59));
@@ -491,7 +558,7 @@ mod tests {
 
     #[test]
     fn upload_window_seconds_until_open() {
-        let w = parse_upload_window("22:00-06:00").unwrap();
+        let w = parse_transfer_window("22:00-06:00").unwrap();
         // Currently 21:00 → 1 hour until 22:00
         assert_eq!(w.seconds_until_open(21 * 60, 0), 3600);
         // Currently 23:00 → window is open, 0 seconds
@@ -504,10 +571,123 @@ mod tests {
 
     #[test]
     fn upload_window_degenerate_equal_start_end_means_always_open() {
-        let w = parse_upload_window("12:00-12:00").unwrap();
+        let w = parse_transfer_window("12:00-12:00").unwrap();
         assert!(w.contains_minute(0));
         assert!(w.contains_minute(12 * 60));
         assert!(w.contains_minute(23 * 60 + 59));
         assert_eq!(w.seconds_until_open(8 * 60, 0), 0);
+    }
+
+    // ── transfer_window + transfer_window_direction ────────────────────────
+
+    /// Build a baseline MountConfig directly in code (core deliberately
+    /// doesn't depend on toml — see CLAUDE.md). Each test mutates the
+    /// window fields it cares about.
+    fn baseline_mount() -> MountConfig {
+        MountConfig {
+            name:             "test".into(),
+            remote:           "test:/".into(),
+            mount_path:       "/tmp/stratosync-test".into(),
+            cache_quota:      default_cache_quota_str(),
+            poll_interval:    default_poll_interval(),
+            enabled:          true,
+            rclone:           RcloneConfig::default(),
+            eviction:         EvictionConfig::default(),
+            ignore_patterns:  Vec::new(),
+            upload_window:    None,
+            transfer_window:  None,
+            transfer_window_direction: TransferDirection::default(),
+            version_retention: 0,
+        }
+    }
+
+    #[test]
+    fn transfer_direction_default_is_both() {
+        let mut m = baseline_mount();
+        m.transfer_window = Some("22:00-06:00".into());
+        let (_w, dir) = m.parse_window().unwrap().expect("window present");
+        assert_eq!(dir, TransferDirection::Both,
+            "bare transfer_window without a direction must default to Both");
+        assert!(dir.includes_upload() && dir.includes_download());
+    }
+
+    #[test]
+    fn transfer_direction_explicit_download_gates_only_downloads() {
+        let mut m = baseline_mount();
+        m.transfer_window           = Some("22:00-06:00".into());
+        m.transfer_window_direction = TransferDirection::Download;
+        let (_w, dir) = m.parse_window().unwrap().expect("window present");
+        assert_eq!(dir, TransferDirection::Download);
+        assert!(!dir.includes_upload());
+        assert!(dir.includes_download());
+    }
+
+    #[test]
+    fn transfer_direction_explicit_upload_gates_only_uploads() {
+        let mut m = baseline_mount();
+        m.transfer_window           = Some("22:00-06:00".into());
+        m.transfer_window_direction = TransferDirection::Upload;
+        let (_w, dir) = m.parse_window().unwrap().expect("window present");
+        assert_eq!(dir, TransferDirection::Upload);
+        assert!(dir.includes_upload());
+        assert!(!dir.includes_download());
+    }
+
+    /// Legacy `upload_window` keeps working — equivalent to a
+    /// transfer_window with direction=Upload. Existing configs must
+    /// not break when this version rolls out.
+    #[test]
+    fn legacy_upload_window_is_upload_only() {
+        let mut m = baseline_mount();
+        m.upload_window = Some("22:00-06:00".into());
+        let (_w, dir) = m.parse_window().unwrap().expect("window present");
+        assert_eq!(dir, TransferDirection::Upload,
+            "upload_window must map to Upload direction for back-compat");
+    }
+
+    /// Setting both is a configuration error rather than a silent
+    /// pick-one-and-pray. The error message must name both fields and
+    /// the relationship between them so the user knows what to delete.
+    #[test]
+    fn both_upload_window_and_transfer_window_set_is_an_error() {
+        let mut m = baseline_mount();
+        m.upload_window   = Some("22:00-06:00".into());
+        m.transfer_window = Some("08:00-17:00".into());
+        let err = m.parse_window().expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("upload_window"), "msg names upload_window: {msg}");
+        assert!(msg.contains("transfer_window"), "msg names transfer_window: {msg}");
+    }
+
+    /// Empty string for the window is treated as "not set", same as
+    /// the historical behavior. Catches a config-edit footgun where
+    /// the user clears the value but leaves the key.
+    #[test]
+    fn empty_window_strings_count_as_unset() {
+        let mut m1 = baseline_mount();
+        m1.upload_window = Some("".into());
+        assert!(m1.parse_window().unwrap().is_none());
+
+        let mut m2 = baseline_mount();
+        m2.transfer_window = Some("".into());
+        assert!(m2.parse_window().unwrap().is_none());
+    }
+
+    /// `transfer_window_direction` without `transfer_window` should be
+    /// silently ignored (it's a hint with no window to apply to). This
+    /// matches the spirit of the config — directions are decorations
+    /// on a window that has to exist.
+    #[test]
+    fn direction_alone_is_a_no_op() {
+        let mut m = baseline_mount();
+        m.transfer_window_direction = TransferDirection::Download;
+        assert!(m.parse_window().unwrap().is_none(),
+            "direction without a window should not synthesize one");
+    }
+
+    #[test]
+    fn neither_field_means_no_window() {
+        let m = baseline_mount();
+        assert!(m.parse_window().unwrap().is_none());
     }
 }

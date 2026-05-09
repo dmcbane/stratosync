@@ -21,7 +21,7 @@ use chrono::{Local, Timelike};
 use stratosync_core::{
     backend::Backend,
     base_store::BaseStore,
-    config::{SyncConfig, UploadWindow},
+    config::{SyncConfig, TransferWindow},
     ipc::{ActiveUpload, QueueStatus},
     state::{StateDb, SyncQueueJob, VersionSource},
     types::{Inode, SyncError, SyncStatus},
@@ -55,7 +55,7 @@ impl UploadQueue {
         debounce:        Duration,
         close_debounce:  Duration,
         max_concurrent:  usize,
-        upload_window:   Option<UploadWindow>,
+        upload_window:   Option<TransferWindow>,
         version_retention: u32,
     ) -> Self {
         let (tx, rx) = mpsc::channel(512);
@@ -117,7 +117,7 @@ struct PendingUpload {
 /// to whichever is later: their `due_at`, or when the window opens.
 fn effective_due_at(
     p:              &PendingUpload,
-    window:         Option<UploadWindow>,
+    window:         Option<TransferWindow>,
     now_tokio:      tokio::time::Instant,
     secs_until_open: u64,
 ) -> tokio::time::Instant {
@@ -130,7 +130,7 @@ fn effective_due_at(
 
 /// Seconds until the upload window opens, or 0 if it's open right now
 /// (or no window is configured).
-fn secs_until_window_opens(window: Option<UploadWindow>) -> u64 {
+fn secs_until_window_opens(window: Option<TransferWindow>) -> u64 {
     let Some(w) = window else { return 0 };
     let now = Local::now();
     let now_min = now.hour() * 60 + now.minute();
@@ -149,7 +149,7 @@ async fn upload_loop(
     debounce:       Duration,
     close_debounce: Duration,
     max_concurrent: usize,
-    upload_window:  Option<UploadWindow>,
+    upload_window:  Option<TransferWindow>,
     version_retention: u32,
 ) {
     // Debounce tracking: inode → when the upload should fire.
@@ -612,8 +612,8 @@ mod tests {
     //! unit level and rely on the type system for the wiring.
     use super::*;
 
-    fn window(start: u32, end: u32) -> UploadWindow {
-        UploadWindow { start_min: start, end_min: end }
+    fn window(start: u32, end: u32) -> TransferWindow {
+        TransferWindow { start_min: start, end_min: end }
     }
 
     fn pending(due_in: Duration, immediate: bool) -> PendingUpload {

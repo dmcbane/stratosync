@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.11] - 2026-05-09
+
+### Added
+- **`transfer_window` config field** — bandwidth scheduling for the
+  download side, the third item from the upload/download symmetry
+  audit. Previously only uploads could be gated by a daily window;
+  background prefetch ran any time, which was unhelpful for users on
+  metered connections who wanted "no big downloads during work hours."
+
+  ```toml
+  [[mount]]
+  transfer_window = "22:00-06:00"             # both sides by default
+  transfer_window_direction = "download"      # or "upload" / "both"
+  ```
+
+  - `TransferDirection` enum with `lowercase` serde names. Default is
+    `both`, so a bare `transfer_window` without a direction does what
+    most users mean ("only sync at night").
+  - Gating semantics on the download side mirror the upload side:
+    speculative work (`spawn_prefetch_small_files`,
+    `spawn_prefetch_headers`) skips when the window is closed, while
+    user-initiated `open()` always proceeds — same shape as how
+    `fsync` always bypasses the upload window.
+  - Legacy `upload_window` continues to work; equivalent to
+    `transfer_window` with `direction = "upload"`. Setting both
+    fields together is a configuration error with a message that
+    names both and explains the relationship.
+  - 8 new tests in `core::config` covering: default-is-both,
+    explicit-download, explicit-upload, legacy-upload-window
+    back-compat, mutual-exclusion error, empty-string-as-unset,
+    direction-without-window-is-a-no-op, and the all-empty case.
+
+### Changed
+- `UploadWindow` renamed to `TransferWindow` — the type was always
+  just a daily HH:MM-HH:MM interval and was never upload-specific.
+  No external impact (only used inside the workspace);
+  `parse_upload_window` → `parse_transfer_window`. The lib re-export
+  switched from `pub use config::UploadWindow` to
+  `pub use config::{TransferDirection, TransferWindow}`.
+
 ## [0.13.0-beta.10] - 2026-05-09
 
 ### Changed

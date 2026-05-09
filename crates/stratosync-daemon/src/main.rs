@@ -168,18 +168,27 @@ async fn main() -> Result<()> {
             );
         }
 
-        // Bandwidth schedule: parse the optional upload_window once at
-        // startup. Bad windows abort startup with a clear error.
-        let upload_window = mount_cfg.parse_upload_window()
-            .with_context(|| format!("upload_window for mount {:?}", mount_cfg.name))?;
-        if let Some(w) = upload_window {
-            info!(
-                mount = %mount_cfg.name,
-                start = format!("{:02}:{:02}", w.start_min / 60, w.start_min % 60),
-                end   = format!("{:02}:{:02}", w.end_min   / 60, w.end_min   % 60),
-                "bandwidth schedule active"
-            );
-        }
+        // Bandwidth schedule: resolve the unified window+direction once
+        // at startup. Bad windows or "both upload_window and
+        // transfer_window set" abort startup with a clear error.
+        let (upload_window, download_window) = match mount_cfg.parse_window()
+            .with_context(|| format!("transfer window for mount {:?}", mount_cfg.name))?
+        {
+            None => (None, None),
+            Some((w, dir)) => {
+                info!(
+                    mount     = %mount_cfg.name,
+                    start     = format!("{:02}:{:02}", w.start_min / 60, w.start_min % 60),
+                    end       = format!("{:02}:{:02}", w.end_min   / 60, w.end_min   % 60),
+                    direction = ?dir,
+                    "bandwidth schedule active",
+                );
+                (
+                    dir.includes_upload().then_some(w),
+                    dir.includes_download().then_some(w),
+                )
+            }
+        };
 
         // Reset any directory rows lingering with status=dirty/uploading
         // (legacy alpha-era data, or a setattr edge case). Without this,
@@ -293,6 +302,7 @@ async fn main() -> Result<()> {
         let sync_cfg_c   = Arc::clone(&sync_config);
         let waiters_c    = Arc::clone(&hydration_waiters);
         let tracker_c    = hydration_tracker.clone();
+        let download_window_c = download_window;
         let ignore_c     = Arc::clone(&ignore);
         // Capture the tokio Handle here (main thread has runtime context).
         // The spawned std::thread has no tokio context, so Handle::current()
@@ -306,7 +316,7 @@ async fn main() -> Result<()> {
                     &mount_name, mount_id, &mount_path,
                     cache_dir, db_c, backend_c, queue_c,
                     base_store_c, sync_cfg_c, fuse_cfg, rt_handle,
-                    waiters_c, tracker_c, ignore_c,
+                    waiters_c, tracker_c, download_window_c, ignore_c,
                 ) {
                     error!(mount = %mount_name, "FUSE error: {e}");
                 }
