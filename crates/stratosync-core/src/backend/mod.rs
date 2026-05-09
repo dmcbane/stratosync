@@ -175,16 +175,34 @@ fn parse_rclone_error(stderr: &str) -> String {
 /// transfer-progress lines (rclone emits other log lines too — debug,
 /// info about the transfer plan, errors).
 ///
-/// The line we care about looks like one of:
-///   `Transferred:   	    1.234 MiB / 5.678 MiB, 22%, 100 KiB/s, ETA 1m`
-///   `2026/05/07 12:34:56 INFO  : Transferred:   1 MiB / 1 MiB, 100%, ...`
-///   `Transferred:        0 / 0 Bytes, -, 0 B/s, ETA -`
-///
-/// We extract the first quantity (left of the `/`), reusing the project's
-/// `parse_size` so byte/KiB/MiB/GiB/TiB units are handled the same way as
-/// the rest of the config pipeline. Bare unit-less numbers (rclone's "0
-/// / 0 Bytes" case before any transfer has happened) parse as bytes.
+/// Supports two formats:
+/// 1. **JSON-log mode** (active when rclone is invoked with
+///    `--use-json-log`, which we always do). Each line is a JSON
+///    envelope; periodic stats lines have a top-level `stats.bytes`
+///    field with the bytes-so-far count. The visible `msg` string
+///    *does NOT* include the literal "Transferred:" prefix in this
+///    mode — rclone strips it. We rely on `stats.bytes` instead.
+///    This was the regression that made beta.5/beta.6 in-flight
+///    progress always read 0 in production: the parser was looking
+///    for a "Transferred:" substring that never appears in JSON-log
+///    mode.
+/// 2. **Plain-text mode** (rclone without --use-json-log). Lines
+///    look like:
+///      `Transferred:   	    1.234 MiB / 5.678 MiB, 22%, 100 KiB/s, ETA 1m`
+///      `2026/05/07 12:34:56 INFO  : Transferred:   1 MiB / 1 MiB, ...`
+///      `Transferred:        0 / 0 Bytes, -, 0 B/s, ETA -`
+///    We extract the first quantity (left of the `/`), reusing the
+///    project's `parse_size` so byte/KiB/MiB/GiB/TiB units are
+///    handled the same way as the rest of the config pipeline.
 pub(crate) fn parse_rclone_progress_line(line: &str) -> Option<u64> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('{') {
+        // JSON-log mode. Read stats.bytes; bail on anything that
+        // doesn't have it (other log entries like errors and notes).
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        return parsed.get("stats")?.get("bytes")?.as_u64();
+    }
+    // Plain-text fallback.
     let (_, after) = line.split_once("Transferred:")?;
     let after = after.trim_start();
     // Some rclone output forms put a count of files here (e.g.
@@ -621,9 +639,8 @@ impl Backend for RcloneBackend {
     }
 
     /// Same as `download` but pipes byte-progress through the channel.
-    /// Adds `--stats=1s --stats-one-line --stats-log-level=NOTICE` so
-    /// rclone emits one transfer-summary line per second at NOTICE level
-    /// (the default log level), matching `upload_with_progress`.
+    /// Uses `--stats-log-level=ERROR` for the same reason as
+    /// `upload_with_progress` — see that comment.
     async fn download_with_progress(
         &self,
         remote:   &str,
@@ -644,7 +661,7 @@ impl Backend for RcloneBackend {
                 "--no-traverse",
                 "--stats=1s",
                 "--stats-one-line",
-                "--stats-log-level=NOTICE",
+                "--stats-log-level=ERROR",
             ],
             progress,
         ).await?;
@@ -694,10 +711,16 @@ impl Backend for RcloneBackend {
     }
 
     /// Same as `upload` but pipes byte-progress through the channel.
-    /// Adds `--stats=1s --stats-one-line --stats-log-level=NOTICE` so
-    /// rclone emits one transfer-summary line per second at NOTICE level
-    /// (the default log level), without the noise that bumping to INFO
-    /// would produce. The if_match phase and post-stat are unchanged.
+    /// Adds `--stats=1s --stats-one-line --stats-log-level=ERROR` so
+    /// rclone emits one transfer-summary line per second AT ERROR level,
+    /// where the master `--log-level=ERROR` (set in `extra_flags`) lets
+    /// it through. Setting stats-log-level to NOTICE looks tempting, but
+    /// the master log-level filter would then drop the stats lines on
+    /// the floor — we observed exactly that on a live OneDrive upload:
+    /// rclone was actively transferring (3.4 MB queued in the kernel
+    /// send buffer) but our parser saw nothing because rclone never
+    /// emitted the `Transferred:` line at all. The if_match phase and
+    /// post-stat are unchanged.
     async fn upload_with_progress(
         &self,
         local:    &Path,
@@ -734,7 +757,7 @@ impl Backend for RcloneBackend {
                 "--checksum",
                 "--stats=1s",
                 "--stats-one-line",
-                "--stats-log-level=NOTICE",
+                "--stats-log-level=ERROR",
             ],
             progress,
         ).await?;
@@ -852,6 +875,44 @@ mod parse_progress_tests {
     fn parses_with_log_prefix() {
         let line = "2026/05/07 12:34:56 INFO  : Transferred:   100 MiB / 200 MiB, 50%, 5 MiB/s, ETA 20s";
         assert_eq!(parse_rclone_progress_line(line).unwrap(), 100u64 << 20);
+    }
+
+    /// `--use-json-log` (which we always pass via `extra_flags`) wraps
+    /// each rclone log line in a JSON envelope. Critically, the visible
+    /// `msg` string does NOT contain the literal "Transferred:" prefix
+    /// — rclone strips it. The structured byte count is in
+    /// `stats.bytes`. Captured payload from a live `rclone copyto …
+    /// onedrv:/test --stats=1s --stats-one-line --stats-log-level=ERROR
+    /// --log-level ERROR --use-json-log` invocation. Regression target:
+    /// beta.5 and beta.6 shipped with a parser that searched for
+    /// "Transferred:" in the line, which never appears in this mode —
+    /// in-flight uploads always read 0 bytes in production until this
+    /// test was added.
+    #[test]
+    fn parses_json_log_envelope_uses_stats_bytes() {
+        let line = r#"{"time":"2026-05-09T17:21:21.488896966-04:00","level":"error","msg":"          0 B / 10 B, 0%, 0 B/s, ETA -\n","stats":{"bytes":0,"totalBytes":10,"totalTransfers":1},"source":"accounting/stats.go:551"}"#;
+        assert_eq!(parse_rclone_progress_line(line), Some(0),
+            "JSON-log shape with stats.bytes=0 must parse as 0, not None");
+
+        let line2 = r#"{"time":"2026-05-09T17:21:22.489361621-04:00","level":"error","msg":"         10 B / 10 B, 100%, 0 B/s, ETA -\n","stats":{"bytes":10,"totalBytes":10},"source":"accounting/stats.go:551"}"#;
+        assert_eq!(parse_rclone_progress_line(line2), Some(10));
+
+        // Bigger transfer: 7_340_032 == 7 MiB
+        let line3 = r#"{"level":"error","msg":"  7 MiB / 100 MiB, ...","stats":{"bytes":7340032,"totalBytes":104857600},"source":"accounting/stats.go:551"}"#;
+        assert_eq!(parse_rclone_progress_line(line3), Some(7_340_032));
+    }
+
+    /// JSON envelopes WITHOUT a `stats.bytes` field (regular error logs,
+    /// info notes, etc.) must return None — never default-to-zero,
+    /// which would clobber a real progress reading.
+    #[test]
+    fn skips_json_lines_without_stats_bytes() {
+        let err = r#"{"level":"error","msg":"failed to upload","source":"backend.go:42"}"#;
+        assert_eq!(parse_rclone_progress_line(err), None);
+        let info = r#"{"level":"info","msg":"checked","source":"check.go:1"}"#;
+        assert_eq!(parse_rclone_progress_line(info), None);
+        // Malformed JSON falls through to None too.
+        assert_eq!(parse_rclone_progress_line("{not json"), None);
     }
 
     #[test]

@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.7] - 2026-05-09
+
+### Fixed
+- **In-flight progress now actually populates in the dashboard.** Two
+  bugs shipped together in beta.5 (uploads) and beta.6 (downloads)
+  prevented the live byte counter from ever leaving zero in
+  production:
+  1. `--stats-log-level=NOTICE` was suppressed by the daemon's master
+     `--log-level=ERROR`. rclone generated stats lines at NOTICE but
+     the master filter dropped them on the floor before they reached
+     our parser. Switched both `upload_with_progress` and
+     `download_with_progress` to `--stats-log-level=ERROR` so the
+     master filter lets them through.
+  2. The progress parser searched for the literal substring
+     `"Transferred:"`, which never appears when rclone is invoked with
+     `--use-json-log` (we always set this in `extra_flags`). rclone's
+     JSON envelope strips the `Transferred:` prefix and exposes the
+     value as `stats.bytes`. Updated the parser to read `stats.bytes`
+     directly when the line is JSON, falling back to the original
+     plain-text logic for non-JSON-log mode.
+
+  Verified end-to-end on a live OneDrive mount: a 825 MB upload now
+  shows `220.2 MB/825.3 MB 26% 32s` and climbs in real time
+  (~8.7 MB/s), where beta.5/beta.6 stayed at `0 B / 825.3 MB 0%`
+  for the entire upload regardless of actual progress.
+
 ## [0.13.0-beta.6] - 2026-05-09
 
 ### Added
