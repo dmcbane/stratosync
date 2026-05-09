@@ -43,6 +43,22 @@ pub struct CacheStatus {
 pub struct QueueStatus {
     pub pending:   u64,
     pub in_flight: Vec<ActiveUpload>,
+    /// Failed uploads since the last success. Reset to 0 on any
+    /// successful upload. Direct twin of
+    /// `HydrationStatus.consecutive_failures` — the tray and dashboard
+    /// flip a warning indicator when this is non-zero so users
+    /// learn that uploads are stalling without having to read journal
+    /// logs. Defaults to 0 for legacy daemons.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Most recent upload error message, kept across recoveries so the
+    /// dashboard can show "healthy now, last failure was X."
+    #[serde(default)]
+    pub last_error:           Option<String>,
+    /// Unix-epoch seconds of the last failure, also kept across
+    /// recoveries.
+    #[serde(default)]
+    pub last_failure_unix:    Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,6 +232,9 @@ mod tests {
                         attempt: 3,
                         bytes_uploaded: Some(1_500_000),
                     }],
+                    consecutive_failures: 2,
+                    last_error: Some("rclone timed out".into()),
+                    last_failure_unix: Some(1_700_000_005),
                 },
                 poller: PollerStatus {
                     mode: "full-listing".into(),
@@ -276,6 +295,22 @@ mod tests {
     /// upgrade (new CLI, old daemon still running) the dashboard must
     /// keep working — even if it has to render `attempt=1` and "no
     /// progress info" placeholders.
+    /// QueueStatus from a pre-v0.13.0-beta.8 daemon doesn't include the
+    /// upload-health fields. The dashboard CLI must still parse it
+    /// cleanly, defaulting failures to 0 / last_error to None.
+    #[test]
+    fn queue_status_deserializes_legacy_payload() {
+        let legacy = r#"{
+            "pending": 5,
+            "in_flight": []
+        }"#;
+        let q: QueueStatus = serde_json::from_str(legacy).unwrap();
+        assert_eq!(q.pending, 5);
+        assert_eq!(q.consecutive_failures, 0);
+        assert!(q.last_error.is_none());
+        assert!(q.last_failure_unix.is_none());
+    }
+
     /// HydrationStatus on an older daemon doesn't include the `in_flight`
     /// field; deserializing must default it to an empty Vec rather than
     /// failing the whole snapshot.

@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.8] - 2026-05-09
+
+### Added
+- **Upload health symmetry.** The `mount_health` table and surrounding
+  code paths previously tracked only hydration (download) failures —
+  the tray flipped its warning icon on download retry loops but stayed
+  silent during a 41-attempt upload retry, and Prometheus had no upload
+  failure gauge. Closes the most concrete asymmetry surfaced by the
+  audit:
+  - Migration `0009_mount_health_upload.sql` adds three columns
+    (`consecutive_upload_failures`, `last_upload_error`,
+    `last_upload_failure_unix`).
+  - `record_upload_failure` / `record_upload_success` mirror the
+    hydration pair (same upsert pattern, same "leave last_error intact
+    after success" semantics).
+  - The upload queue calls them on every terminal outcome — success,
+    conflict, retryable error, fatal error — matching what
+    `do_hydrate` already does for downloads.
+  - `QueueStatus` IPC payload gains `consecutive_failures`,
+    `last_error`, `last_failure_unix` (all `#[serde(default)]` for
+    legacy-daemon tolerance during partial-upgrade rollouts).
+  - New Prometheus gauge `stratosync_mount_upload_consecutive_failures`
+    (twin of the existing `…_hydration_consecutive_failures`).
+  - The dashboard `status` column now factors uploads into its
+    worst-of decision; the poller block prints `uploads: N consecutive
+    fail(s) — err` when non-zero.
+  - The tray's warning icon trips on either side stalling. The tooltip
+    distinguishes `upload`, `download`, or `transfers` (when both),
+    and the menu shows one line per stalled direction so a mount
+    stalled on both surfaces both errors.
+  - 5 new state-DB tests + 4 new tray tests covering threshold
+    behavior, direction independence, the both-sides "transfers"
+    label, and the IPC backward-compat round-trip.
+
 ## [0.13.0-beta.7] - 2026-05-09
 
 ### Fixed

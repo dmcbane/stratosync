@@ -277,6 +277,15 @@ fn render(
                         .unwrap_or_default(),
                 ));
             }
+            if m.queue.consecutive_failures > 0 {
+                text.push_str(&format!(
+                    "\nuploads: {} consecutive fail(s){}",
+                    m.queue.consecutive_failures,
+                    m.queue.last_error.as_ref()
+                        .map(|e| format!(" — {e}"))
+                        .unwrap_or_default(),
+                ));
+            }
             text
         }).unwrap_or_default();
         let ptitle = mount.map(|m| format!(" {}: poller ", m.name))
@@ -298,10 +307,13 @@ fn render(
 // ── Formatting helpers ───────────────────────────────────────────────────────
 
 fn status_label(m: &MountStatus) -> String {
-    // Worst-of poller and hydration. A stalled download is just as bad
-    // as a failing poller, and lumping them under one column keeps the
-    // overview row scannable.
-    let worst = m.poller.consecutive_failures.max(m.hydration.consecutive_failures);
+    // Worst-of poller, hydration, and upload. A stalled upload is just
+    // as bad as a stalled download or a failing poller — the row should
+    // surface whichever is unhealthiest so the user knows there's
+    // something to investigate without having to scan multiple columns.
+    let worst = m.poller.consecutive_failures
+        .max(m.hydration.consecutive_failures)
+        .max(m.queue.consecutive_failures);
     match worst {
         0    => "● ok".to_string(),
         1..=9 => "◎ retry".to_string(),

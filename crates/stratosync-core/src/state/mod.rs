@@ -1019,16 +1019,65 @@ impl StateDb {
         let row = conn.query_row(
             "SELECT consecutive_hydration_failures,
                     last_hydration_error,
-                    last_hydration_failure_unix
+                    last_hydration_failure_unix,
+                    consecutive_upload_failures,
+                    last_upload_error,
+                    last_upload_failure_unix
              FROM mount_health WHERE mount_id = ?1",
             params![mount_id],
             |r| Ok(MountHealth {
                 consecutive_hydration_failures: r.get::<_, i64>(0)? as u32,
                 last_hydration_error:           r.get(1)?,
                 last_hydration_failure_unix:    r.get(2)?,
+                consecutive_upload_failures:    r.get::<_, i64>(3)? as u32,
+                last_upload_error:              r.get(4)?,
+                last_upload_failure_unix:       r.get(5)?,
             }),
         ).optional()?;
         Ok(row.unwrap_or_default())
+    }
+
+    // ── Mount health (upload) ─────────────────────────────────────────────────
+    //
+    // Direct twin of the hydration helpers above. Same upsert pattern,
+    // same "leave last_* intact on success so the dashboard can show
+    // recovered-after-N-failures" semantics. Kept as separate columns
+    // and separate methods rather than a generic "direction" enum
+    // because (a) the SQL is short, (b) the IPC/metric names are
+    // direction-specific, and (c) upload and hydration paths fail in
+    // different code with different concurrency stories — coupling
+    // them into one generic API would be a refactor for refactor's
+    // sake.
+
+    pub async fn record_upload_failure(
+        &self, mount_id: u32, error: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO mount_health
+                 (mount_id, consecutive_upload_failures,
+                  last_upload_error, last_upload_failure_unix)
+             VALUES (?1, 1, ?2, unixepoch())
+             ON CONFLICT(mount_id) DO UPDATE SET
+                 consecutive_upload_failures =
+                     consecutive_upload_failures + 1,
+                 last_upload_error        = excluded.last_upload_error,
+                 last_upload_failure_unix = excluded.last_upload_failure_unix",
+            params![mount_id, error],
+        )?;
+        Ok(())
+    }
+
+    pub async fn record_upload_success(&self, mount_id: u32) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO mount_health (mount_id, consecutive_upload_failures)
+             VALUES (?1, 0)
+             ON CONFLICT(mount_id) DO UPDATE SET
+                 consecutive_upload_failures = 0",
+            params![mount_id],
+        )?;
+        Ok(())
     }
 }
 
@@ -1053,6 +1102,9 @@ pub struct MountHealth {
     pub consecutive_hydration_failures: u32,
     pub last_hydration_error:           Option<String>,
     pub last_hydration_failure_unix:    Option<i64>,
+    pub consecutive_upload_failures:    u32,
+    pub last_upload_error:              Option<String>,
+    pub last_upload_failure_unix:       Option<i64>,
 }
 
 #[derive(Debug)]
@@ -1194,6 +1246,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0006", include_str!("migrations/0006_dedupe_file_index.sql")),
     ("0007", include_str!("migrations/0007_mount_health.sql")),
     ("0008", include_str!("migrations/0008_remote_item_id.sql")),
+    ("0009", include_str!("migrations/0009_mount_health_upload.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -1811,6 +1864,72 @@ mod tests {
         let h = db.get_mount_health(mount_id).await.unwrap();
         assert_eq!(h.consecutive_hydration_failures, 0);
         assert!(h.last_hydration_error.is_none());
+    }
+
+    // ── Upload-health twin tests (mirror the four hydration tests) ─────────
+
+    #[tokio::test]
+    async fn mount_health_upload_failure_increments_and_records_error() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+        db.record_upload_failure(mount_id, "net 1").await.unwrap();
+        db.record_upload_failure(mount_id, "net 2").await.unwrap();
+        db.record_upload_failure(mount_id, "net 3").await.unwrap();
+
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_upload_failures, 3);
+        assert_eq!(h.last_upload_error.as_deref(), Some("net 3"));
+        assert!(h.last_upload_failure_unix.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn mount_health_upload_success_resets_counter_but_keeps_last_error() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+        db.record_upload_failure(mount_id, "blew up").await.unwrap();
+        db.record_upload_failure(mount_id, "blew up again").await.unwrap();
+        db.record_upload_success(mount_id).await.unwrap();
+
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_upload_failures, 0);
+        assert_eq!(h.last_upload_error.as_deref(), Some("blew up again"),
+            "last error survives recovery so the dashboard can show \
+             'recovered after N failures, last error was X'");
+        assert!(h.last_upload_failure_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn mount_health_upload_success_on_clean_mount_is_noop() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+        db.record_upload_success(mount_id).await.unwrap();
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_upload_failures, 0);
+        assert!(h.last_upload_error.is_none());
+    }
+
+    /// Hydration and upload health are independent counters — a flapping
+    /// download must not zero the upload counter, and vice versa. This
+    /// guards against the kind of "added a generic record_failure(direction)"
+    /// refactor that would couple them in subtle ways.
+    #[tokio::test]
+    async fn mount_health_upload_and_hydration_are_independent() {
+        let (db, mount_id, _root) = setup_db_with_mount().await;
+        db.record_hydration_failure(mount_id, "h1").await.unwrap();
+        db.record_hydration_failure(mount_id, "h2").await.unwrap();
+        db.record_upload_failure(mount_id, "u1").await.unwrap();
+
+        // A download success must NOT clear upload failures.
+        db.record_hydration_success(mount_id).await.unwrap();
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_hydration_failures, 0);
+        assert_eq!(h.consecutive_upload_failures, 1,
+            "hydration success must not clobber the upload counter");
+
+        // And vice versa.
+        db.record_hydration_failure(mount_id, "h3").await.unwrap();
+        db.record_upload_success(mount_id).await.unwrap();
+        let h = db.get_mount_health(mount_id).await.unwrap();
+        assert_eq!(h.consecutive_upload_failures, 0);
+        assert_eq!(h.consecutive_hydration_failures, 1,
+            "upload success must not clobber the hydration counter");
     }
 
     // ── upsert_remote_file_by_id_or_path (v0.13 rename detection) ──────────

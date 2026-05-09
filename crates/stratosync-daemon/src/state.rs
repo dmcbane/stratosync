@@ -65,7 +65,7 @@ async fn collect_mount_status(m: &MountHandle) -> MountStatus {
         pinned_count: m.db.pinned_count(m.mount_id).await.unwrap_or(0),
     };
 
-    let queue = m.upload_queue.snapshot().await;
+    let mut queue = m.upload_queue.snapshot().await;
 
     let poller = m.poller_state.read().await.clone();
 
@@ -84,6 +84,13 @@ async fn collect_mount_status(m: &MountHandle) -> MountStatus {
         last_failure_unix:    health.last_hydration_failure_unix,
         in_flight:            m.hydration_tracker.snapshot(),
     };
+    // Inject upload health into the queue snapshot — the upload queue
+    // doesn't see the DB row itself, so we splice it in here right next
+    // to the hydration twin so the same get_mount_health call serves
+    // both directions.
+    queue.consecutive_failures = health.consecutive_upload_failures;
+    queue.last_error           = health.last_upload_error;
+    queue.last_failure_unix    = health.last_upload_failure_unix;
 
     let conflicts = m.db.count_conflicts(m.mount_id).await.unwrap_or(0);
 

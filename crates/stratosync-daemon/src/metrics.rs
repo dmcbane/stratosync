@@ -148,6 +148,10 @@ pub fn render_prometheus(s: &DaemonStatus) -> String {
         "Files currently being uploaded.",
         |m| m.queue.in_flight.len() as u64);
     emit_mount_gauge(&mut out, s,
+        "stratosync_mount_upload_consecutive_failures",
+        "Upload failures since the last success. Non-zero means uploads are stalling.",
+        |m| m.queue.consecutive_failures as u64);
+    emit_mount_gauge(&mut out, s,
         "stratosync_mount_hydration_active",
         "Files currently downloading from the remote.",
         |m| m.hydration.active);
@@ -265,6 +269,7 @@ mod tests {
                         attempt: 1,
                         bytes_uploaded: None,
                     }],
+                    ..Default::default()
                 },
                 poller:     PollerStatus {
                     mode: "delta".into(),
@@ -297,6 +302,8 @@ mod tests {
         assert!(body.contains(r#"stratosync_mount_cache_used_bytes{mount="gdrive"} 1234"#));
         assert!(body.contains(r#"stratosync_mount_conflicts{mount="gdrive"} 3"#));
         assert!(body.contains(r#"stratosync_mount_upload_queue_in_flight{mount="gdrive"} 1"#));
+        // Upload health twin of the existing hydration_consecutive_failures gauge.
+        assert!(body.contains(r#"stratosync_mount_upload_consecutive_failures{mount="gdrive"} 0"#));
         assert!(body.contains(r#"stratosync_mount_poller_last_poll_timestamp_seconds{mount="gdrive"} 1700000000"#));
 
         // Series lines must end with newlines (Prometheus parsers reject otherwise).

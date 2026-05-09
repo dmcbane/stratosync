@@ -340,6 +340,12 @@ async fn upload_loop(
                         clear_all(inode, &mut in_flight_started,
                                   &mut in_flight_first_started,
                                   &mut attempts, &in_flight_progress);
+                        // Best-effort health recovery, mirrors the hydration
+                        // path: a failed health write is far less important
+                        // than the fact that the upload itself succeeded.
+                        if let Err(e) = db.record_upload_success(mount_id).await {
+                            debug!(mount_id, "record_upload_success: {e}");
+                        }
                         debug!(inode, "upload complete");
                     }
                     Ok((inode, Err(SyncError::Conflict { local, remote }))) => {
@@ -347,6 +353,16 @@ async fn upload_loop(
                                   &mut in_flight_first_started,
                                   &mut attempts, &in_flight_progress);
                         warn!(inode, ?local, ?remote, "upload conflict — invoking resolver");
+                        // Conflicts count as a real upload failure for
+                        // the health gauge — the file did not reach the
+                        // remote, even though the resolver will sort it
+                        // out asynchronously.
+                        if let Err(e) = db
+                            .record_upload_failure(mount_id, &format!("conflict: {local:?} vs {remote:?}"))
+                            .await
+                        {
+                            debug!(mount_id, "record_upload_failure(conflict): {e}");
+                        }
                         if let Ok(Some(entry)) = db.get_by_inode(inode).await {
                             let has_git = super::conflict::git_available();
                             if let Err(e) = super::conflict::resolve(
@@ -370,6 +386,9 @@ async fn upload_loop(
                         if let Err(db_err) = db.fail_queue_job_by_inode(inode, &e.to_string(), 30).await {
                             warn!(inode, "failed to record retry backoff: {db_err}");
                         }
+                        if let Err(db_err) = db.record_upload_failure(mount_id, &e.to_string()).await {
+                            debug!(mount_id, "record_upload_failure(retryable): {db_err}");
+                        }
                         // Re-add to pending with debounce delay for retry.
                         // Retries are not "immediate" — they respect the
                         // bandwidth window like a normal write.
@@ -383,6 +402,9 @@ async fn upload_loop(
                                   &mut in_flight_first_started,
                                   &mut attempts, &in_flight_progress);
                         warn!(inode, "upload fatal: {e}");
+                        if let Err(db_err) = db.record_upload_failure(mount_id, &e.to_string()).await {
+                            debug!(mount_id, "record_upload_failure(fatal): {db_err}");
+                        }
                         if let Err(db_err) = db.set_status(inode, SyncStatus::Dirty).await {
                             warn!(inode, "failed to reset status to Dirty: {db_err}");
                         }
@@ -458,6 +480,13 @@ async fn build_queue_snapshot(
     QueueStatus {
         pending: pending.len() as u64,
         in_flight,
+        // Health fields are populated by the snapshot consumer
+        // (collect_mount_status), which holds the StateDb handle. The
+        // queue loop deliberately stays out of the DB read path here so
+        // it doesn't add latency to its inner select loop.
+        consecutive_failures: 0,
+        last_error:           None,
+        last_failure_unix:    None,
     }
 }
 
