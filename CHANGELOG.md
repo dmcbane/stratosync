@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.12] - 2026-05-11
+
+### Fixed
+- **Notification storm: "upload failed — dirty but no cache_path"**
+  resolved at the root. `setattr(size=N)` (and `open(O_TRUNC)`, which
+  the kernel translates to setattr) on a never-hydrated file used to
+  materialize a cache file on disk but call `set_dirty_size`, which
+  flips the row to `status='dirty'` *without* recording the
+  synthesized cache_path. The upload queue then loaded the row, hit
+  `cache_path = NULL`, returned `Fatal("dirty but no cache_path")`,
+  and the fatal handler set the row back to `dirty` — poisoning it
+  forever and firing a desktop notification on every retry. Joplin
+  saves (O_TRUNC-rewrite-then-write) and other "edit a never-opened
+  remote file" workflows were the dominant trigger; observed in the
+  wild as a 277-row backlog spamming notifications on every daemon
+  restart.
+
+  Three-part fix:
+  - New `StateDb::set_dirty_with_cache_path` records status, size,
+    and cache_path in one update. `setattr`'s "create cache file
+    out-of-band" branch now calls this instead of `set_dirty_size`.
+  - New `StateDb::reset_stuck_dirty_files_without_cache_path`
+    startup sweep (symmetric to the directory cleanup added earlier):
+    rows with `kind='file' AND status IN ('dirty','uploading') AND
+    cache_path IS NULL` revert to `status='remote'`, so the next
+    open() re-hydrates from the cloud. Heals the existing backlog
+    on first restart after upgrade.
+  - Defense in depth in `run_upload`: if it ever sees a dirty row
+    with no cache_path again (some new code path regressing into the
+    same shape), it self-heals to `remote` and returns Ok instead
+    of looping through the fatal handler with a notification per
+    cycle.
+
 ## [0.13.0-beta.11] - 2026-05-09
 
 ### Added

@@ -335,6 +335,26 @@ impl StateDb {
         Ok(())
     }
 
+    /// Mark a file as dirty and record both its size AND its cache_path
+    /// in one atomic update. Used by setattr/truncate when it materializes
+    /// a cache file out-of-band on a never-hydrated row: the DB previously
+    /// had `cache_path = NULL` and bumping just the dirty flag (via
+    /// `set_dirty_size`) would leave the upload queue with no idea where
+    /// the on-disk file actually lives, causing a "dirty but no cache_path"
+    /// fatal on every poll cycle.
+    pub async fn set_dirty_with_cache_path(
+        &self, inode: Inode, cache_path: &Path, size: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE file_index
+             SET status='dirty', size=?1, cache_size=?1, cache_path=?2
+             WHERE inode=?3",
+            params![size as i64, cache_path.to_string_lossy(), inode as i64],
+        )?;
+        Ok(())
+    }
+
     pub async fn set_cached(
         &self,
         inode:      Inode,
@@ -809,6 +829,36 @@ impl StateDb {
              SET status = 'cached'
              WHERE kind = 'dir'
                AND status IN ('dirty','uploading')",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    /// One-shot cleanup symmetric to `reset_stuck_dirty_directories`,
+    /// but for file rows that have `cache_path IS NULL` despite their
+    /// status claiming they have unsynced local content.
+    ///
+    /// This state was reachable before v0.13.0-beta.12 when an app
+    /// truncated (or `open(O_TRUNC)`d) a never-hydrated file: the
+    /// setattr handler created a cache file on disk but called the
+    /// path-less `set_dirty_size`, leaving the DB row pointing
+    /// nowhere. Every restart, `get_pending_uploads` returned the row,
+    /// `run_upload` failed fatally with "dirty but no cache_path",
+    /// the fatal handler set the row back to `dirty`, and a desktop
+    /// notification fired — once per row, per restart.
+    ///
+    /// Reverts to `remote` (not `cached`) so the next open() pulls
+    /// the file fresh from the cloud. The local "dirty" payload was
+    /// never uploaded anyway — keeping that state would imply a
+    /// truncated file that the user never confirmed.
+    pub async fn reset_stuck_dirty_files_without_cache_path(&self) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE file_index
+             SET status = 'remote'
+             WHERE kind = 'file'
+               AND status IN ('dirty','uploading')
+               AND cache_path IS NULL",
             [],
         )?;
         Ok(n)

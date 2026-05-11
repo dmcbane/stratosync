@@ -501,6 +501,84 @@ async fn get_pending_uploads_excludes_directories() {
         "a dirty directory must NOT be in pending uploads (no cache_path to upload)");
 }
 
+/// `set_dirty_with_cache_path` writes status + size + cache_path in one
+/// step. Used by setattr/truncate on a never-hydrated file: the FUSE layer
+/// creates a cache file at a synthesized path and must persist that path
+/// to the DB along with the dirty flag — otherwise the upload queue picks
+/// the row up and crashes with "dirty but no cache_path".
+#[tokio::test]
+async fn set_dirty_with_cache_path_sets_status_size_and_path() {
+    let (db, mid, root) = setup().await;
+    // Start as Remote, cache_path = NULL — the exact state setattr sees
+    // before it materializes a cache file.
+    let inode = insert_file(
+        &db, mid, root, "notes.md", "notes.md",
+        SyncStatus::Remote, None,
+    ).await;
+
+    let cp = std::path::PathBuf::from("/tmp/cache/notes.md");
+    db.set_dirty_with_cache_path(inode, &cp, 1234).await.unwrap();
+
+    let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+    assert_eq!(entry.status, SyncStatus::Dirty);
+    assert_eq!(entry.size, 1234);
+    assert_eq!(entry.cache_size, Some(1234));
+    assert_eq!(entry.cache_path.as_deref(), Some(cp.as_path()),
+        "cache_path must be recorded so the upload queue can find the file");
+}
+
+/// Regression: rows left in `kind='file' AND status='dirty' AND
+/// cache_path IS NULL` from before the setattr fix shipped used to loop
+/// forever — `get_pending_uploads` re-queued them on every restart,
+/// `run_upload` errored with "dirty but no cache_path", and the fatal
+/// handler set the row back to `dirty`, poisoning it permanently and
+/// firing a desktop notification on every cycle.
+///
+/// `reset_stuck_dirty_files_without_cache_path` is the symmetric
+/// startup cleanup to `reset_stuck_dirty_directories`: it reverts these
+/// rows to `remote` so the next access re-hydrates from the cloud.
+/// Healthy dirty rows (with a cache_path) MUST be left alone.
+#[tokio::test]
+async fn reset_stuck_dirty_files_without_cache_path_reverts_only_orphans() {
+    let (db, mid, root) = setup().await;
+
+    // Poisoned: dirty file, no cache_path. Must revert to Remote.
+    let orphan = insert_file(
+        &db, mid, root, "joplin.md", "joplin.md",
+        SyncStatus::Dirty, None,
+    ).await;
+    // Also poisoned via the uploading lane (less common, but the
+    // upload queue's `reset_uploading` runs before the file-cleanup,
+    // so any row that was uploading-then-restarted is now dirty — but
+    // for defense in depth we cover both statuses).
+    let orphan_up = insert_file(
+        &db, mid, root, "joplin2.md", "joplin2.md",
+        SyncStatus::Uploading, None,
+    ).await;
+    // Healthy: dirty file WITH a cache_path. Must stay dirty.
+    let healthy = insert_file(
+        &db, mid, root, "doc.txt", "doc.txt",
+        SyncStatus::Dirty, Some("/tmp/cache/doc.txt"),
+    ).await;
+    // Unrelated: cached file. Must stay cached.
+    let cached = insert_file(
+        &db, mid, root, "img.png", "img.png",
+        SyncStatus::Cached, Some("/tmp/cache/img.png"),
+    ).await;
+
+    let n = db.reset_stuck_dirty_files_without_cache_path().await.unwrap();
+    assert_eq!(n, 2, "exactly the two orphaned rows must be reset");
+
+    assert_eq!(db.get_by_inode(orphan).await.unwrap().unwrap().status,
+        SyncStatus::Remote, "orphan dirty row should revert to Remote");
+    assert_eq!(db.get_by_inode(orphan_up).await.unwrap().unwrap().status,
+        SyncStatus::Remote, "orphan uploading row should revert to Remote");
+    assert_eq!(db.get_by_inode(healthy).await.unwrap().unwrap().status,
+        SyncStatus::Dirty, "healthy dirty row must NOT be touched");
+    assert_eq!(db.get_by_inode(cached).await.unwrap().unwrap().status,
+        SyncStatus::Cached, "unrelated cached row must NOT be touched");
+}
+
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]

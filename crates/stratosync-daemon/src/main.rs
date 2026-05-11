@@ -204,6 +204,23 @@ async fn main() -> Result<()> {
             Err(e) => warn!(mount = %mount_cfg.name, "reset_stuck_dirty_directories failed: {e}"),
         }
 
+        // Symmetric file-level cleanup for the v0.13.0-beta.12 setattr
+        // bug: rows with kind=file, status in (dirty,uploading),
+        // cache_path NULL never had a real cache file recorded — they
+        // were poisoned by `set_dirty_size` paths that forgot to
+        // persist the synthesized path. Revert to `remote` so the next
+        // open() re-hydrates from the cloud and the row stops
+        // notification-storming on every startup.
+        match db.reset_stuck_dirty_files_without_cache_path().await {
+            Ok(n) if n > 0 => warn!(
+                count = n, mount = %mount_cfg.name,
+                "reset stuck dirty files with no cache_path to remote",
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(mount = %mount_cfg.name,
+                "reset_stuck_dirty_files_without_cache_path failed: {e}"),
+        }
+
         // Re-queue any dirty/uploading files from prior run.
         // `get_pending_uploads` already restricts to kind='file'.
         let pending = db.get_pending_uploads(mount_id).await?;

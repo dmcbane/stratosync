@@ -816,16 +816,23 @@ impl Filesystem for StratoFs {
                 if let Some(cp) = &entry.cache_path {
                     let f = tokio::fs::OpenOptions::new().write(true).open(cp).await?;
                     f.set_len(new_size).await?;
+                    db.set_dirty_size(ino, new_size).await?;
                 } else {
                     // File not hydrated — create a cache file at the right size
+                    // and record its path on the DB row in the *same* update
+                    // that flips the status to dirty. Without persisting the
+                    // path, the upload queue picks up a dirty row that points
+                    // nowhere and fatal-errors with "dirty but no cache_path"
+                    // — a notification-storm bug seen with Joplin/`O_TRUNC`
+                    // saves on never-hydrated notes.
                     let cp = cache_dir.join(entry.remote_path.trim_start_matches('/'));
                     if let Some(p) = cp.parent() {
                         tokio::fs::create_dir_all(p).await?;
                     }
                     let f = tokio::fs::File::create(&cp).await?;
                     f.set_len(new_size).await?;
+                    db.set_dirty_with_cache_path(ino, &cp, new_size).await?;
                 }
-                db.set_dirty_size(ino, new_size).await?;
                 queue.enqueue(UploadTrigger::Write { inode: ino }).await;
             }
 

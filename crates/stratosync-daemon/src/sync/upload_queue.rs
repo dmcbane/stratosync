@@ -526,8 +526,25 @@ async fn run_upload(
         return Ok(());
     }
 
-    let cache_path = entry.cache_path
-        .ok_or_else(|| SyncError::Fatal(format!("inode {inode}: dirty but no cache_path")))?;
+    // Defensive: if the row is dirty/uploading but cache_path is NULL,
+    // the row is in an inconsistent state (historically reachable via
+    // setattr/truncate on a never-hydrated file — fixed in
+    // v0.13.0-beta.12 with `set_dirty_with_cache_path`, plus a startup
+    // sweep that resets pre-fix rows to `remote`). If a brand-new code
+    // path ever regresses into this shape, self-heal here instead of
+    // looping forever on the fatal handler (which used to set the row
+    // back to `dirty` and fire a desktop notification on every cycle).
+    let cache_path = match entry.cache_path {
+        Some(cp) => cp,
+        None => {
+            warn!(inode, path = %entry.remote_path,
+                "skipping upload: dirty but no cache_path — resetting to remote");
+            if let Err(e) = db.set_status(inode, SyncStatus::Remote).await {
+                warn!(inode, "failed to reset to remote after no-cache-path skip: {e}");
+            }
+            return Ok(());
+        }
+    };
 
     if !cache_path.exists() {
         return Err(SyncError::Fatal(format!("cache file missing: {}", cache_path.display())));
