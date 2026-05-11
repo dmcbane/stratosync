@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.13] - 2026-05-11
+
+### Added
+- **Schema invariant for file rows.** Migration 0010 installs two
+  BEFORE INSERT/UPDATE triggers that make
+  `kind='file' AND status IN ('cached','dirty','uploading') AND
+  cache_path IS NULL` physically impossible. The same migration
+  runs a cleanup pass that reverts any existing rows in this state
+  to `remote`, so the move is safe over pre-fix data. `stale` and
+  `conflict` are exempt — the poller legitimately flips never-
+  hydrated rows to `stale`, and conflict siblings can live
+  remote-only.
+
+### Fixed
+- **`versions restore` could poison a never-hydrated row** with the
+  same "dirty but no cache_path" shape that beta.12 fixed for
+  `setattr`. The restore path synthesized a cache_path and wrote
+  the blob to it, then called `set_status(Dirty)` without
+  recording the synthesized path on the row. Now uses
+  `set_dirty_with_cache_path` (and would be caught by the
+  migration-0010 trigger if regressed).
+- **`get_pending_uploads` filters out `cache_path IS NULL` rows**
+  at the source. Read-side companion to the trigger: even if some
+  future code path slips an invariant violation past the DB
+  (legacy data, sqlite3 shell edits), the upload queue physically
+  cannot see it.
+
 ## [0.13.0-beta.12] - 2026-05-11
 
 ### Fixed

@@ -191,8 +191,13 @@ async fn db_upsert_remote_file_preserves_dirty() {
     let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "work.rs")).await.unwrap();
 
-    // Locally dirty — remote poll should NOT reset to stale
-    db.set_status(inode, SyncStatus::Dirty).await.unwrap();
+    // Locally dirty — remote poll should NOT reset to stale.
+    // `set_dirty_with_cache_path` mirrors the production write path:
+    // a fresh remote row can only legitimately reach Dirty by also
+    // gaining a cache_path (the file was written through FUSE).
+    db.set_dirty_with_cache_path(
+        inode, std::path::Path::new("/tmp/cache/work.rs"), 1024,
+    ).await.unwrap();
 
     db.upsert_remote_file(
         mid, root, "work.rs", "/work.rs",
@@ -446,7 +451,9 @@ async fn db_fail_queue_job_applies_backoff() {
     let (db, mid) = fresh_db().await;
     let root = insert_root(&db, mid).await;
     let inode = db.insert_file(&file_entry(mid, root, "slow.bin")).await.unwrap();
-    db.set_status(inode, SyncStatus::Dirty).await.unwrap();
+    db.set_dirty_with_cache_path(
+        inode, std::path::Path::new("/tmp/cache/slow.bin"), 1024,
+    ).await.unwrap();
 
     db.enqueue_upload(inode, mid, "/slow.bin", None, 1).await.unwrap();
     let job = db.dequeue_next_upload(mid).await.unwrap().unwrap();

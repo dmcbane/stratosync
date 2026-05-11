@@ -14,7 +14,7 @@ use stratosync_core::{
     base_store::BaseStore,
     config::{default_data_dir, MountConfig},
     state::StateDb,
-    types::{FileEntry, SyncStatus},
+    types::FileEntry,
 };
 
 pub async fn list(config_path: &Path, user_path: &Path) -> Result<()> {
@@ -79,11 +79,17 @@ pub async fn restore(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating cache dir {parent:?}"))?;
     }
-    std::fs::copy(&blob, &cache_path)
+    let written = std::fs::copy(&blob, &cache_path)
         .with_context(|| format!("copy blob {blob:?} -> {cache_path:?}"))?;
 
-    // Mark Dirty so the next sync uploads it.
-    ctx.db.set_status(ctx.entry.inode, SyncStatus::Dirty).await
+    // Mark Dirty AND record the cache_path. When the entry was never
+    // hydrated, `pick_or_synthesize_cache_path` returned a synthesized
+    // path that isn't yet on the DB row — `set_status(Dirty)` alone
+    // would leave `cache_path = NULL`, the same poisoned shape that
+    // setattr/truncate used to produce. The migration-0010 trigger
+    // would now reject that UPDATE outright; using
+    // `set_dirty_with_cache_path` records both fields atomically.
+    ctx.db.set_dirty_with_cache_path(ctx.entry.inode, &cache_path, written).await
         .context("marking restored entry Dirty")?;
 
     println!("Restored version #{index} of '{}' (recorded {}).",

@@ -72,6 +72,18 @@ async fn insert_file(
     db: &Arc<StateDb>, mid: u32, parent: Inode, name: &str, remote_path: &str,
     status: SyncStatus, cache_path: Option<&str>,
 ) -> Inode {
+    // Migration 0010 trigger: cached/dirty/uploading file rows MUST have
+    // a cache_path. Older call sites pass `None` because they only care
+    // about the status; synthesize a deterministic placeholder for them.
+    // Tests that deliberately want a poisoned row (to verify cleanup or
+    // read-side filtering) drop the trigger and call `db.insert_file`
+    // directly.
+    let cp = match (status, cache_path) {
+        (SyncStatus::Cached | SyncStatus::Dirty | SyncStatus::Uploading, None) =>
+            Some(PathBuf::from(format!("/tmp/cache/{name}"))),
+        (_, other) => other.map(PathBuf::from),
+    };
+
     db.insert_file(&NewFileEntry {
         mount_id: mid,
         parent,
@@ -82,7 +94,7 @@ async fn insert_file(
         mtime: SystemTime::now(),
         etag: Some("etag-1".into()),
         status,
-        cache_path: cache_path.map(PathBuf::from),
+        cache_path: cp,
         cache_size: Some(100),
     }).await.unwrap()
 }
@@ -230,16 +242,115 @@ async fn set_dirty_size_updates_size_and_cache_size() {
     assert_eq!(entry.cache_size, Some(42));
 }
 
+/// Pre-v0.13.0-beta.13 `set_dirty_size` would happily flip a Remote
+/// (cache_path=NULL) file row to Dirty, leaving the row in the
+/// "dirty but no cache_path" poisoned state that caused the upload
+/// queue's notification storm. The DB trigger added in migration
+/// 0010 now rejects this transition outright. Callers that want to
+/// dirty a never-hydrated file (setattr/truncate, versions::restore)
+/// must instead go through `set_dirty_with_cache_path`, which
+/// records the synthesized cache_path in the same update.
 #[tokio::test]
-async fn set_dirty_size_on_remote_file_transitions_to_dirty() {
+async fn set_dirty_size_on_remote_file_without_cache_path_is_rejected() {
     let (db, mid, root) = setup().await;
     let inode = insert_file(&db, mid, root, "new.txt", "new.txt", SyncStatus::Remote, None).await;
 
-    db.set_dirty_size(inode, 1024).await.unwrap();
+    let result = db.set_dirty_size(inode, 1024).await;
+    assert!(result.is_err(),
+        "set_dirty_size must be rejected on a row without cache_path");
+
+    // Row must stay Remote — the trigger aborts the UPDATE atomically.
+    let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+    assert_eq!(entry.status, SyncStatus::Remote,
+        "rejected UPDATE must leave the row's prior status intact");
+}
+
+/// Schema invariant (migration 0010): file rows in `cached`, `dirty`,
+/// or `uploading` MUST have a cache_path. Inserting one without
+/// errors at the DB level — no production code path needs this, and
+/// every prior bug in this area produced exactly this shape.
+#[tokio::test]
+async fn invariant_rejects_inserting_file_with_active_status_and_no_cache_path() {
+    let (db, mid, root) = setup().await;
+    for status in [SyncStatus::Cached, SyncStatus::Dirty, SyncStatus::Uploading] {
+        let result = db.insert_file(&stratosync_core::state::NewFileEntry {
+            mount_id: mid, parent: root,
+            name: format!("x-{}.txt", status.as_str()),
+            remote_path: format!("x-{}.txt", status.as_str()),
+            kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+            etag: None, status,
+            cache_path: None, cache_size: None,
+        }).await;
+        assert!(result.is_err(),
+            "INSERT with status={status:?} and no cache_path must be rejected");
+    }
+}
+
+/// Symmetric trigger guard on UPDATE: a file row already in `remote`
+/// (legitimately cache_path=NULL) cannot be flipped to `dirty` without
+/// also recording a cache_path. The trigger fires before the UPDATE
+/// commits and aborts the whole statement.
+#[tokio::test]
+async fn invariant_rejects_updating_file_to_dirty_without_cache_path() {
+    let (db, mid, root) = setup().await;
+    let inode = insert_file(
+        &db, mid, root, "remote.txt", "remote.txt",
+        SyncStatus::Remote, None,
+    ).await;
+
+    // Bypassing `set_dirty_size` (which is itself rejected by the
+    // trigger) to demonstrate the guard catches any path that tries
+    // to set status without cache_path.
+    let result = db.set_status(inode, SyncStatus::Dirty).await;
+    assert!(result.is_err(),
+        "UPDATE to status=dirty on a row without cache_path must be rejected");
+
+    // The original status must survive a rejected UPDATE.
+    let entry = db.get_by_inode(inode).await.unwrap().unwrap();
+    assert_eq!(entry.status, SyncStatus::Remote);
+}
+
+/// `stale` and `conflict` legitimately exist with cache_path=NULL
+/// (poller marking a never-hydrated row stale on a later visit; the
+/// conflict file path lives remotely only). The invariant must NOT
+/// fire for these statuses.
+#[tokio::test]
+async fn invariant_allows_stale_and_conflict_without_cache_path() {
+    let (db, mid, root) = setup().await;
+    db.insert_file(&stratosync_core::state::NewFileEntry {
+        mount_id: mid, parent: root,
+        name: "stale.txt".into(), remote_path: "stale.txt".into(),
+        kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+        etag: None, status: SyncStatus::Stale,
+        cache_path: None, cache_size: None,
+    }).await.expect("stale + null cache_path is a legitimate state");
+
+    db.insert_file(&stratosync_core::state::NewFileEntry {
+        mount_id: mid, parent: root,
+        name: "conflict.txt".into(), remote_path: "conflict.txt".into(),
+        kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+        etag: None, status: SyncStatus::Conflict,
+        cache_path: None, cache_size: None,
+    }).await.expect("conflict + null cache_path is a legitimate state");
+}
+
+/// Healthy case: `set_dirty_size` on a file that already has a
+/// cache_path (e.g. after `handle_write` on a hydrated file) is
+/// the normal write path and must continue to work.
+#[tokio::test]
+async fn set_dirty_size_on_cached_file_still_works() {
+    let (db, mid, root) = setup().await;
+    let inode = insert_file(
+        &db, mid, root, "ok.txt", "ok.txt",
+        SyncStatus::Cached, Some("/tmp/cache/ok.txt"),
+    ).await;
+
+    db.set_dirty_size(inode, 4096).await.unwrap();
 
     let entry = db.get_by_inode(inode).await.unwrap().unwrap();
     assert_eq!(entry.status, SyncStatus::Dirty);
-    assert_eq!(entry.size, 1024);
+    assert_eq!(entry.size, 4096);
+    assert!(entry.cache_path.is_some());
 }
 
 #[tokio::test]
@@ -317,7 +428,15 @@ async fn rename_across_directories() {
 
     let inode = insert_file(&db, mid, dir_a, "file.txt", "a/file.txt", SyncStatus::Dirty, None).await;
 
-    db.rename_entry(inode, dir_b, "file.txt", "b/file.txt", None).await.unwrap();
+    // Production `rename_entry` always carries the cache_path through
+    // (the FUSE rename handler renames the on-disk file first and
+    // passes the new path). Passing `None` here would NULL out the
+    // cache_path on a dirty row — invariant violation under
+    // migration 0010.
+    db.rename_entry(
+        inode, dir_b, "file.txt", "b/file.txt",
+        Some(std::path::Path::new("/tmp/cache/b/file.txt")),
+    ).await.unwrap();
 
     let entry = db.get_by_inode(inode).await.unwrap().unwrap();
     assert_eq!(entry.parent, dir_b);
@@ -527,6 +646,53 @@ async fn set_dirty_with_cache_path_sets_status_size_and_path() {
         "cache_path must be recorded so the upload queue can find the file");
 }
 
+/// Belt for the trigger's suspenders: even if a poisoned row somehow
+/// slipped past the schema invariant (legacy data from before the
+/// trigger landed, or a migration that bulk-inserted via the SQLite
+/// shell), the upload queue must never see it. `get_pending_uploads`
+/// filters out `cache_path IS NULL` rows at the source so `run_upload`
+/// never has to decide what to do with one.
+#[tokio::test]
+async fn get_pending_uploads_excludes_files_without_cache_path() {
+    let (db, mid, root) = setup().await;
+
+    let healthy = insert_file(
+        &db, mid, root, "good.txt", "good.txt",
+        SyncStatus::Dirty, Some("/tmp/cache/good.txt"),
+    ).await;
+
+    // Sneak a poisoned row past the trigger by dropping the invariant
+    // triggers and inserting directly — simulates a row that
+    // pre-dates migration 0010 or that someone crafted via sqlite3.
+    // Scope the conn guard tightly so insert_file doesn't deadlock
+    // on the same mutex.
+    {
+        let conn = db.raw_conn().await;
+        conn.execute(
+            "DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_insert",
+            [],
+        ).unwrap();
+        conn.execute(
+            "DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_update",
+            [],
+        ).unwrap();
+    }
+    let poisoned = db.insert_file(&stratosync_core::state::NewFileEntry {
+        mount_id: mid, parent: root,
+        name: "bad.txt".into(), remote_path: "bad.txt".into(),
+        kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+        etag: None, status: SyncStatus::Dirty,
+        cache_path: None, cache_size: None,
+    }).await.unwrap();
+
+    let pending = db.get_pending_uploads(mid).await.unwrap();
+    let inodes: Vec<_> = pending.iter().map(|e| e.inode).collect();
+    assert!(inodes.contains(&healthy),
+        "healthy dirty file must be in pending uploads");
+    assert!(!inodes.contains(&poisoned),
+        "files with NULL cache_path must be excluded from pending uploads");
+}
+
 /// Regression: rows left in `kind='file' AND status='dirty' AND
 /// cache_path IS NULL` from before the setattr fix shipped used to loop
 /// forever — `get_pending_uploads` re-queued them on every restart,
@@ -542,19 +708,41 @@ async fn set_dirty_with_cache_path_sets_status_size_and_path() {
 async fn reset_stuck_dirty_files_without_cache_path_reverts_only_orphans() {
     let (db, mid, root) = setup().await;
 
+    // Drop the invariant triggers so we can craft deliberately
+    // poisoned rows that simulate pre-migration-0010 data.
+    {
+        let conn = db.raw_conn().await;
+        conn.execute(
+            "DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_insert",
+            [],
+        ).unwrap();
+        conn.execute(
+            "DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_update",
+            [],
+        ).unwrap();
+    }
+
     // Poisoned: dirty file, no cache_path. Must revert to Remote.
-    let orphan = insert_file(
-        &db, mid, root, "joplin.md", "joplin.md",
-        SyncStatus::Dirty, None,
-    ).await;
+    // Bypass the test helper (which auto-synthesizes a cache_path
+    // to keep with the trigger) and write the bad row directly.
+    let orphan = db.insert_file(&NewFileEntry {
+        mount_id: mid, parent: root,
+        name: "joplin.md".into(), remote_path: "joplin.md".into(),
+        kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+        etag: None, status: SyncStatus::Dirty,
+        cache_path: None, cache_size: None,
+    }).await.unwrap();
     // Also poisoned via the uploading lane (less common, but the
     // upload queue's `reset_uploading` runs before the file-cleanup,
     // so any row that was uploading-then-restarted is now dirty — but
     // for defense in depth we cover both statuses).
-    let orphan_up = insert_file(
-        &db, mid, root, "joplin2.md", "joplin2.md",
-        SyncStatus::Uploading, None,
-    ).await;
+    let orphan_up = db.insert_file(&NewFileEntry {
+        mount_id: mid, parent: root,
+        name: "joplin2.md".into(), remote_path: "joplin2.md".into(),
+        kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+        etag: None, status: SyncStatus::Uploading,
+        cache_path: None, cache_size: None,
+    }).await.unwrap();
     // Healthy: dirty file WITH a cache_path. Must stay dirty.
     let healthy = insert_file(
         &db, mid, root, "doc.txt", "doc.txt",
@@ -803,7 +991,13 @@ async fn concurrent_upserts_to_different_files() {
 #[tokio::test]
 async fn concurrent_status_transitions() {
     let (db, mid, root) = setup().await;
-    let inode = insert_file(&db, mid, root, "race.txt", "race.txt", SyncStatus::Remote, None).await;
+    // Start with a cached row + cache_path so the in-test transition
+    // to `Cached` doesn't trip the migration-0010 invariant. The race
+    // being tested is about concurrent UPDATEs, not the initial state.
+    let inode = insert_file(
+        &db, mid, root, "race.txt", "race.txt",
+        SyncStatus::Cached, Some("/tmp/cache/race.txt"),
+    ).await;
 
     // Simulate hydration + poller updating concurrently
     let db1 = Arc::clone(&db);
@@ -1103,14 +1297,21 @@ async fn sql_injection_in_filename_is_harmless() {
 async fn zero_and_max_file_sizes() {
     let (db, mid, root) = setup().await;
 
-    // Zero-size file
-    let z = insert_file(&db, mid, root, "zero.txt", "zero.txt", SyncStatus::Remote, None).await;
+    // Zero-size file. `set_dirty_size` requires the row to already have
+    // a cache_path (invariant in migration 0010), so seed as Cached.
+    let z = insert_file(
+        &db, mid, root, "zero.txt", "zero.txt",
+        SyncStatus::Cached, Some("/tmp/cache/zero.txt"),
+    ).await;
     db.set_dirty_size(z, 0).await.unwrap();
     let entry = db.get_by_inode(z).await.unwrap().unwrap();
     assert_eq!(entry.size, 0);
 
     // Very large size (near i64::MAX / 2 to avoid SQLite overflow)
-    let big = insert_file(&db, mid, root, "big.txt", "big.txt", SyncStatus::Remote, None).await;
+    let big = insert_file(
+        &db, mid, root, "big.txt", "big.txt",
+        SyncStatus::Cached, Some("/tmp/cache/big.txt"),
+    ).await;
     let large_size = 4_000_000_000_000u64; // 4 TB
     db.set_dirty_size(big, large_size).await.unwrap();
     let entry = db.get_by_inode(big).await.unwrap().unwrap();
@@ -1170,7 +1371,12 @@ async fn delete_stale_entries_removes_old_generation() {
 async fn delete_stale_entries_preserves_dirty() {
     let (db, mid, root) = setup().await;
     let dirty = insert_file(&db, mid, root, "edited.txt", "edited.txt", SyncStatus::Dirty, None).await;
-    let uploading = insert_file(&db, mid, root, "up.txt", "up.txt", SyncStatus::Remote, None).await;
+    // Insert directly cached (cache_path autosynth via helper) so the
+    // status transition to Uploading is a valid, invariant-respecting move.
+    let uploading = insert_file(
+        &db, mid, root, "up.txt", "up.txt",
+        SyncStatus::Cached, Some("/tmp/cache/up.txt"),
+    ).await;
     db.set_status(uploading, SyncStatus::Uploading).await.unwrap();
 
     // Both at generation 0, threshold is 1

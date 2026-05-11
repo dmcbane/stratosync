@@ -798,17 +798,21 @@ impl StateDb {
     /// Return all entries that were UPLOADING (need retry after restart).
     pub async fn get_pending_uploads(&self, mount_id: u32) -> Result<Vec<FileEntry>> {
         let conn = self.conn.lock().await;
-        // Restrict to kind='file': directories never have a cache_path
-        // and the upload path requires one. Legacy data with status=dirty
-        // on a directory used to feed `run_upload`, which then crashed
-        // with "dirty but no cache_path" and spammed desktop notifications.
+        // Restrict to kind='file' AND cache_path IS NOT NULL: the
+        // upload path requires both. The kind filter excludes
+        // directories that have no on-disk cache file by definition.
+        // The cache_path filter is the read-side companion to the
+        // migration-0010 trigger — even if a poisoned row predates
+        // the trigger or slips through some future bug, the upload
+        // queue physically cannot see it.
         let mut stmt = conn.prepare(
             "SELECT inode, mount_id, parent_inode, name, remote_path, kind,
                     size, mtime, etag, status, cache_path, cache_size, dir_listed
              FROM file_index
              WHERE mount_id = ?1
                AND status IN ('dirty','uploading')
-               AND kind = 'file'",
+               AND kind = 'file'
+               AND cache_path IS NOT NULL",
         )?;
         let rows = stmt.query_map(params![mount_id], row_to_entry)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1297,6 +1301,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0007", include_str!("migrations/0007_mount_health.sql")),
     ("0008", include_str!("migrations/0008_remote_item_id.sql")),
     ("0009", include_str!("migrations/0009_mount_health_upload.sql")),
+    ("0010", include_str!("migrations/0010_file_cache_path_invariant.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -1376,14 +1381,14 @@ mod tests {
             size:  42,
             mtime: SystemTime::now(),
             etag:  Some("abc123".into()),
-            status: SyncStatus::Remote,
-            cache_path: None,
-            cache_size: None,
+            status: SyncStatus::Cached,
+            cache_path: Some(PathBuf::from("/tmp/cache/test.txt")),
+            cache_size: Some(42),
         }).await.unwrap();
 
         let entry = db.get_by_inode(inode).await.unwrap().unwrap();
         assert_eq!(entry.name, "test.txt");
-        assert_eq!(entry.status, SyncStatus::Remote);
+        assert_eq!(entry.status, SyncStatus::Cached);
         assert_eq!(entry.size, 42);
 
         db.set_status(inode, SyncStatus::Dirty).await.unwrap();
@@ -1501,8 +1506,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: Some("etag1".into()),
             status: SyncStatus::Dirty,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from("/tmp/cache/dirty.txt")),
+            cache_size: Some(100),
         }).await.unwrap();
 
         // Should NOT delete dirty entries
@@ -1527,8 +1532,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: Some("etag1".into()),
             status: SyncStatus::Uploading,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from("/tmp/cache/uploading.txt")),
+            cache_size: Some(100),
         }).await.unwrap();
 
         let result = db.delete_remote_entry_by_path(mount_id, "uploading.txt").await.unwrap();
@@ -1552,8 +1557,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: Some("etag1".into()),
             status: SyncStatus::Cached,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from("/tmp/cache/notes.txt")),
+            cache_size: Some(100),
         }).await.unwrap();
 
         // Initially no base
@@ -1599,8 +1604,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: None,
             status: SyncStatus::Cached,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from("/tmp/cache/a.txt")),
+            cache_size: Some(50),
         }).await.unwrap();
 
         let inode2 = db.insert_file(&NewFileEntry {
@@ -1613,8 +1618,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: None,
             status: SyncStatus::Cached,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from("/tmp/cache/b.txt")),
+            cache_size: Some(50),
         }).await.unwrap();
 
         let hash = "same_content_hash";
@@ -1643,8 +1648,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: None,
             status: SyncStatus::Dirty,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from("/tmp/cache/dirty.txt")),
+            cache_size: Some(50),
         }).await.unwrap();
 
         db.set_base_hash(inode, mount_id, "hash123", 50).await.unwrap();
@@ -1668,8 +1673,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: None,
             status: SyncStatus::Cached,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from("/tmp/cache/old.txt")),
+            cache_size: Some(50),
         }).await.unwrap();
 
         db.set_base_hash(inode, mount_id, "oldhash", 50).await.unwrap();
@@ -1724,6 +1729,9 @@ mod tests {
     // ── Version history tests ───────────────────────────────────────────
 
     async fn make_file(db: &StateDb, mount_id: u32, root: Inode, name: &str) -> Inode {
+        // Migration 0010: status=cached requires cache_path. The tests
+        // that call this helper only care about the row's existence and
+        // not the actual cache_path, so synthesize a placeholder.
         db.insert_file(&NewFileEntry {
             mount_id,
             parent: root,
@@ -1734,8 +1742,8 @@ mod tests {
             mtime: SystemTime::now(),
             etag: Some("e1".into()),
             status: SyncStatus::Cached,
-            cache_path: None,
-            cache_size: None,
+            cache_path: Some(PathBuf::from(format!("/tmp/cache/{name}"))),
+            cache_size: Some(100),
         }).await.unwrap()
     }
 
@@ -2184,7 +2192,13 @@ mod tests {
             mid, root, "live.txt", "live.txt", FileKind::File,
             5, SystemTime::UNIX_EPOCH, None, Some("od-id-live"), 0,
         ).await.unwrap();
-        db.set_status(inode, SyncStatus::Dirty).await.unwrap();
+        // `set_status(Dirty)` alone would NULL out cache_path on this
+        // fresh remote row (migration-0010 invariant violation). In
+        // production, dirty status is only reached after a write to a
+        // hydrated cache file, so go through the path-aware helper.
+        db.set_dirty_with_cache_path(
+            inode, std::path::Path::new("/tmp/cache/live.txt"), 5,
+        ).await.unwrap();
 
         let result = db.delete_remote_entry_by_item_id(mid, "od-id-live").await.unwrap();
         assert!(result.is_none(), "dirty rows must be protected from delete");
