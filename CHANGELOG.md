@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.14] - 2026-05-11
+
+### Fixed
+- **Dashboard halted with stuck "N consecutive failures" after the
+  beta.13 cleanup**. Migration 0010 (and the runtime sweep) deleted
+  the poisoned `file_index` rows but left
+  `mount_health.consecutive_upload_failures` alone — the counter
+  only decrements on `record_upload_success`, and post-cleanup no
+  upload even gets attempted (rows are back to `remote`). Result:
+  the dashboard kept reporting "554 consecutive failures — backend
+  fatal: inode N: dirty but no cache_path" against a mount that
+  no longer had anything to fail on.
+
+  Two-part fix:
+  - **Migration 0011** retroactively clears `mount_health` rows
+    whose `last_upload_error LIKE '%dirty but no cache_path%'`.
+    Pattern-match scope is exactly the bug string from pre-beta.13
+    `run_upload`'s fatal branch, so legitimate transient errors
+    (rclone timeout, auth failures) keep their counters. Catches
+    every population: direct upgraders from beta.11, beta.12
+    intermediates whose rows beta.12's runtime sweep ate before
+    0010 saw them, and users already on beta.13 with stuck banners.
+  - **Runtime sweep** (`reset_stuck_dirty_files_without_cache_path`)
+    now clears upload-health for affected mounts in the same atomic
+    update as the row cleanup. Defense in depth: if a regression
+    ever reproduces the bug shape, both layers heal at once.
+
 ## [0.13.0-beta.13] - 2026-05-11
 
 ### Added

@@ -767,6 +767,92 @@ async fn reset_stuck_dirty_files_without_cache_path_reverts_only_orphans() {
         SyncStatus::Cached, "unrelated cached row must NOT be touched");
 }
 
+/// The upload-failure counter and last-error fields recorded against
+/// the now-revived rows are by definition stale — those failures were
+/// produced by the very inconsistency the sweep just healed. Without
+/// clearing them, the dashboard halts the mount with a "554
+/// consecutive failures" banner that never goes away (the counter
+/// only decrements on a successful upload, and post-sweep no upload
+/// even gets attempted — the rows are back to `remote`).
+#[tokio::test]
+async fn reset_stuck_dirty_files_also_clears_upload_health() {
+    let (db, mid, root) = setup().await;
+
+    // Drop the trigger so we can plant a deliberately poisoned row.
+    {
+        let conn = db.raw_conn().await;
+        conn.execute("DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_insert", []).unwrap();
+        conn.execute("DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_update", []).unwrap();
+    }
+    db.insert_file(&NewFileEntry {
+        mount_id: mid, parent: root,
+        name: "poisoned.md".into(), remote_path: "poisoned.md".into(),
+        kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+        etag: None, status: SyncStatus::Dirty,
+        cache_path: None, cache_size: None,
+    }).await.unwrap();
+
+    // Simulate the dashboard-halting state: many recorded upload
+    // failures + a stuck error message from the poisoned row.
+    for _ in 0..554 {
+        db.record_upload_failure(mid, "backend fatal: inode 3172: dirty but no cache_path").await.unwrap();
+    }
+    let pre = db.get_mount_health(mid).await.unwrap();
+    assert_eq!(pre.consecutive_upload_failures, 554);
+    assert!(pre.last_upload_error.is_some());
+
+    let n = db.reset_stuck_dirty_files_without_cache_path().await.unwrap();
+    assert_eq!(n, 1);
+
+    let post = db.get_mount_health(mid).await.unwrap();
+    assert_eq!(post.consecutive_upload_failures, 0,
+        "upload-failure counter must reset when the failing rows go away");
+    assert!(post.last_upload_error.is_none(),
+        "last_upload_error must clear too — its content quotes the row that no longer exists");
+    assert!(post.last_upload_failure_unix.is_none(),
+        "last_upload_failure_unix must clear in lockstep with the error");
+}
+
+/// The upload-health reset is scoped to mounts that actually had
+/// poisoned rows cleaned. A second healthy mount running on the
+/// same daemon (with legitimate transient upload errors) must keep
+/// its counter intact.
+#[tokio::test]
+async fn reset_stuck_dirty_files_does_not_touch_unaffected_mounts() {
+    let (db, mid_bad, root) = setup().await;
+    // Set up a second mount with its own legitimate upload error.
+    let mid_ok = db.upsert_mount(
+        "other", "mock:/other", "/mnt/other", "/tmp/cache-other", 5 << 30, 60,
+    ).await.unwrap();
+    db.record_upload_failure(mid_ok, "network error: rclone timed out").await.unwrap();
+
+    // Bad mount: plant a poisoned row + a failure counter.
+    {
+        let conn = db.raw_conn().await;
+        conn.execute("DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_insert", []).unwrap();
+        conn.execute("DROP TRIGGER IF EXISTS file_index_dirty_requires_cache_path_update", []).unwrap();
+    }
+    db.insert_file(&NewFileEntry {
+        mount_id: mid_bad, parent: root,
+        name: "bad.md".into(), remote_path: "bad.md".into(),
+        kind: FileKind::File, size: 0, mtime: SystemTime::now(),
+        etag: None, status: SyncStatus::Dirty,
+        cache_path: None, cache_size: None,
+    }).await.unwrap();
+    db.record_upload_failure(mid_bad, "backend fatal: dirty but no cache_path").await.unwrap();
+
+    let _ = db.reset_stuck_dirty_files_without_cache_path().await.unwrap();
+
+    let bad = db.get_mount_health(mid_bad).await.unwrap();
+    assert_eq!(bad.consecutive_upload_failures, 0, "affected mount's counter clears");
+
+    let ok = db.get_mount_health(mid_ok).await.unwrap();
+    assert_eq!(ok.consecutive_upload_failures, 1,
+        "unaffected mount's legitimate failure counter must survive");
+    assert!(ok.last_upload_error.is_some(),
+        "unaffected mount's legitimate last_upload_error must survive");
+}
+
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]

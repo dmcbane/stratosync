@@ -857,6 +857,33 @@ impl StateDb {
     /// truncated file that the user never confirmed.
     pub async fn reset_stuck_dirty_files_without_cache_path(&self) -> Result<usize> {
         let conn = self.conn.lock().await;
+        // Order matters: the upload-health clear has to run BEFORE the
+        // file_index UPDATE — its WHERE clause identifies affected
+        // mounts by looking at the poisoned rows themselves, which are
+        // about to disappear. Scoped via `mount_id IN (...)` so
+        // unrelated mounts with legitimate transient upload errors
+        // keep their counters.
+        //
+        // Why clear all three columns and not just the counter (as
+        // `record_upload_success` does): the error message and
+        // failure timestamp specifically quote a row that no longer
+        // exists, so leaving them around makes the dashboard show
+        // "last error: inode 3172: dirty but no cache_path" against
+        // a healthy mount forever. The counter on its own already
+        // tells the dashboard the mount is fine.
+        conn.execute(
+            "UPDATE mount_health
+             SET consecutive_upload_failures = 0,
+                 last_upload_error           = NULL,
+                 last_upload_failure_unix    = NULL
+             WHERE mount_id IN (
+               SELECT DISTINCT mount_id FROM file_index
+               WHERE kind = 'file'
+                 AND status IN ('dirty','uploading')
+                 AND cache_path IS NULL
+             )",
+            [],
+        )?;
         let n = conn.execute(
             "UPDATE file_index
              SET status = 'remote'
@@ -1302,6 +1329,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0008", include_str!("migrations/0008_remote_item_id.sql")),
     ("0009", include_str!("migrations/0009_mount_health_upload.sql")),
     ("0010", include_str!("migrations/0010_file_cache_path_invariant.sql")),
+    ("0011", include_str!("migrations/0011_clear_stale_upload_health.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> Result<()> {
