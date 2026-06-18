@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.15] - 2026-06-17
+
+### Fixed
+- **Large files failed to upload forever on a fixed 120 s rclone
+  timeout.** `RcloneBackend` wrapped *every* rclone invocation — a 50 ms
+  `stat` and a multi-gigabyte transfer alike — in a single hardcoded
+  120-second wall-clock deadline. Any upload (or download/hydration)
+  that couldn't finish in 120 s was killed mid-stream, mapped to a
+  retryable `Network("rclone timed out")` error, re-queued, and
+  restarted from byte zero — an infinite loop. A real 2.4 GB archive to
+  Google Drive failed **613 consecutive times over ~33 hours**; the same
+  file uploaded fine through the browser (resumable chunked upload, no
+  such cap).
+
+  Transfers (`run_with_progress`) now use a **stall watchdog** instead:
+  rclone is aborted only after making *no* progress for `stall_timeout`
+  (default 120 s of silence), so an arbitrarily large but actively-
+  progressing transfer runs to completion, while a genuinely wedged
+  rclone is still killed promptly. The fixed `timeout` is retained only
+  for quick metadata ops (`stat`, `lsjson`, `mkdir`, …). Transfer
+  invocations also pass rclone's own `--timeout 120s --contimeout 60s`
+  as a backstop.
+
+### Added
+- **`[mount.rclone]` config is now actually applied.** `extra_flags`,
+  `bwlimit`, `transfers`, and `checkers` were defined in the schema but
+  silently dropped — the daemon never passed them to the backend. They
+  are now wired through (`RcloneBackend::with_rclone_config`), so e.g.
+  `extra_flags = ["--drive-chunk-size", "64M"]` takes effect. New
+  optional `stall_timeout_secs` overrides the transfer stall timeout for
+  very slow links.
+
 ## [0.13.0-beta.14] - 2026-05-11
 
 ### Fixed

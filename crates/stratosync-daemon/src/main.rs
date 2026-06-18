@@ -106,7 +106,8 @@ async fn main() -> Result<()> {
             ))
         } else {
             let mut rclone_backend = RcloneBackend::new(&mount_cfg.remote)
-                .with_context(|| format!("backend for {:?}", mount_cfg.name))?;
+                .with_context(|| format!("backend for {:?}", mount_cfg.name))?
+                .with_rclone_config(&mount_cfg.rclone);
             rclone_backend.init_delta().await;
             Arc::new(rclone_backend)
         };

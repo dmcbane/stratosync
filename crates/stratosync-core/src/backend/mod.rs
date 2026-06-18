@@ -231,8 +231,17 @@ pub struct RcloneBackend {
     pub rclone_bin:  std::path::PathBuf,
     /// Extra flags to pass to every rclone invocation.
     pub extra_flags: Vec<String>,
-    /// Per-operation timeout.
+    /// Wall-clock timeout for quick metadata operations (`stat`, `lsjson`,
+    /// `mkdir`, `delete`, …) that go through `run`. These should always
+    /// complete fast, so a fixed deadline is appropriate.
     pub timeout:     Duration,
+    /// Stall timeout for data transfers (upload/download) that go through
+    /// `run_with_progress`. A transfer is aborted only after making *no*
+    /// progress for this long — not on a fixed wall-clock — so an
+    /// arbitrarily large but actively-progressing transfer runs to
+    /// completion. A fixed deadline here is what made large uploads to
+    /// Google Drive fail forever (see docs/dev-journal).
+    pub stall_timeout: Duration,
     /// Optional delta provider for efficient change detection.
     delta: Option<Box<dyn delta::DeltaProvider>>,
 }
@@ -244,18 +253,59 @@ impl RcloneBackend {
     }
 
     pub fn new(remote_root: impl Into<String>) -> Result<Self> {
-        let remote_root = remote_root.into();
         let rclone_bin = which_rclone()?;
-        Ok(Self {
+        Ok(Self::with_binary(remote_root, rclone_bin))
+    }
+
+    /// Construct a backend with an explicit rclone binary path, bypassing
+    /// PATH / `STRATOSYNC_RCLONE` resolution. Used by tests that
+    /// substitute a fake rclone, and by callers that have already
+    /// resolved the binary.
+    pub fn with_binary(
+        remote_root: impl Into<String>,
+        rclone_bin:  impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
             delta: None, // initialized asynchronously via init_delta()
-            remote_root,
-            rclone_bin,
+            remote_root: remote_root.into(),
+            rclone_bin:  rclone_bin.into(),
             extra_flags: vec![
                 "--log-level".into(), "ERROR".into(),
                 "--use-json-log".into(),
             ],
-            timeout: Duration::from_secs(120),
-        })
+            timeout:       Duration::from_secs(120),
+            stall_timeout: Duration::from_secs(120),
+        }
+    }
+
+    /// Override the transfer stall timeout (default 120 s of no progress).
+    pub fn with_stall_timeout(mut self, d: Duration) -> Self {
+        self.stall_timeout = d;
+        self
+    }
+
+    /// Apply per-mount `[mount.rclone]` config: append `extra_flags`,
+    /// `--bwlimit`, `--transfers`, `--checkers`, and override the stall
+    /// timeout if `stall_timeout_secs` is set. These knobs were defined
+    /// in the config schema but silently dropped before this was wired in.
+    pub fn with_rclone_config(mut self, cfg: &crate::config::RcloneConfig) -> Self {
+        self.extra_flags.extend(cfg.extra_flags.iter().cloned());
+        if let Some(bw) = &cfg.bwlimit {
+            self.extra_flags.push("--bwlimit".into());
+            self.extra_flags.push(bw.clone());
+        }
+        if let Some(t) = cfg.transfers {
+            self.extra_flags.push("--transfers".into());
+            self.extra_flags.push(t.to_string());
+        }
+        if let Some(c) = cfg.checkers {
+            self.extra_flags.push("--checkers".into());
+            self.extra_flags.push(c.to_string());
+        }
+        if let Some(s) = cfg.stall_timeout_secs {
+            self.stall_timeout = Duration::from_secs(s);
+        }
+        self
     }
 
     /// Attempt to initialize delta (change token) support by reading the
@@ -497,12 +547,21 @@ impl RcloneBackend {
                 .map(|_| buf)
         });
 
+        // Liveness signal shared with the stall watchdog below. The stderr
+        // task bumps it on every line; with `--stats=1s` rclone emits a
+        // stats line each second while the transfer is alive, so a counter
+        // that stops advancing means the transfer is wedged.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let activity = std::sync::Arc::new(AtomicU64::new(0));
+        let activity_stderr = std::sync::Arc::clone(&activity);
+
         // Drain stderr line-by-line; emit progress on transfer lines,
         // collect everything for error mapping if the process fails.
         let stderr_task = tokio::spawn(async move {
             let mut full = String::new();
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                activity_stderr.fetch_add(1, Ordering::Relaxed);
                 if let Some(bytes) = parse_rclone_progress_line(&line) {
                     // Channel closed = consumer gone; drop the value.
                     let _ = progress.try_send(bytes);
@@ -513,10 +572,32 @@ impl RcloneBackend {
             full
         });
 
-        let status = match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(Ok(s))  => s,
-            Ok(Err(e)) => return Err(SyncError::Fatal(format!("rclone wait: {e}"))),
-            Err(_)     => return Err(SyncError::Network("rclone timed out".into())),
+        // Stall watchdog. Wait for rclone to exit, but abort if it makes
+        // no progress for `stall_timeout`. Unlike a fixed wall-clock
+        // deadline, this lets an arbitrarily large but progressing
+        // transfer finish while still killing a genuinely wedged rclone.
+        // `child.wait()` is cancel-safe, so re-racing it each loop is fine;
+        // dropping the child on early return triggers `kill_on_drop`.
+        let status = {
+            let mut last_seen = activity.load(Ordering::Relaxed);
+            loop {
+                tokio::select! {
+                    res = child.wait() => break match res {
+                        Ok(s)  => s,
+                        Err(e) => return Err(SyncError::Fatal(format!("rclone wait: {e}"))),
+                    },
+                    _ = tokio::time::sleep(self.stall_timeout) => {
+                        let now = activity.load(Ordering::Relaxed);
+                        if now == last_seen {
+                            let secs = self.stall_timeout.as_secs();
+                            return Err(SyncError::Network(format!(
+                                "rclone stalled (no progress for {secs}s)"
+                            )));
+                        }
+                        last_seen = now;
+                    }
+                }
+            }
         };
 
         let stdout_bytes = stdout_task.await
@@ -662,6 +743,10 @@ impl Backend for RcloneBackend {
                 "--stats=1s",
                 "--stats-one-line",
                 "--stats-log-level=ERROR",
+                // rclone's own idle/connection timeouts: backstop the stall
+                // watchdog by letting rclone self-abort a dead socket.
+                "--timeout", "120s",
+                "--contimeout", "60s",
             ],
             progress,
         ).await?;
@@ -758,6 +843,10 @@ impl Backend for RcloneBackend {
                 "--stats=1s",
                 "--stats-one-line",
                 "--stats-log-level=ERROR",
+                // rclone's own idle/connection timeouts: backstop the stall
+                // watchdog by letting rclone self-abort a dead socket.
+                "--timeout", "120s",
+                "--contimeout", "60s",
             ],
             progress,
         ).await?;

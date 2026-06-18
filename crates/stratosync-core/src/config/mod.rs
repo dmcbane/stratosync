@@ -341,6 +341,10 @@ pub struct RcloneConfig {
     pub bwlimit:     Option<String>,
     pub transfers:   Option<u32>,
     pub checkers:    Option<u32>,
+    /// Seconds a transfer may make no progress before the daemon aborts
+    /// and retries it. Defaults to 120 when unset. Raise it for very slow
+    /// links or backends with long server-side commit pauses.
+    pub stall_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
