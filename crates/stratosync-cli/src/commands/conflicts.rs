@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use stratosync_core::{
@@ -25,71 +26,38 @@ pub async fn list(config_path: &Path) -> Result<()> {
         let db = StateDb::open(&db_path)?;
         let Some(mount_id) = db.get_mount_id(&mount.name).await? else { continue };
 
-        // Query for all conflict entries
-        let conn = db.raw_conn().await;
-        let mut stmt = conn.prepare(
-            "SELECT inode, name, remote_path, size, mtime
-             FROM file_index
-             WHERE mount_id=?1 AND status='conflict'
-             ORDER BY mtime DESC",
-        )?;
-
-        let rows: Vec<(u64, String, String, u64, i64)> = stmt
-            .query_map(rusqlite::params![mount_id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)? as u64,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get::<_, i64>(3)? as u64,
-                    r.get(4)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        // Also look for files whose name contains ".conflict."
-        let mut stmt2 = conn.prepare(
-            "SELECT inode, name, remote_path, size, mtime
-             FROM file_index
-             WHERE mount_id=?1 AND name LIKE '%.conflict.%'
-             ORDER BY mtime DESC",
-        )?;
-        let conflict_files: Vec<(u64, String, String, u64, i64)> = stmt2
-            .query_map(rusqlite::params![mount_id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)? as u64,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get::<_, i64>(3)? as u64,
-                    r.get(4)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if rows.is_empty() && conflict_files.is_empty() { continue; }
+        let entries = collect_conflict_entries(&db, mount_id).await?;
+        if entries.is_empty() { continue; }
 
         found_any = true;
+        let mount_fuse = expand_tilde(&mount.resolved_mount_path());
         println!("Mount: {}", mount.name);
         println!("{}", "─".repeat(60));
 
-        for (inode, name, path, size, mtime) in &rows {
-            let ts = chrono::DateTime::from_timestamp(*mtime, 0)
+        for sibling in &entries {
+            let ts = chrono::DateTime::from_timestamp(
+                    sibling.mtime.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs() as i64, 0)
                 .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
                 .unwrap_or_else(|| "unknown".into());
-            println!("  CONFLICT  {name}");
-            println!("            inode={inode}  size={}  modified={ts}", bytesize::ByteSize(*size));
-            println!("            remote: {path}");
-            println!();
-        }
 
-        for (inode, name, path, size, mtime) in &conflict_files {
-            let ts = chrono::DateTime::from_timestamp(*mtime, 0)
-                .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_else(|| "unknown".into());
-            println!("  FILE      {name}");
-            println!("            inode={inode}  size={}  modified={ts}", bytesize::ByteSize(*size));
-            println!("            remote: {path}");
+            // Locate the canonical entry so we can show its FUSE path.
+            let canonical_fuse = if let Ok(Some(canon)) =
+                find_conflict_sibling(&db, mount_id, sibling).await
+            {
+                let rel = canon.remote_path.trim_start_matches('/');
+                Some(mount_fuse.join(rel))
+            } else {
+                None
+            };
+
+            println!("  {}", sibling.name);
+            println!("    conflict:  {}", sibling.remote_path);
+            println!("    size: {}  |  modified: {ts}",
+                bytesize::ByteSize(sibling.size));
+            if let Some(ref canon_path) = canonical_fuse {
+                println!("    resolve via: {}", canon_path.display());
+            }
             println!();
         }
     }
@@ -97,7 +65,7 @@ pub async fn list(config_path: &Path) -> Result<()> {
     if !found_any {
         println!("No conflicts found.");
     } else {
-        println!("To resolve:");
+        println!("To resolve, pass the canonical file path shown above:");
         println!("  stratosync conflicts keep-local  <path>   — upload local, discard remote");
         println!("  stratosync conflicts keep-remote <path>   — download remote, discard local");
         println!("  stratosync conflicts merge       <path>   — attempt 3-way merge");
@@ -113,9 +81,11 @@ pub async fn list(config_path: &Path) -> Result<()> {
 struct ResolveContext {
     db:               StateDb,
     mount_id:         u32,
+    /// Always the canonical entry (never the .conflict.* sibling).
     entry:            FileEntry,
+    /// The .conflict.* sibling, when one exists.
     conflict_sibling: Option<FileEntry>,
-    backend:          RcloneBackend,
+    backend:          Arc<dyn Backend>,
     mount:            MountConfig,
 }
 
@@ -133,8 +103,11 @@ fn expand_tilde(p: &Path) -> PathBuf {
 /// conflict sibling file.
 ///
 /// The path can be:
-/// - A mount-relative path to a file with status='conflict'
-/// - A path to a `.conflict.*` sibling file (resolves to the canonical entry)
+/// - A mount-relative path to the canonical file (e.g. `/mount/docs/report.pdf`)
+/// - A FUSE-visible path to the `.conflict.*` sibling (resolves via name lookup)
+///
+/// In either case `ctx.entry` is always the *canonical* entry and
+/// `ctx.conflict_sibling` is the `.conflict.*` sibling (if found).
 async fn resolve_path(config_path: &Path, user_path: &Path) -> Result<ResolveContext> {
     let cfg = crate::config_io::load(config_path)?;
     let user_abs = expand_tilde(user_path);
@@ -157,27 +130,88 @@ async fn resolve_path(config_path: &Path, user_path: &Path) -> Result<ResolveCon
     let mount_id = db.get_mount_id(&mount.name).await?
         .ok_or_else(|| anyhow::anyhow!("mount '{}' not found in database", mount.name))?;
 
-    // Build the remote path from the relative path — try both with and without
-    // leading slash since root-level files may be stored either way.
     let rel_str = rel_path.to_string_lossy();
     let rel_str = rel_str.trim_start_matches('/');
-    let entry = {
+
+    // Primary lookup: by remote_path (exact match, with/without leading slash).
+    let entry_raw = {
         let with_slash = format!("/{rel_str}");
         match db.get_by_remote_path(mount_id, &with_slash).await? {
-            Some(e) => e,
-            None => db.get_by_remote_path(mount_id, rel_str).await?
-                .ok_or_else(|| anyhow::anyhow!(
-                    "file not found in database: {rel_str}"
-                ))?,
+            Some(e) => Some(e),
+            None    => db.get_by_remote_path(mount_id, rel_str).await?,
         }
     };
 
-    // Find conflict sibling: look for .conflict.* files with the same stem
-    let conflict_sibling = find_conflict_sibling(&db, mount_id, &entry).await?;
+    // Fallback for conflict sibling FUSE paths: conflict siblings are stored
+    // under .stratosync-conflicts/ so their remote_path never matches the
+    // user-visible FUSE path.  When the filename contains ".conflict." and the
+    // primary lookup found nothing, search by name within the mount.
+    let entry_raw = match entry_raw {
+        Some(e) => e,
+        None => {
+            let fuse_name = Path::new(rel_str)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(rel_str);
 
-    let backend = RcloneBackend::new(&mount.remote)?;
+            if fuse_name.contains(".conflict.") {
+                let inode = {
+                    let conn = db.raw_conn().await;
+                    let inodes: Vec<u64> = conn.prepare(
+                        "SELECT inode FROM file_index
+                         WHERE mount_id=?1 AND name=?2
+                         LIMIT 1",
+                    )?.query_map(
+                        rusqlite::params![mount_id, fuse_name],
+                        |r| Ok(r.get::<_, i64>(0)? as u64),
+                    )?.filter_map(|r| r.ok()).collect();
+                    inodes.into_iter().next()
+                };
+                match inode {
+                    Some(i) => db.get_by_inode(i).await?
+                        .ok_or_else(|| anyhow::anyhow!("file not found in database: {rel_str}"))?,
+                    None => anyhow::bail!("file not found in database: {rel_str}"),
+                }
+            } else {
+                anyhow::bail!("file not found in database: {rel_str}")
+            }
+        }
+    };
+
+    // Normalize roles: ctx.entry must always be the canonical; if the lookup
+    // returned a conflict sibling, swap so we hold (canonical, sibling).
+    let (entry, conflict_sibling) =
+        normalize_conflict_roles(&db, mount_id, entry_raw).await?;
+
+    let backend: Arc<dyn Backend> = Arc::new(RcloneBackend::new(&mount.remote)?);
 
     Ok(ResolveContext { db, mount_id, entry, conflict_sibling, backend, mount })
+}
+
+/// Return `(canonical, sibling?)` regardless of which end of the pair `entry`
+/// represents.  If `entry` already is the canonical, calls
+/// `find_conflict_sibling` to locate its sibling.  If `entry` is the sibling
+/// (contains ".conflict." in name), locates the canonical instead and swaps.
+async fn normalize_conflict_roles(
+    db: &StateDb,
+    mount_id: u32,
+    entry: FileEntry,
+) -> Result<(FileEntry, Option<FileEntry>)> {
+    if entry.name.contains(".conflict.") {
+        // Entry is the sibling — find canonical via the reverse lookup.
+        let canonical = find_conflict_sibling(db, mount_id, &entry)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!(
+                "'{}' looks like a conflict file but its canonical entry could not \
+                 be found in the database",
+                entry.name
+            ))?;
+        Ok((canonical, Some(entry)))
+    } else {
+        // Entry is the canonical — find sibling if present.
+        let sibling = find_conflict_sibling(db, mount_id, &entry).await?;
+        Ok((entry, sibling))
+    }
 }
 
 /// Find the `.conflict.*` sibling for a given entry, or if the entry itself
@@ -239,26 +273,29 @@ async fn find_conflict_sibling(
 /// Cleanup after resolution: delete conflict sibling from remote and DB,
 /// then update canonical entry to Cached status.
 async fn finalize_resolution(
-    ctx: &ResolveContext,
+    db: &StateDb,
+    backend: &dyn Backend,
+    entry: &FileEntry,
+    conflict_sibling: Option<&FileEntry>,
     cache_path: &Path,
 ) -> Result<()> {
     // Delete conflict sibling
-    if let Some(ref sibling) = ctx.conflict_sibling {
-        if let Err(reason) = ctx.backend.delete(&sibling.remote_path).await {
+    if let Some(sibling) = conflict_sibling {
+        if let Err(reason) = backend.delete(&sibling.remote_path).await {
             // NotFound is fine — sibling may have already been cleaned up
             if !matches!(reason, stratosync_core::types::SyncError::NotFound { .. }) {
                 anyhow::bail!("failed to delete conflict file '{}': {reason}", sibling.remote_path);
             }
         }
-        ctx.db.delete_entry(sibling.inode).await
+        db.delete_entry(sibling.inode).await
             .context("failed to remove conflict sibling from database")?;
     }
 
     // Update canonical entry to Cached
-    let meta = ctx.backend.stat(&ctx.entry.remote_path).await
+    let meta = backend.stat(&entry.remote_path).await
         .context("failed to stat remote after resolution")?;
-    ctx.db.set_cached(
-        ctx.entry.inode, cache_path, meta.size,
+    db.set_cached(
+        entry.inode, cache_path, meta.size,
         meta.etag.as_deref(), meta.mtime, meta.size,
     ).await.context("failed to update database status")?;
 
@@ -282,7 +319,11 @@ pub async fn keep_local(config_path: &Path, path: &Path) -> Result<()> {
     ctx.backend.upload(cache_path, &ctx.entry.remote_path, None).await
         .context("failed to upload local version")?;
 
-    finalize_resolution(&ctx, cache_path).await?;
+    finalize_resolution(
+        &ctx.db, &*ctx.backend,
+        &ctx.entry, ctx.conflict_sibling.as_ref(),
+        cache_path,
+    ).await?;
 
     println!("Resolved: kept local version of '{}'", ctx.entry.name);
     Ok(())
@@ -307,7 +348,11 @@ pub async fn keep_remote(config_path: &Path, path: &Path) -> Result<()> {
     ctx.backend.download(&ctx.entry.remote_path, &cache_path).await
         .context("failed to download remote version")?;
 
-    finalize_resolution(&ctx, &cache_path).await?;
+    finalize_resolution(
+        &ctx.db, &*ctx.backend,
+        &ctx.entry, ctx.conflict_sibling.as_ref(),
+        &cache_path,
+    ).await?;
 
     println!("Resolved: kept remote version of '{}'", ctx.entry.name);
     Ok(())
@@ -355,7 +400,11 @@ pub async fn merge(config_path: &Path, path: &Path) -> Result<()> {
             ctx.backend.upload(cache_path, &ctx.entry.remote_path, None).await
                 .context("failed to upload merged result")?;
 
-            finalize_resolution(&ctx, cache_path).await?;
+            finalize_resolution(
+                &ctx.db, &*ctx.backend,
+                &ctx.entry, ctx.conflict_sibling.as_ref(),
+                cache_path,
+            ).await?;
 
             // Update base version to the merged result
             if let Ok(hash) = base_store.store_base(cache_path) {
@@ -402,8 +451,8 @@ pub async fn cleanup(config_path: &Path, dry_run: bool) -> Result<()> {
 
         let db = StateDb::open(&db_path)?;
         let Some(mount_id) = db.get_mount_id(&mount.name).await? else { continue };
-        let backend_dyn: std::sync::Arc<dyn Backend> =
-            std::sync::Arc::new(RcloneBackend::new(&mount.remote)?);
+        let backend_dyn: Arc<dyn Backend> =
+            Arc::new(RcloneBackend::new(&mount.remote)?);
 
         // Collect all conflict entries: by status or by filename pattern.
         let entries = collect_conflict_entries(&db, mount_id).await?;
@@ -585,6 +634,8 @@ where
 
 /// Collect every entry that looks like a conflict file — either by
 /// `status='conflict'` or by filename pattern `%.conflict.%`.
+/// Results are deduplicated by inode so a sibling that matches both
+/// conditions appears only once.
 async fn collect_conflict_entries(db: &StateDb, mount_id: u32) -> Result<Vec<FileEntry>> {
     let conn = db.raw_conn().await;
     let rows: Vec<u64> = conn.prepare(
@@ -598,10 +649,16 @@ async fn collect_conflict_entries(db: &StateDb, mount_id: u32) -> Result<Vec<Fil
 
     drop(conn);
 
+    // Deduplicate: a sibling satisfies both conditions so appears once in the
+    // SQL result but could map to the same inode twice if the query is ever
+    // changed to use UNION.  Using a seen-set is defensive.
+    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(rows.len());
     for inode in rows {
-        if let Some(e) = db.get_by_inode(inode).await? {
-            out.push(e);
+        if seen.insert(inode) {
+            if let Some(e) = db.get_by_inode(inode).await? {
+                out.push(e);
+            }
         }
     }
     Ok(out)
@@ -637,4 +694,251 @@ pub async fn diff(config_path: &Path, path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use stratosync_core::{
+        backend::mock::MockBackend,
+        state::{NewFileEntry, StateDb},
+        types::{FileKind, SyncStatus, FUSE_ROOT_INODE},
+    };
+
+    async fn setup_db() -> (StateDb, u32) {
+        let db = StateDb::in_memory().unwrap();
+        db.migrate().await.unwrap();
+        let mount_id = db.upsert_mount(
+            "test", "mock:/", "/mnt/test",
+            "/tmp/stratosync-test-cache", 5 << 30, 60,
+        ).await.unwrap();
+        db.insert_root(&NewFileEntry {
+            mount_id, parent: 0,
+            name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0,
+            mtime: SystemTime::UNIX_EPOCH, etag: None,
+            status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+        (db, mount_id)
+    }
+
+    async fn insert_canonical(
+        db: &StateDb,
+        mount_id: u32,
+        name: &str,
+        cache_path: Option<PathBuf>,
+    ) -> u64 {
+        // The DB trigger enforces: status=Cached requires cache_path.
+        // Use Remote when no local file is provided.
+        let (status, cache_size) = if cache_path.is_some() {
+            (SyncStatus::Cached, Some(100))
+        } else {
+            (SyncStatus::Remote, None)
+        };
+        db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: FUSE_ROOT_INODE,
+            name: name.into(),
+            remote_path: format!("/{name}"),
+            kind: FileKind::File,
+            size: 100,
+            mtime: SystemTime::now(),
+            etag: Some("etag-canonical".into()),
+            status,
+            cache_path,
+            cache_size,
+        }).await.unwrap()
+    }
+
+    async fn insert_sibling(db: &StateDb, mount_id: u32, sibling_name: &str) -> u64 {
+        db.insert_file(&NewFileEntry {
+            mount_id,
+            parent: FUSE_ROOT_INODE,
+            name: sibling_name.into(),
+            remote_path: format!(".stratosync-conflicts/{sibling_name}"),
+            kind: FileKind::File,
+            size: 80,
+            mtime: SystemTime::now(),
+            etag: None,
+            status: SyncStatus::Conflict,
+            cache_path: None,
+            cache_size: None,
+        }).await.unwrap()
+    }
+
+    // ── find_conflict_sibling ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_sibling_from_canonical() {
+        let (db, mount_id) = setup_db().await;
+        let canonical_inode = insert_canonical(&db, mount_id, "report.pdf", None).await;
+        let sibling_inode =
+            insert_sibling(&db, mount_id, "report.conflict.20250101T000000Z.deadbeef.pdf").await;
+
+        let canonical = db.get_by_inode(canonical_inode).await.unwrap().unwrap();
+        let found = find_conflict_sibling(&db, mount_id, &canonical).await.unwrap();
+
+        assert!(found.is_some(), "should find conflict sibling from canonical");
+        assert_eq!(found.unwrap().inode, sibling_inode);
+    }
+
+    #[tokio::test]
+    async fn find_canonical_from_sibling() {
+        let (db, mount_id) = setup_db().await;
+        let canonical_inode = insert_canonical(&db, mount_id, "report.pdf", None).await;
+        let sibling_inode =
+            insert_sibling(&db, mount_id, "report.conflict.20250101T000000Z.deadbeef.pdf").await;
+
+        let sibling = db.get_by_inode(sibling_inode).await.unwrap().unwrap();
+        let found = find_conflict_sibling(&db, mount_id, &sibling).await.unwrap();
+
+        assert!(found.is_some(), "should find canonical from sibling");
+        assert_eq!(found.unwrap().inode, canonical_inode);
+    }
+
+    // ── normalize_conflict_roles ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn normalize_from_canonical_returns_canonical_plus_sibling() {
+        let (db, mount_id) = setup_db().await;
+        let canonical_inode = insert_canonical(&db, mount_id, "doc.txt", None).await;
+        let sibling_inode =
+            insert_sibling(&db, mount_id, "doc.conflict.20250101T000000Z.deadbeef.txt").await;
+
+        let canonical = db.get_by_inode(canonical_inode).await.unwrap().unwrap();
+        let (entry, sib) =
+            normalize_conflict_roles(&db, mount_id, canonical).await.unwrap();
+
+        assert_eq!(entry.inode, canonical_inode, "entry must be the canonical");
+        assert_eq!(sib.as_ref().map(|s| s.inode), Some(sibling_inode));
+    }
+
+    #[tokio::test]
+    async fn normalize_from_sibling_swaps_to_canonical() {
+        let (db, mount_id) = setup_db().await;
+        let canonical_inode = insert_canonical(&db, mount_id, "doc.txt", None).await;
+        let sibling_inode =
+            insert_sibling(&db, mount_id, "doc.conflict.20250101T000000Z.deadbeef.txt").await;
+
+        let sibling = db.get_by_inode(sibling_inode).await.unwrap().unwrap();
+        let (entry, sib) =
+            normalize_conflict_roles(&db, mount_id, sibling).await.unwrap();
+
+        assert_eq!(entry.inode, canonical_inode,
+            "entry must be the canonical, not the sibling");
+        assert_eq!(sib.as_ref().map(|s| s.inode), Some(sibling_inode));
+    }
+
+    // ── finalize_resolution ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn finalize_resolution_removes_sibling_and_caches_canonical() {
+        let (db, mount_id) = setup_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join("report.pdf");
+        std::fs::write(&cache_file, b"remote content").unwrap();
+
+        let canonical_inode =
+            insert_canonical(&db, mount_id, "report.pdf", Some(cache_file.clone())).await;
+        let sibling_inode =
+            insert_sibling(&db, mount_id, "report.conflict.20250101T000000Z.deadbeef.pdf").await;
+
+        let canonical = db.get_by_inode(canonical_inode).await.unwrap().unwrap();
+        let sibling   = db.get_by_inode(sibling_inode).await.unwrap().unwrap();
+
+        let backend = MockBackend::default();
+        // Seed the mock: canonical must exist for stat() to succeed.
+        let backend_arc: Arc<dyn Backend> = Arc::new(backend);
+        backend_arc.upload(&cache_file, "/report.pdf", None).await.unwrap();
+        // Seed sibling so delete() doesn't error.
+        backend_arc.upload(
+            &cache_file,
+            ".stratosync-conflicts/report.conflict.20250101T000000Z.deadbeef.pdf",
+            None,
+        ).await.unwrap();
+
+        finalize_resolution(
+            &db, &*backend_arc,
+            &canonical, Some(&sibling),
+            &cache_file,
+        ).await.unwrap();
+
+        // Sibling must be gone from DB.
+        let sib_after = db.get_by_inode(sibling_inode).await.unwrap();
+        assert!(sib_after.is_none(), "sibling should be removed from DB after resolution");
+
+        // Canonical must be Cached.
+        let canon_after = db.get_by_inode(canonical_inode).await.unwrap().unwrap();
+        assert_eq!(canon_after.status, SyncStatus::Cached,
+            "canonical should be Cached after resolution");
+    }
+
+    /// Core regression: keep-remote called via the sibling's FUSE-visible name
+    /// (e.g. /mount/docs/file.conflict.…txt) should remove the sibling from DB.
+    /// Before the fix this would fail with "file not found in database" because
+    /// the sibling's remote_path is under .stratosync-conflicts/ and never
+    /// matched the FUSE path — the conflict stayed in the list forever.
+    #[tokio::test]
+    async fn finalize_after_normalize_from_sibling_clears_conflict() {
+        let (db, mount_id) = setup_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join("report.pdf");
+        std::fs::write(&cache_file, b"remote content").unwrap();
+
+        let canonical_inode =
+            insert_canonical(&db, mount_id, "report.pdf", Some(cache_file.clone())).await;
+        let sibling_inode =
+            insert_sibling(&db, mount_id, "report.conflict.20250101T000000Z.deadbeef.pdf").await;
+
+        // Simulate what happens when the user passes the sibling's FUSE path:
+        // normalize_conflict_roles is called with the sibling entry and must
+        // swap roles before finalize_resolution runs.
+        let sibling_entry = db.get_by_inode(sibling_inode).await.unwrap().unwrap();
+        let (canonical, conflict_sibling) =
+            normalize_conflict_roles(&db, mount_id, sibling_entry).await.unwrap();
+
+        assert_eq!(canonical.inode, canonical_inode,
+            "normalize must produce the canonical as ctx.entry");
+        assert_eq!(conflict_sibling.as_ref().map(|s| s.inode), Some(sibling_inode),
+            "normalize must keep sibling in conflict_sibling slot");
+
+        let backend_arc: Arc<dyn Backend> = Arc::new(MockBackend::default());
+        backend_arc.upload(&cache_file, "/report.pdf", None).await.unwrap();
+        backend_arc.upload(
+            &cache_file,
+            ".stratosync-conflicts/report.conflict.20250101T000000Z.deadbeef.pdf",
+            None,
+        ).await.unwrap();
+
+        finalize_resolution(
+            &db, &*backend_arc,
+            &canonical, conflict_sibling.as_ref(),
+            &cache_file,
+        ).await.unwrap();
+
+        // The conflict sibling must no longer appear in the DB.
+        assert!(db.get_by_inode(sibling_inode).await.unwrap().is_none(),
+            "sibling must be gone from DB — conflict no longer reported");
+
+        // Canonical must be healthy.
+        let canon = db.get_by_inode(canonical_inode).await.unwrap().unwrap();
+        assert_eq!(canon.status, SyncStatus::Cached);
+    }
+
+    /// `collect_conflict_entries` must return each sibling exactly once even
+    /// though it matches BOTH the status='conflict' and name LIKE conditions.
+    #[tokio::test]
+    async fn collect_conflict_entries_no_duplicates() {
+        let (db, mount_id) = setup_db().await;
+        insert_canonical(&db, mount_id, "file.txt", None).await;
+        insert_sibling(&db, mount_id, "file.conflict.20250101T000000Z.deadbeef.txt").await;
+
+        let entries = collect_conflict_entries(&db, mount_id).await.unwrap();
+        assert_eq!(entries.len(), 1, "sibling should appear exactly once, got: {entries:?}");
+    }
 }

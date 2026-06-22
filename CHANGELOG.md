@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.16] - 2026-06-22
+
+### Fixed
+- **`conflicts keep-remote` on a no-local conflict left it still
+  reported.** Three interlocking bugs:
+  1. `conflicts list` ran two separate queries (`status='conflict'` and
+     `name LIKE '%.conflict.%'`) and printed the same sibling entry
+     **twice** (once as "CONFLICT", once as "FILE") without deduplication.
+     Combined into a single query in `collect_conflict_entries`; `list`
+     now deduplicate by inode.
+  2. `resolve_path` looked up the path exclusively via `remote_path`,
+     but conflict siblings are stored under `.stratosync-conflicts/…` so
+     their FUSE-visible path (e.g. `docs/file.conflict.…txt`) never
+     matched. Passing the sibling path now falls back to a name-based
+     lookup when `name LIKE '%.conflict.%'` and the remote-path search
+     found nothing.
+  3. Role inversion: if `resolve_path` found a conflict sibling entry,
+     `finalize_resolution` treated it as the canonical — deleting the
+     actual canonical (data loss) and leaving the sibling in the DB.
+     New `normalize_conflict_roles` always ensures `ctx.entry` is the
+     canonical and `ctx.conflict_sibling` is the `.conflict.*` file,
+     regardless of which path the user supplied. `finalize_resolution`
+     now takes individual parameters instead of `&ResolveContext` so it
+     can be unit-tested with `MockBackend`.
+  - `conflicts list` now shows "resolve via: `/mount/path/canonical`"
+    for each conflict so the user can see which path to pass to
+    `keep-remote`/`keep-local`.
+
 ## [0.13.0-beta.15] - 2026-06-17
 
 ### Fixed
