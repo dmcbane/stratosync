@@ -153,6 +153,13 @@ fn parse_rclone_error(stderr: &str) -> String {
         let trimmed = line.trim();
         if trimmed.starts_with('{') {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                // `--stats=1s` stats lines are logged at the same level
+                // as errors and usually come last; their `msg` is the
+                // progress summary ("0 B / 0 B, -, 0 B/s, ETA -"), never
+                // the failure reason.
+                if parsed.get("stats").is_some() {
+                    continue;
+                }
                 if let Some(msg) = parsed.get("msg").and_then(|v| v.as_str()) {
                     return msg.to_string();
                 }
@@ -716,7 +723,23 @@ impl Backend for RcloneBackend {
         let rp = self.rpath(remote);
         let offset_str = offset.to_string();
         let count_str = len.to_string();
-        self.run(&["cat", &rp, "--offset", &offset_str, "--count", &count_str]).await
+        // A range read is a transfer, not a metadata call: run it under
+        // the stall watchdog (fed by `--stats=1s`) rather than the fixed
+        // wall-clock `timeout`, which killed slow-but-alive reads on a
+        // throttled remote. Nobody consumes the byte count, so the
+        // progress receiver is dropped up front.
+        let (progress, _) = tokio::sync::mpsc::channel(1);
+        self.run_with_progress(
+            &[
+                "cat", &rp, "--offset", &offset_str, "--count", &count_str,
+                "--stats=1s",
+                "--stats-one-line",
+                "--stats-log-level=ERROR",
+                "--timeout", "120s",
+                "--contimeout", "60s",
+            ],
+            progress,
+        ).await
     }
 
     /// Same as `download` but pipes byte-progress through the channel.

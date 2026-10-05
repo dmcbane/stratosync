@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.20] - 2026-10-04
+
+### Fixed
+- **Range reads were killed by the fixed 120 s timeout.** The
+  `rclone cat --offset/--count` read FUSE uses to serve the start of an
+  unhydrated file still ran under the wall-clock metadata timeout, so on
+  a throttled remote even a 3 MB file failed repeatedly ("range download
+  failed … rclone timed out") and its reader stalled. Range reads now
+  use the transfer stall watchdog (`--stats=1s`; aborted only after
+  `stall_timeout` with no progress), plus rclone's own
+  `--timeout`/`--contimeout` backstops.
+- **rclone errors surfaced as a progress line** such as
+  `read: not found: 0 B / 0 B, -, 0 B/s, ETA -`. With `--stats=1s` the
+  last JSON log line is usually a stats line; the error parser now skips
+  stats lines and reports the actual failure.
+
 ## [0.13.0-beta.19] - 2026-10-04
 
 ### Fixed
