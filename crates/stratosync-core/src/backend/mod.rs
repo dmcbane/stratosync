@@ -201,13 +201,32 @@ fn parse_rclone_error(stderr: &str) -> String {
 ///    We extract the first quantity (left of the `/`), reusing the
 ///    project's `parse_size` so byte/KiB/MiB/GiB/TiB units are
 ///    handled the same way as the rest of the config pipeline.
+/// `(stats.bytes, stats.totalBytes)` from a JSON-log stats line.
+fn parse_json_stats(line: &str) -> Option<(u64, Option<u64>)> {
+    let parsed: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let stats = parsed.get("stats")?;
+    Some((stats.get("bytes")?.as_u64()?, stats.get("totalBytes").and_then(|t| t.as_u64())))
+}
+
+/// Does this stderr line show the transfer is alive? rclone with
+/// `--stats=1s` prints a stats line every second even when nothing
+/// moves, so a stats line only counts when the byte count changed (a
+/// change, not an increase: a retry restarts from 0) or every byte is
+/// already sent (the provider may take minutes to commit a large
+/// upload). Any other log line is rclone doing something, so it counts.
+fn stderr_line_shows_liveness(line: &str, last_bytes: &mut Option<u64>) -> bool {
+    let Some((bytes, total)) = parse_json_stats(line) else { return true };
+    let changed = *last_bytes != Some(bytes);
+    *last_bytes = Some(bytes);
+    changed || total.is_some_and(|t| t > 0 && bytes >= t)
+}
+
 pub(crate) fn parse_rclone_progress_line(line: &str) -> Option<u64> {
     let trimmed = line.trim_start();
     if trimmed.starts_with('{') {
         // JSON-log mode. Read stats.bytes; bail on anything that
         // doesn't have it (other log entries like errors and notes).
-        let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-        return parsed.get("stats")?.get("bytes")?.as_u64();
+        return parse_json_stats(trimmed).map(|(bytes, _)| bytes);
     }
     // Plain-text fallback.
     let (_, after) = line.split_once("Transferred:")?;
@@ -555,9 +574,9 @@ impl RcloneBackend {
         });
 
         // Liveness signal shared with the stall watchdog below. The stderr
-        // task bumps it on every line; with `--stats=1s` rclone emits a
-        // stats line each second while the transfer is alive, so a counter
-        // that stops advancing means the transfer is wedged.
+        // task bumps it whenever a line shows real progress (see
+        // `stderr_line_shows_liveness`); a counter that stops advancing
+        // means the transfer is wedged.
         use std::sync::atomic::{AtomicU64, Ordering};
         let activity = std::sync::Arc::new(AtomicU64::new(0));
         let activity_stderr = std::sync::Arc::clone(&activity);
@@ -567,8 +586,11 @@ impl RcloneBackend {
         let stderr_task = tokio::spawn(async move {
             let mut full = String::new();
             let mut lines = BufReader::new(stderr).lines();
+            let mut last_bytes = None;
             while let Ok(Some(line)) = lines.next_line().await {
-                activity_stderr.fetch_add(1, Ordering::Relaxed);
+                if stderr_line_shows_liveness(&line, &mut last_bytes) {
+                    activity_stderr.fetch_add(1, Ordering::Relaxed);
+                }
                 if let Some(bytes) = parse_rclone_progress_line(&line) {
                     // Channel closed = consumer gone; drop the value.
                     let _ = progress.try_send(bytes);

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.22] - 2026-10-04
+
+### Fixed
+- **The transfer stall watchdog could never fire.** It treated every
+  rclone stderr line as liveness, but with `--stats=1s` rclone prints a
+  stats line every second even when no bytes move — so a stuck upload,
+  download or range read ran until rclone itself gave up. A stats line
+  now counts only when the byte count changes, or when every byte is
+  already sent (the provider may take minutes to commit a large upload;
+  aborting that would restart it from zero). Other log lines still count.
+- **`status` with several busy mounts could still exceed the
+  dashboard's 3 s fetch timeout.** Upload-queue snapshots were requested
+  one mount at a time, each allowed 1 s. They are now requested
+  concurrently under a single 1 s limit.
+
 ## [0.13.0-beta.21] - 2026-10-04
 
 ### Fixed

@@ -29,3 +29,8 @@ the loop was busy for minutes.
 Conflict resolution still runs inline in the queue loop, so uploads
 stall while one resolves. Moving it off the loop needs a per-inode
 guard against starting a new upload of the same file mid-resolve.
+
+## Addendum (beta.22)
+The per-mount 1 s snapshot limit was applied sequentially, so three busy
+mounts could still exceed the client's 3 s timeout. Snapshots are now
+requested concurrently (`snapshot_all_queues`).

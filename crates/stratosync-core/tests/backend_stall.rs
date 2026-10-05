@@ -165,3 +165,38 @@ exit 3
         other => panic!("expected NotFound with the real message, got {other:?}"),
     }
 }
+
+/// Real rclone with `--stats=1s` prints a stats line every second even
+/// when nothing moves (observed live: `"bytes":0` lines from a stuck
+/// read). Counting every stderr line as liveness meant the watchdog
+/// could never fire. Unchanged byte counts are not progress.
+#[tokio::test]
+async fn stats_lines_without_byte_progress_are_a_stall() {
+    let body = r#"#!/usr/bin/env bash
+for i in $(seq 1 25); do
+  printf '{"level":"error","msg":"x","stats":{"bytes":0,"totalBytes":10000}}\n' >&2
+  sleep 0.2
+done
+exit 0
+"#;
+    match run_download(body).await {
+        Err(SyncError::Network(msg)) => assert!(msg.contains("stall"), "{msg:?}"),
+        other => panic!("expected Network(stall) for a transfer stuck at 0 bytes, got {other:?}"),
+    }
+}
+
+/// After the last byte, rclone can wait a long time for the provider to
+/// commit a large upload. That is not a stall — killing it restarts the
+/// transfer from zero (the beta.16 613-retry loop).
+#[tokio::test]
+async fn finalizing_after_all_bytes_sent_is_not_a_stall() {
+    let body = r#"#!/usr/bin/env bash
+for i in $(seq 1 15); do
+  printf '{"level":"error","msg":"x","stats":{"bytes":10000,"totalBytes":10000}}\n' >&2
+  sleep 0.2
+done
+exit 0
+"#;
+    let res = run_download(body).await;
+    assert!(res.is_ok(), "finalizing transfer must not be killed, got {res:?}");
+}

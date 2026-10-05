@@ -46,9 +46,18 @@ impl DaemonState {
 
     /// Collect a full status snapshot for every mount.
     pub async fn snapshot(&self) -> DaemonStatus {
+        // Ask every upload queue at once: sequential requests let several
+        // busy mounts add up past the dashboard's own fetch timeout.
+        let queues = snapshot_all_queues(
+            self.mounts.iter().map(|m| {
+                let q = Arc::clone(&m.upload_queue);
+                async move { q.snapshot().await }
+            }).collect(),
+            QUEUE_SNAPSHOT_TIMEOUT,
+        ).await;
         let mut mounts = Vec::with_capacity(self.mounts.len());
-        for m in &self.mounts {
-            mounts.push(collect_mount_status(m).await);
+        for (m, queue) in self.mounts.iter().zip(queues) {
+            mounts.push(collect_mount_status(m, queue).await);
         }
         DaemonStatus {
             version:     env!("CARGO_PKG_VERSION").to_string(),
@@ -76,16 +85,32 @@ async fn queue_snapshot_or_busy(
     }
 }
 
-async fn collect_mount_status(m: &MountHandle) -> MountStatus {
+/// Snapshot several upload queues concurrently, each bounded by `limit`,
+/// so the total wait is one `limit` regardless of how many are busy.
+async fn snapshot_all_queues<F>(snapshots: Vec<F>, limit: Duration) -> Vec<QueueStatus>
+where
+    F: Future<Output = QueueStatus> + Send + 'static,
+{
+    let handles: Vec<_> = snapshots.into_iter()
+        .map(|f| tokio::spawn(queue_snapshot_or_busy(f, limit)))
+        .collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        out.push(h.await.unwrap_or_else(|e| {
+            tracing::warn!("upload queue snapshot task failed: {e}");
+            QueueStatus { busy: true, ..Default::default() }
+        }));
+    }
+    out
+}
+
+async fn collect_mount_status(m: &MountHandle, mut queue: QueueStatus) -> MountStatus {
     let cache = CacheStatus {
         used_bytes:   m.db.total_cache_bytes(m.mount_id).await.unwrap_or(0),
         quota_bytes:  m.quota_bytes,
         pinned_count: m.db.pinned_count(m.mount_id).await.unwrap_or(0),
     };
 
-    let mut queue = queue_snapshot_or_busy(
-        m.upload_queue.snapshot(), QUEUE_SNAPSHOT_TIMEOUT,
-    ).await;
 
     let poller = m.poller_state.read().await.clone();
 
@@ -152,5 +177,18 @@ mod tests {
         let s = queue_snapshot_or_busy(ready, Duration::from_secs(1)).await;
         assert!(!s.busy);
         assert_eq!(s.pending, 7);
+    }
+    /// Three busy mounts used to cost 3 × the per-queue limit, reaching
+    /// the dashboard's own 3 s fetch timeout — so it reported "did not
+    /// respond" instead of "busy". All snapshots share one deadline.
+    #[tokio::test]
+    async fn busy_snapshots_across_mounts_share_one_deadline() {
+        let started = std::time::Instant::now();
+        let futs: Vec<_> = (0..3).map(|_| std::future::pending::<QueueStatus>()).collect();
+        let got = snapshot_all_queues(futs, Duration::from_millis(200)).await;
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|q| q.busy));
+        assert!(started.elapsed() < Duration::from_millis(500),
+            "took {:?}; snapshots must run concurrently", started.elapsed());
     }
 }
