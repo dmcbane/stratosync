@@ -177,6 +177,8 @@ impl TryFrom<RcloneLsJsonEntry> for RemoteMetadata {
             .and_then(|h| {
                 h.get("sha1").or_else(|| h.get("SHA-1"))
                     .or_else(|| h.get("md5")).or_else(|| h.get("MD5"))
+                    // OneDrive: rclone exposes only quickxor.
+                    .or_else(|| h.get("quickxor"))
                     .cloned()
             })
             .or_else(|| e.id.clone());
@@ -287,5 +289,39 @@ pub enum SyncError {
 impl SyncError {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Network(_) | Self::Transient(_) | Self::QuotaExceeded)
+    }
+}
+
+#[cfg(test)]
+mod lsjson_etag_tests {
+    use super::*;
+
+    fn entry(hashes: &[(&str, &str)]) -> RcloneLsJsonEntry {
+        RcloneLsJsonEntry {
+            path: "f".into(), name: "f".into(), size: 1, mime_type: None,
+            mod_time: "2024-01-01T00:00:00Z".into(), is_dir: false,
+            hashes: Some(hashes.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+            id: Some("4139BC84D0721EB5#4139BC84D0721EB5!16481".into()),
+        }
+    }
+
+    /// OneDrive lsjson only offers `quickxor`. Without picking it, the
+    /// etag fell back to the item ID, which says nothing about content.
+    #[test]
+    fn onedrive_quickxor_is_used_instead_of_item_id() {
+        let m = RemoteMetadata::try_from(entry(&[("quickxor", "043b02bc1c911f62aa943274ad2da35c3ea1dd26")])).unwrap();
+        assert_eq!(m.etag.as_deref(), Some("043b02bc1c911f62aa943274ad2da35c3ea1dd26"));
+    }
+
+    /// gdrive's preference must not change: stored sha1 etags are
+    /// compared verbatim by the full-listing poller, so switching the
+    /// family would mark every cached row stale.
+    #[test]
+    fn gdrive_keeps_sha1_preference() {
+        let m = RemoteMetadata::try_from(entry(&[
+            ("md5", "8cdbe53eaf2dcf885824a5c1563e2a4a"),
+            ("sha1", "847bfc9ae8a6ad75e03bbda5b0200194d2be6049"),
+        ])).unwrap();
+        assert_eq!(m.etag.as_deref(), Some("847bfc9ae8a6ad75e03bbda5b0200194d2be6049"));
     }
 }

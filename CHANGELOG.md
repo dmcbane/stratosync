@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.21] - 2026-10-04
+
+### Fixed
+- **Every upload was treated as a conflict, and editing a binary file
+  created a spurious `.conflict` copy.** The stored ETag and the one the
+  upload precondition read back were different spellings of different
+  hashes: gdrive's delta poller stored `md5Checksum` while rclone `stat`
+  preferred sha1 (and `list` stored the Drive item ID); OneDrive's delta
+  stored Graph's uppercase `sha1Hash` while rclone — which only sees
+  `quickxor` on OneDrive — fell back to the item ID. Identical content
+  then healed via the resolver's byte comparison (at the cost of a second
+  download), but a genuinely edited photo/PDF/Office file fell through to
+  keep-both.
+  - The upload precondition now matches the stored ETag against *every*
+    content hash the remote lists, normalized (case-insensitive hex;
+    standard or URL-safe base64 decoded to hex). Item IDs never count as
+    a match when real hashes exist. New `stratosync_core::hashes`.
+  - OneDrive delta stores `quickXorHash` as lowercase hex (rclone's
+    spelling); rclone listings pick `quickxor` instead of falling back to
+    the item ID; `list` requests `--hash`. gdrive's sha1 preference is
+    unchanged so stored sha1 ETags keep matching full listings.
+- Rows still holding a legacy item ID or Graph sha1 ETag go through the
+  conflict resolver once: unchanged files refresh to a content hash; an
+  edited binary among them can still produce one conflict copy.
+
 ## [0.13.0-beta.20] - 2026-10-04
 
 ### Fixed

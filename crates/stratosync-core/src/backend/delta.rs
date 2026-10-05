@@ -812,10 +812,9 @@ impl DeltaProvider for OneDriveDelta {
                     .map(|dt| SystemTime::from(dt))
                     .unwrap_or(SystemTime::UNIX_EPOCH);
 
-                // OneDrive provides SHA-1 or QuickXorHash for content detection
                 let etag = item.file.as_ref()
                     .and_then(|f| f.hashes.as_ref())
-                    .and_then(|h| h.sha1_hash.clone().or_else(|| h.quick_xor_hash.clone()));
+                    .and_then(onedrive_content_etag);
 
                 let meta = RemoteMetadata {
                     path,
@@ -916,6 +915,17 @@ struct OneDriveHashes {
     sha1_hash: Option<String>,
     #[serde(rename = "quickXorHash")]
     quick_xor_hash: Option<String>,
+}
+
+/// Content ETag for a OneDrive item, in the spelling rclone reports for
+/// the same file. rclone only exposes `quickxor` on OneDrive (as lowercase
+/// hex), while Graph sends `quickXorHash` as base64 and `sha1Hash` as
+/// uppercase hex — storing Graph's form verbatim meant no later
+/// comparison against rclone's view could ever match.
+fn onedrive_content_etag(h: &OneDriveHashes) -> Option<String> {
+    h.quick_xor_hash.as_deref()
+        .or(h.sha1_hash.as_deref())
+        .and_then(crate::hashes::hash_to_hex)
 }
 
 // ── Detect provider type from rclone remote name ─────────────────────────────
@@ -1234,6 +1244,26 @@ mod tests {
         assert!(item.deleted.is_none());
         let hashes = item.file.as_ref().unwrap().hashes.as_ref().unwrap();
         assert_eq!(hashes.sha1_hash.as_deref(), Some("aabbccdd"));
+    }
+
+    /// rclone can only see `quickxor` on OneDrive (no sha1 on personal
+    /// drives), so the delta-stored ETag must be quickxor in rclone's
+    /// spelling (lowercase hex), not Graph's base64 — otherwise no upload
+    /// precondition or full-listing comparison can ever match it.
+    #[test]
+    fn onedrive_etag_prefers_quickxor_as_lowercase_hex() {
+        let h = OneDriveHashes {
+            sha1_hash:      Some("847BFC9AE8A6AD75E03BBDA5B0200194D2BE6049".into()),
+            quick_xor_hash: Some("U7+DihnRkOTG+YLW135a4acY6YQ=".into()),
+        };
+        assert_eq!(onedrive_content_etag(&h).as_deref(),
+                   Some("53bf838a19d190e4c6f982d6d77e5ae1a718e984"));
+        let sha1_only = OneDriveHashes {
+            sha1_hash: Some("847BFC9AE8A6AD75E03BBDA5B0200194D2BE6049".into()),
+            quick_xor_hash: None,
+        };
+        assert_eq!(onedrive_content_etag(&sha1_only).as_deref(),
+                   Some("847bfc9ae8a6ad75e03bbda5b0200194d2be6049"));
     }
 
     #[test]

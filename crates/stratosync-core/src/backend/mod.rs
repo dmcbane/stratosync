@@ -662,6 +662,44 @@ impl RcloneBackend {
         }
     }
 
+    /// `if_match` precondition for uploads. The stored ETag may be any
+    /// spelling of any content hash (gdrive delta stores md5, `stat`
+    /// prefers sha1; Graph sends uppercase sha1 or base64 quickxor while
+    /// rclone reports hex), so compare it against *every* hash the remote
+    /// lists, normalized — not only the one `stat` picks as its etag.
+    /// Exact equality against that single value made every upload a
+    /// conflict. Remotes with no content hashes (Google-native docs) keep
+    /// the plain etag comparison.
+    async fn check_if_match(&self, remote: &str, expected: &str) -> Result<(), SyncError> {
+        let rp = self.rpath(remote);
+        let bytes = match self.run(&["lsjson", "--no-modtime=false", "--hash", &rp]).await {
+            Ok(b) => b,
+            // File doesn't exist remotely yet — new file, safe to upload.
+            Err(SyncError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let entries: Vec<RcloneLsJsonEntry> = serde_json::from_slice(&bytes)
+            .map_err(|e| SyncError::Fatal(format!("lsjson parse error: {e}")))?;
+        let Some(entry) = entries.into_iter().next() else { return Ok(()) };
+
+        let hashes = entry.hashes.clone().unwrap_or_default();
+        let meta = RemoteMetadata::try_from(entry)
+            .map_err(|e| SyncError::Fatal(e.to_string()))?;
+        let matches = if hashes.is_empty() {
+            meta.etag.as_deref().is_none_or(|remote_etag| remote_etag == expected)
+        } else {
+            crate::hashes::etag_matches_hashes(expected, &hashes)
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(SyncError::Conflict {
+                local:  Some(expected.to_owned()),
+                remote: meta.etag,
+            })
+        }
+    }
+
     /// Parse rclone lsjson output into `Vec<RemoteMetadata>`.
     fn parse_lsjson(bytes: &[u8]) -> Result<Vec<RemoteMetadata>, SyncError> {
         let entries: Vec<RcloneLsJsonEntry> = serde_json::from_slice(bytes)
@@ -684,7 +722,9 @@ impl Backend for RcloneBackend {
 
     async fn list(&self, path: &str) -> Result<Vec<RemoteMetadata>, SyncError> {
         let rp    = self.rpath(path);
-        let bytes = self.run(&["lsjson", &rp]).await?;
+        // --hash: without it every row stores the item ID as its etag,
+        // which can never prove the remote unchanged at upload time.
+        let bytes = self.run(&["lsjson", "--hash", &rp]).await?;
         Self::parse_lsjson(&bytes)
     }
 
@@ -787,23 +827,8 @@ impl Backend for RcloneBackend {
         let rp = self.rpath(remote);
 
         // Phase 1: if_match check — fetch remote ETag before uploading
-        if let Some(expected_etag) = if_match {
-            match self.stat(remote).await {
-                Ok(meta) => {
-                    if let Some(ref remote_etag) = meta.etag {
-                        if remote_etag != expected_etag {
-                            return Err(SyncError::Conflict {
-                                local:  Some(expected_etag.to_owned()),
-                                remote: Some(remote_etag.clone()),
-                            });
-                        }
-                    }
-                }
-                Err(SyncError::NotFound(_)) => {
-                    // File doesn't exist remotely yet — new file, safe to upload
-                }
-                Err(e) => return Err(e),
-            }
+        if let Some(expected) = if_match {
+            self.check_if_match(remote, expected).await?;
         }
 
         // Phase 2: upload
@@ -840,21 +865,8 @@ impl Backend for RcloneBackend {
             .ok_or_else(|| SyncError::Fatal("non-UTF8 local path".into()))?;
         let rp = self.rpath(remote);
 
-        if let Some(expected_etag) = if_match {
-            match self.stat(remote).await {
-                Ok(meta) => {
-                    if let Some(ref remote_etag) = meta.etag {
-                        if remote_etag != expected_etag {
-                            return Err(SyncError::Conflict {
-                                local:  Some(expected_etag.to_owned()),
-                                remote: Some(remote_etag.clone()),
-                            });
-                        }
-                    }
-                }
-                Err(SyncError::NotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
+        if let Some(expected) = if_match {
+            self.check_if_match(remote, expected).await?;
         }
 
         self.run_with_progress(
