@@ -14,7 +14,7 @@ use stratosync_core::{
     base_store::BaseStore,
     config::{default_data_dir, MountConfig},
     state::StateDb,
-    types::FileEntry,
+    types::{FileEntry, Inode},
 };
 
 pub async fn list(config_path: &Path, user_path: &Path) -> Result<()> {
@@ -79,18 +79,7 @@ pub async fn restore(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating cache dir {parent:?}"))?;
     }
-    let written = std::fs::copy(&blob, &cache_path)
-        .with_context(|| format!("copy blob {blob:?} -> {cache_path:?}"))?;
-
-    // Mark Dirty AND record the cache_path. When the entry was never
-    // hydrated, `pick_or_synthesize_cache_path` returned a synthesized
-    // path that isn't yet on the DB row — `set_status(Dirty)` alone
-    // would leave `cache_path = NULL`, the same poisoned shape that
-    // setattr/truncate used to produce. The migration-0010 trigger
-    // would now reject that UPDATE outright; using
-    // `set_dirty_with_cache_path` records both fields atomically.
-    ctx.db.set_dirty_with_cache_path(ctx.entry.inode, &cache_path, written).await
-        .context("marking restored entry Dirty")?;
+    install_restored_content(&ctx.db, ctx.entry.inode, &blob, &cache_path).await?;
 
     println!("Restored version #{index} of '{}' (recorded {}).",
         ctx.entry.remote_path, format_ts(v.recorded_at));
@@ -147,6 +136,39 @@ async fn resolve(config_path: &Path, user_path: &Path) -> Result<VersionCtx> {
     Ok(VersionCtx { db, entry, mount })
 }
 
+/// Put the restored bytes at `cache_path` and mark the row dirty so the
+/// daemon uploads them. The CLI can't reach the daemon's upload queue;
+/// the daemon's cache-dir watcher is the trigger, and it only queues
+/// rows that are already `dirty` when the event arrives. So: copy into
+/// a dot-prefixed temp sibling (the watcher ignores dotfiles), mark the
+/// row dirty, THEN rename into place — the rename event is guaranteed
+/// to see `dirty`.
+async fn install_restored_content(
+    db: &StateDb, inode: Inode, blob: &Path, cache_path: &Path,
+) -> Result<u64> {
+    let name = cache_path.file_name()
+        .ok_or_else(|| anyhow::anyhow!("cache path has no file name: {cache_path:?}"))?;
+    let tmp = cache_path.with_file_name(
+        format!(".{}.restore.tmp", name.to_string_lossy()));
+    let written = std::fs::copy(blob, &tmp)
+        .with_context(|| format!("copy blob {blob:?} -> {tmp:?}"))?;
+
+    // Mark Dirty AND record the cache_path. When the entry was never
+    // hydrated, `pick_or_synthesize_cache_path` returned a synthesized
+    // path that isn't yet on the DB row — `set_status(Dirty)` alone
+    // would leave `cache_path = NULL`, the same poisoned shape that
+    // setattr/truncate used to produce. The migration-0010 trigger
+    // would now reject that UPDATE outright; using
+    // `set_dirty_with_cache_path` records both fields atomically.
+    if let Err(e) = db.set_dirty_with_cache_path(inode, cache_path, written).await {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("marking restored entry Dirty");
+    }
+    std::fs::rename(&tmp, cache_path)
+        .with_context(|| format!("rename {tmp:?} -> {cache_path:?}"))?;
+    Ok(written)
+}
+
 fn pick_or_synthesize_cache_path(entry: &FileEntry, cache_dir: &Path) -> PathBuf {
     if let Some(cp) = &entry.cache_path { return cp.clone(); }
     // Reconstruct from remote_path. Drop the leading '/' if present.
@@ -172,4 +194,53 @@ fn format_ts(unix: i64) -> String {
 
 fn short_hash(h: &str) -> &str {
     &h[..h.len().min(12)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+    use stratosync_core::state::NewFileEntry;
+    use stratosync_core::types::{FileKind, SyncStatus};
+
+    /// The daemon's cache watcher only queues uploads for rows that are
+    /// already `dirty` when the event is processed, so the restored
+    /// bytes must land via a dot-prefixed temp file (ignored by the
+    /// watcher) that is renamed into place only AFTER the row is dirty.
+    #[tokio::test]
+    async fn install_restored_content_marks_dirty_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::in_memory().unwrap();
+        db.migrate().await.unwrap();
+        let mid = db.upsert_mount("t", "mock:/", "/mnt/t",
+            dir.path().to_str().unwrap(), 1 << 30, 60).await.unwrap();
+        let root = db.insert_root(&NewFileEntry {
+            mount_id: mid, parent: 0, name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0, mtime: SystemTime::UNIX_EPOCH,
+            etag: None, status: SyncStatus::Remote, cache_path: None, cache_size: None,
+        }).await.unwrap();
+        let cache_path = dir.path().join("docs/note.md");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, b"current").unwrap();
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id: mid, parent: root, name: "note.md".into(),
+            remote_path: "docs/note.md".into(), kind: FileKind::File, size: 7,
+            mtime: SystemTime::UNIX_EPOCH, etag: Some("e".into()),
+            status: SyncStatus::Cached, cache_path: Some(cache_path.clone()),
+            cache_size: Some(7),
+        }).await.unwrap();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"older version").unwrap();
+
+        let written = install_restored_content(&db, inode, &blob, &cache_path).await.unwrap();
+
+        assert_eq!(written, 13);
+        assert_eq!(std::fs::read(&cache_path).unwrap(), b"older version");
+        let e = db.get_by_inode(inode).await.unwrap().unwrap();
+        assert_eq!(e.status, SyncStatus::Dirty);
+        assert_eq!(e.cache_path, Some(cache_path.clone()));
+        let leftovers: Vec<_> = std::fs::read_dir(cache_path.parent().unwrap()).unwrap()
+            .map(|d| d.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "temp file must be renamed away: {leftovers:?}");
+    }
 }

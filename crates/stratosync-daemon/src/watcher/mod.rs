@@ -109,7 +109,14 @@ async fn handle_event(
                 if entry.status == SyncStatus::Conflict {
                     continue; // conflict files must not be re-uploaded
                 }
-                if matches!(entry.status, SyncStatus::Cached | SyncStatus::Dirty) {
+                // Only `dirty` rows carry a local edit. A `cached` row's
+                // events are the daemon's own writes — chiefly hydration
+                // renaming a finished download into place — and queueing
+                // those re-uploaded every file that was merely read.
+                // FUSE writes mark the row dirty (and enqueue) themselves;
+                // this path remains for out-of-process writers such as
+                // `stratosync versions restore`.
+                if entry.status == SyncStatus::Dirty {
                     debug!(inode = entry.inode, path = ?path, event = ?event.kind, "fs event");
                     upload_queue.enqueue(UploadTrigger::Write { inode: entry.inode }).await;
                 }
@@ -119,5 +126,87 @@ async fn handle_event(
             }
             Err(e) => warn!(path = ?path, "db lookup error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::SystemTime;
+    use notify::event::{ModifyKind, RenameMode, DataChange, CreateKind};
+    use stratosync_core::{
+        backend::mock::MockBackend,
+        base_store::BaseStore,
+        config::SyncConfig,
+        state::NewFileEntry,
+        types::{FileKind, Inode},
+        Backend,
+    };
+
+    /// A queue with a long debounce: an enqueue shows up as `pending`
+    /// in the snapshot and never actually runs during the test.
+    async fn setup(status: SyncStatus) -> (Arc<StateDb>, Arc<UploadQueue>, u32, Inode, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(StateDb::in_memory().unwrap());
+        db.migrate().await.unwrap();
+        let mount_id = db.upsert_mount(
+            "test", "mock:/", "/mnt/test",
+            dir.path().to_str().unwrap(), 5 << 30, 60,
+        ).await.unwrap();
+        let root = db.insert_root(&NewFileEntry {
+            mount_id, parent: 0, name: "/".into(), remote_path: "/".into(),
+            kind: FileKind::Directory, size: 0, mtime: SystemTime::UNIX_EPOCH,
+            etag: None, status: SyncStatus::Remote,
+            cache_path: None, cache_size: None,
+        }).await.unwrap();
+        let inode = db.insert_file(&NewFileEntry {
+            mount_id, parent: root, name: "photo.jpg".into(),
+            remote_path: "Pictures/photo.jpg".into(),
+            kind: FileKind::File, size: 3, mtime: SystemTime::UNIX_EPOCH,
+            etag: Some("etag-1".into()), status,
+            cache_path: Some(dir.path().join("Pictures/photo.jpg")),
+            cache_size: Some(3),
+        }).await.unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::default());
+        let queue = Arc::new(UploadQueue::new(
+            mount_id, Arc::clone(&db), backend,
+            Arc::new(BaseStore::new(dir.path().join(".bases")).unwrap()),
+            Arc::new(SyncConfig::default()),
+            Duration::from_secs(600), Duration::from_secs(600), 1, None, 0,
+        ));
+        (db, queue, mount_id, inode, dir)
+    }
+
+    async fn fire(kind: EventKind, cache_dir: &Path, db: &Arc<StateDb>,
+                  queue: &Arc<UploadQueue>, mount_id: u32) {
+        let ev = Event::new(kind).add_path(cache_dir.join("Pictures/photo.jpg"));
+        handle_event(ev, mount_id, cache_dir, db, queue, &GlobSet::empty()).await;
+    }
+
+    /// Live bug: hydration downloads to `.meta/partial/*.tmp`, renames
+    /// into the cache, then marks the row `cached`. The watcher saw the
+    /// rename as a Modify on a `cached` row and queued an upload — so
+    /// every file *read* through the mount was re-uploaded (and, via the
+    /// conflict resolver, downloaded a second time). A cached row has no
+    /// recorded local edit; the event is the daemon's own write.
+    #[tokio::test]
+    async fn hydration_rename_into_cache_does_not_enqueue_upload() {
+        let (db, queue, mid, _ino, dir) = setup(SyncStatus::Cached).await;
+        fire(EventKind::Modify(ModifyKind::Name(RenameMode::To)), dir.path(), &db, &queue, mid).await;
+        fire(EventKind::Create(CreateKind::File), dir.path(), &db, &queue, mid).await;
+        fire(EventKind::Modify(ModifyKind::Data(DataChange::Any)), dir.path(), &db, &queue, mid).await;
+        assert_eq!(queue.snapshot().await.pending, 0,
+            "events on a cached (unmodified) file must not queue an upload");
+    }
+
+    /// The watcher is still the only upload trigger for writers outside
+    /// the daemon process — `stratosync versions restore` writes the
+    /// cache file and marks the row dirty, then relies on this path.
+    #[tokio::test]
+    async fn modify_on_dirty_row_still_enqueues_upload() {
+        let (db, queue, mid, _ino, dir) = setup(SyncStatus::Dirty).await;
+        fire(EventKind::Modify(ModifyKind::Data(DataChange::Any)), dir.path(), &db, &queue, mid).await;
+        assert_eq!(queue.snapshot().await.pending, 1);
     }
 }

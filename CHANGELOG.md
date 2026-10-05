@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.18] - 2026-10-04
+
+### Fixed
+- **Every file read through the mount was re-uploaded.** Hydration
+  renames a finished download into the cache and marks the row
+  `cached`; the cache-dir watcher treated that rename as a local edit
+  and queued an upload. The upload then hit an ETag mismatch, so the
+  conflict resolver downloaded the file *again* to compare bytes. A
+  read-only `rsync`/`cp` out of the mount (or a desktop indexer such as
+  Baloo crawling it) cost ~3 transfers per file and triggered OneDrive
+  throttling (`activityLimitReached`). The watcher now queues uploads
+  only for `dirty` rows. FUSE writes already mark rows dirty and
+  enqueue themselves.
+- `stratosync versions restore` now writes the restored bytes to a
+  dot-prefixed temp file, marks the row dirty, then renames into place,
+  so the daemon's watcher always observes the row as dirty and uploads
+  it (previously a copy-then-mark race could be missed).
+
 ## [0.13.0-beta.17] - 2026-10-04
 
 ### Fixed
