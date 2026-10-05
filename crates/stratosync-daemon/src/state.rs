@@ -4,14 +4,15 @@
 //! `snapshot()` walks every mount and produces a `DaemonStatus` suitable
 //! for serialization over the socket.
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::future::Future;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use libc::c_int;
 use tokio::sync::{oneshot, RwLock};
 
 use stratosync_core::{
-    ipc::{CacheStatus, DaemonStatus, HydrationStatus, MountStatus, PollerStatus},
+    ipc::{CacheStatus, DaemonStatus, HydrationStatus, MountStatus, PollerStatus, QueueStatus},
     state::StateDb,
     types::{Inode, SyncStatus},
 };
@@ -58,6 +59,23 @@ impl DaemonState {
     }
 }
 
+/// How long `status` waits for the upload loop to answer a snapshot.
+/// The loop runs conflict resolution inline, so it can be busy for as
+/// long as a full download takes; status must not inherit that latency.
+const QUEUE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn queue_snapshot_or_busy(
+    snapshot: impl Future<Output = QueueStatus>, limit: Duration,
+) -> QueueStatus {
+    match tokio::time::timeout(limit, snapshot).await {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::debug!(?limit, "upload queue snapshot timed out — reporting busy");
+            QueueStatus { busy: true, ..Default::default() }
+        }
+    }
+}
+
 async fn collect_mount_status(m: &MountHandle) -> MountStatus {
     let cache = CacheStatus {
         used_bytes:   m.db.total_cache_bytes(m.mount_id).await.unwrap_or(0),
@@ -65,7 +83,9 @@ async fn collect_mount_status(m: &MountHandle) -> MountStatus {
         pinned_count: m.db.pinned_count(m.mount_id).await.unwrap_or(0),
     };
 
-    let mut queue = m.upload_queue.snapshot().await;
+    let mut queue = queue_snapshot_or_busy(
+        m.upload_queue.snapshot(), QUEUE_SNAPSHOT_TIMEOUT,
+    ).await;
 
     let poller = m.poller_state.read().await.clone();
 
@@ -108,4 +128,29 @@ pub fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The queue snapshot travels through the upload loop's trigger
+    /// channel, and that loop runs conflict resolution inline. While it
+    /// is busy the snapshot never answers — and the whole `status` IPC
+    /// (dashboard, tray) used to hang with it. A busy queue must
+    /// produce a bounded, explicitly flagged reply instead.
+    #[tokio::test]
+    async fn queue_snapshot_times_out_as_busy() {
+        let s = queue_snapshot_or_busy(std::future::pending(), Duration::from_millis(50)).await;
+        assert!(s.busy, "unanswered snapshot must be reported as busy, not hang");
+    }
+
+    #[tokio::test]
+    async fn queue_snapshot_passes_through_when_answered() {
+        let ready = async { QueueStatus { pending: 7, ..Default::default() } };
+        let s = queue_snapshot_or_busy(ready, Duration::from_secs(1)).await;
+        assert!(!s.busy);
+        assert_eq!(s.pending, 7);
+    }
 }

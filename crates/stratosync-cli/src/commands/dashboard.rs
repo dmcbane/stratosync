@@ -18,7 +18,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use stratosync_core::{
     config::default_runtime_socket,
-    ipc::{ActiveHydration, ActiveUpload, DaemonStatus, IpcResponse, MountStatus},
+    ipc::{ActiveHydration, ActiveUpload, DaemonStatus, IpcResponse, MountStatus, QueueStatus},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -37,7 +37,23 @@ pub async fn run(_config_path: &Path, once: bool) -> Result<()> {
 
 // ── IPC client ───────────────────────────────────────────────────────────────
 
+/// How long one status round-trip may take before the dashboard reports
+/// the daemon as unresponsive instead of waiting on it.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
 async fn fetch_status(socket: &Path) -> Result<DaemonStatus> {
+    fetch_status_within(socket, FETCH_TIMEOUT).await
+}
+
+async fn fetch_status_within(socket: &Path, limit: Duration) -> Result<DaemonStatus> {
+    tokio::time::timeout(limit, fetch_status_inner(socket)).await
+        .map_err(|_| anyhow::anyhow!(
+            "daemon did not respond within {}s (busy or wedged — see `stratosync daemon logs`)",
+            limit.as_secs_f32(),
+        ))?
+}
+
+async fn fetch_status_inner(socket: &Path) -> Result<DaemonStatus> {
     let mut stream = UnixStream::connect(socket).await.with_context(|| format!(
         "daemon is not running (no socket at {}); start with stratosyncd",
         socket.display()
@@ -74,7 +90,7 @@ fn print_plain(s: &DaemonStatus) {
             m.name,
             status_label(m),
             format!("{}% ({})", pct, ByteSize(m.cache.used_bytes)),
-            format!("{}↑ {}⌛", m.queue.in_flight.len(), m.queue.pending),
+            queue_cell(&m.queue),
             format!("{}/{}", m.hydration.active, m.hydration.waiters),
             m.conflicts,
         );
@@ -124,12 +140,23 @@ async fn tui_loop<B: Backend>(
     let mut last_fetch = Instant::now() - Duration::from_secs(10); // fetch immediately
     let refresh = Duration::from_secs(1);
 
+    // The fetch runs on its own task so a slow daemon never blocks
+    // drawing or key handling — previously the first fetch ran before
+    // the first draw, so a busy daemon left a blank screen that ignored
+    // `q` until the process was killed.
+    let mut in_flight: Option<tokio::task::JoinHandle<Result<DaemonStatus>>> = None;
+
     loop {
-        if last_fetch.elapsed() >= refresh {
-            match fetch_status(socket).await {
-                Ok(s) => { last_status = Some(s); last_error = None; }
-                Err(e) => { last_error = Some(format!("{e}")); }
+        if in_flight.as_ref().is_some_and(|h| h.is_finished()) {
+            match in_flight.take().expect("checked above").await {
+                Ok(Ok(s))  => { last_status = Some(s); last_error = None; }
+                Ok(Err(e)) => { last_error = Some(format!("{e:#}")); }
+                Err(e)     => { last_error = Some(format!("status fetch task failed: {e}")); }
             }
+        }
+        if in_flight.is_none() && last_fetch.elapsed() >= refresh {
+            let socket = socket.to_path_buf();
+            in_flight = Some(tokio::spawn(async move { fetch_status(&socket).await }));
             last_fetch = Instant::now();
         }
 
@@ -159,6 +186,27 @@ async fn tui_loop<B: Backend>(
     Ok(())
 }
 
+fn header_text(status: Option<&DaemonStatus>, error: Option<&str>) -> String {
+    match (status, error) {
+        (Some(s), None) => format!("stratosync {} — pid {} — uptime {}",
+            s.version, s.pid, fmt_duration(s.uptime_secs)),
+        (Some(s), Some(e)) => format!("stratosync {} — pid {} — showing stale data: {e}",
+            s.version, s.pid),
+        (None, Some(e)) => format!("not connected: {e}"),
+        (None, None) => "connecting…".to_string(),
+    }
+}
+
+/// `busy` means the upload loop didn't answer in time: the counts are
+/// unknown, so don't render them as zero.
+fn queue_cell(q: &QueueStatus) -> String {
+    if q.busy {
+        "busy".to_string()
+    } else {
+        format!("{}↑ {}⌛", q.in_flight.len(), q.pending)
+    }
+}
+
 fn render(
     frame: &mut Frame,
     status: Option<&DaemonStatus>,
@@ -178,12 +226,7 @@ fn render(
         .split(area);
 
     // Header
-    let header_text = match (status, error) {
-        (Some(s), _) => format!("stratosync {} — pid {} — uptime {}",
-            s.version, s.pid, fmt_duration(s.uptime_secs)),
-        (None, Some(e)) => format!("not connected: {e}"),
-        (None, None) => "connecting…".to_string(),
-    };
+    let header_text = header_text(status, error);
     frame.render_widget(
         Paragraph::new(header_text).block(Block::default().borders(Borders::BOTTOM)),
         chunks[0],
@@ -199,7 +242,7 @@ fn render(
                 Cell::from(m.name.clone()),
                 Cell::from(status_label(m)),
                 Cell::from(format!("{}% ({})", pct, ByteSize(m.cache.used_bytes))),
-                Cell::from(format!("{}↑ {}⌛", m.queue.in_flight.len(), m.queue.pending)),
+                Cell::from(queue_cell(&m.queue)),
                 Cell::from(format!("{}/{}", m.hydration.active, m.hydration.waiters)),
                 Cell::from(m.conflicts.to_string()),
             ];
@@ -434,4 +477,51 @@ fn elapsed_secs(past_unix: i64) -> i64 {
 
 fn until_secs(future_unix: i64) -> i64 {
     (future_unix - now_unix()).max(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    /// A daemon that accepts the connection but never answers used to
+    /// hang the dashboard forever — before its first draw, so the screen
+    /// stayed blank and `q` was never read. The fetch must give up.
+    #[tokio::test]
+    async fn fetch_status_times_out_against_silent_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let _server = tokio::spawn(async move {
+            let (_conn, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let started = Instant::now();
+        let r = fetch_status_within(&sock, Duration::from_millis(200)).await;
+        assert!(r.is_err(), "silent daemon must yield an error, got {r:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "fetch must respect its timeout");
+        assert!(format!("{:#}", r.unwrap_err()).contains("did not respond"));
+    }
+    #[test]
+    fn queue_cell_reports_busy_instead_of_empty_queue() {
+        let q = stratosync_core::ipc::QueueStatus { busy: true, ..Default::default() };
+        assert_eq!(queue_cell(&q), "busy");
+        let q = stratosync_core::ipc::QueueStatus { pending: 4, ..Default::default() };
+        assert_eq!(queue_cell(&q), "0↑ 4⌛");
+    }
+
+    /// A failed refresh after a good one must not be hidden behind the
+    /// stale header — otherwise a wedged daemon looks healthy.
+    #[test]
+    fn header_shows_error_alongside_stale_status() {
+        let s = DaemonStatus {
+            version: "1.0".into(), pid: 42, uptime_secs: 61, mounts: vec![],
+        };
+        let h = header_text(Some(&s), Some("daemon did not respond within 3s"));
+        assert!(h.contains("pid 42"), "{h}");
+        assert!(h.contains("stale") && h.contains("did not respond"), "{h}");
+        assert!(!header_text(Some(&s), None).contains("stale"));
+        assert_eq!(header_text(None, None), "connecting…");
+    }
 }

@@ -487,6 +487,7 @@ async fn build_queue_snapshot(
         consecutive_failures: 0,
         last_error:           None,
         last_failure_unix:    None,
+        busy:                 false,
     }
 }
 

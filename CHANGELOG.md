@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.19] - 2026-10-04
+
+### Fixed
+- **`stratosync dashboard` could show a blank screen forever and ignore
+  `q`.** The first status fetch ran before the first draw with no
+  timeout, and the daemon built its reply by asking the upload loop for
+  a snapshot — a loop that runs conflict resolution (including a full
+  download) inline. While it was busy, nothing rendered and keys were
+  never read.
+  - Dashboard: status is fetched on a background task with a 3 s
+    timeout; the screen draws and handles keys immediately. A failed
+    refresh after a good one is shown as "showing stale data: …".
+  - Daemon: the queue snapshot is bounded to 1 s. On timeout the queue
+    is reported as `busy` (new `QueueStatus.busy` IPC field, defaults
+    to `false` for older daemons) instead of stalling the whole reply;
+    the dashboard shows "busy" rather than an empty queue.
+
+### Added
+- Prometheus gauge `stratosync_mount_upload_queue_busy`.
+
 ## [0.13.0-beta.18] - 2026-10-04
 
 ### Fixed

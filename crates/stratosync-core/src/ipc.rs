@@ -59,6 +59,12 @@ pub struct QueueStatus {
     /// recoveries.
     #[serde(default)]
     pub last_failure_unix:    Option<i64>,
+    /// True when the upload loop didn't answer the snapshot request in
+    /// time (it is busy, e.g. resolving a conflict). `pending` and
+    /// `in_flight` are then unknown, not zero — clients must say so
+    /// rather than render an empty queue.
+    #[serde(default)]
+    pub busy:                 bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,6 +241,7 @@ mod tests {
                     consecutive_failures: 2,
                     last_error: Some("rclone timed out".into()),
                     last_failure_unix: Some(1_700_000_005),
+                    busy: true,
                 },
                 poller: PollerStatus {
                     mode: "full-listing".into(),
