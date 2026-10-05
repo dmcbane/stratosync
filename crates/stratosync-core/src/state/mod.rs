@@ -439,6 +439,37 @@ impl StateDb {
         Ok(())
     }
 
+    /// Revert a `dirty`/`uploading` file row whose cache file has
+    /// vanished from disk back to `remote`, so the next open()
+    /// re-hydrates from the cloud instead of the upload queue
+    /// fatal-erroring on it forever.
+    ///
+    /// Conditional on the row still pointing at `expected_cache_path`:
+    /// a concurrent FUSE rename may have moved the cache file and
+    /// updated the row, in which case the content is NOT lost and the
+    /// row must be left alone. Returns whether the row was reverted.
+    pub async fn revert_dirty_with_missing_cache(
+        &self, inode: Inode, expected_cache_path: &Path,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE file_index
+             SET status='remote', cache_path=NULL, cache_size=NULL, cache_mtime=NULL
+             WHERE inode = ?1
+               AND kind = 'file'
+               AND status IN ('dirty','uploading')
+               AND cache_path = ?2",
+            params![inode as i64, expected_cache_path.to_string_lossy()],
+        )?;
+        if n > 0 {
+            conn.execute(
+                "DELETE FROM cache_lru WHERE inode = ?1",
+                params![inode as i64],
+            )?;
+        }
+        Ok(n > 0)
+    }
+
     pub async fn touch_lru(&self, inode: Inode) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(

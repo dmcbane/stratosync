@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0-beta.17] - 2026-10-04
+
+### Fixed
+- **Dirty file whose cache file vanished looped as an upload failure
+  forever.** A `dirty`/`uploading` row whose `cache_path` names a file
+  no longer on disk made `run_upload` return `Fatal("cache file
+  missing")`; the fatal handler reset the row to `dirty` and startup
+  re-queued it, so it failed (and bumped `consecutive_upload_failures`)
+  on every restart. Observed live on three 1 GB gdrive videos stuck for
+  five weeks. `run_upload` now reverts such rows to `remote` via the new
+  `StateDb::revert_dirty_with_missing_cache`, so the next `open()`
+  re-hydrates from the cloud. The revert is conditional on the row
+  still naming the missing path — if a concurrent rename moved the
+  cache file, the upload retries instead of discarding live edits.
+
 ## [0.13.0-beta.16] - 2026-06-22
 
 ### Fixed

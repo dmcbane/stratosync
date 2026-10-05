@@ -546,8 +546,25 @@ async fn run_upload(
         }
     };
 
+    // Sibling of the NULL-cache_path case: the row names a cache file
+    // that is gone from disk. Returning Fatal here looped forever (the
+    // fatal handler resets the row to `dirty`, startup re-queues it).
+    // With no local content left, the cloud copy is authoritative —
+    // revert to `remote` so the next open() re-hydrates. The revert is
+    // conditional on the row still naming this path: if a concurrent
+    // rename moved the file, the content still exists, so retry and
+    // let the next attempt read the new path.
     if !cache_path.exists() {
-        return Err(SyncError::Fatal(format!("cache file missing: {}", cache_path.display())));
+        let reverted = db.revert_dirty_with_missing_cache(inode, &cache_path).await
+            .map_err(|e| SyncError::Fatal(e.to_string()))?;
+        if reverted {
+            warn!(inode, path = %entry.remote_path, cache_path = %cache_path.display(),
+                "skipping upload: cache file missing — reverted to remote; \
+                 next open() re-hydrates from the cloud");
+            return Ok(());
+        }
+        return Err(SyncError::Transient(format!(
+            "cache file missing and row changed underneath: {}", cache_path.display())));
     }
 
     // Reject symlinks — prevents uploading arbitrary files via cache dir manipulation
@@ -791,6 +808,47 @@ mod tests {
         assert_eq!(up.first_started_unix, up.started_at_unix);
         assert_eq!(up.bytes_uploaded, None,
             "no progress entry → bytes_uploaded is None, not Some(0)");
+    }
+
+    // ── run_upload: dirty row whose cache file vanished ───────────────
+
+    async fn run_upload_for_test(db: &Arc<StateDb>, mount_id: u32, inode: Inode)
+        -> Result<(), SyncError>
+    {
+        let dir = std::env::temp_dir()
+            .join(format!("stratosync-uq-test-{}-{inode}", std::process::id()));
+        let base_store = Arc::new(BaseStore::new(dir.join(".bases")).unwrap());
+        let backend: Arc<dyn Backend> =
+            Arc::new(stratosync_core::backend::mock::MockBackend::default());
+        let (tx, _rx) = mpsc::channel(8);
+        let r = run_upload(
+            inode, mount_id, db, &backend, &base_store,
+            &Arc::new(SyncConfig::default()), 0, tx,
+        ).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    /// Live failure: three 1 GB gdrive videos sat `dirty` for five weeks
+    /// with a cache_path whose file was gone. Every daemon restart
+    /// re-queued them and every attempt returned
+    /// `Fatal("cache file missing")`, whose handler set the row back to
+    /// `dirty` — a permanent loop. With no local content, the cloud copy
+    /// is authoritative: self-heal to `remote` and report success.
+    #[tokio::test]
+    async fn run_upload_reverts_dirty_row_whose_cache_file_is_missing() {
+        let (db, mid, inode) = make_db_with_inode("/gone.mov", 1_000).await;
+        // make_db_with_inode points cache_path at /tmp/cache/x, which
+        // does not exist. Flip to dirty, matching the stuck rows.
+        db.set_status(inode, SyncStatus::Dirty).await.unwrap();
+        assert!(!PathBuf::from("/tmp/cache/x").exists(), "test precondition");
+
+        let r = run_upload_for_test(&db, mid, inode).await;
+        assert!(r.is_ok(), "missing cache file must self-heal, not fatal: {r:?}");
+
+        let e = db.get_by_inode(inode).await.unwrap().unwrap();
+        assert_eq!(e.status, SyncStatus::Remote);
+        assert_eq!(e.cache_path, None);
     }
 
     #[tokio::test]

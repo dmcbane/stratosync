@@ -8,7 +8,7 @@
 //! or network access required.
 //!
 //! Run with: cargo test -p stratosync-core --test functional
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -851,6 +851,67 @@ async fn reset_stuck_dirty_files_does_not_touch_unaffected_mounts() {
         "unaffected mount's legitimate failure counter must survive");
     assert!(ok.last_upload_error.is_some(),
         "unaffected mount's legitimate last_upload_error must survive");
+}
+
+/// Sibling of the "dirty but no cache_path" poison: the row records a
+/// cache_path, but the file on disk is gone (observed live: three
+/// 1 GB gdrive videos stuck `dirty` for five weeks, fatal-erroring on
+/// every daemon restart). With no local content left, the cloud copy
+/// is the only copy — revert to `remote` so the next open() re-hydrates.
+#[tokio::test]
+async fn revert_dirty_with_missing_cache_reverts_matching_row() {
+    let (db, mid, root) = setup().await;
+    let gone = "/tmp/cache/gone.mov";
+    let inode = insert_file(
+        &db, mid, root, "gone.mov", "gone.mov",
+        SyncStatus::Dirty, Some(gone),
+    ).await;
+
+    let reverted = db.revert_dirty_with_missing_cache(inode, Path::new(gone)).await.unwrap();
+    assert!(reverted, "dirty row pointing at the missing path must revert");
+
+    let e = db.get_by_inode(inode).await.unwrap().unwrap();
+    assert_eq!(e.status, SyncStatus::Remote);
+    assert_eq!(e.cache_path, None, "cache_path must clear so the row stops claiming local content");
+    assert_eq!(e.cache_size, None);
+}
+
+/// Race guard: a FUSE rename can move the cache file and update the
+/// row's cache_path between `run_upload` reading the row and checking
+/// the file. The revert must be conditional on the path the caller saw,
+/// or it would discard real, unsynced local edits at the new path.
+#[tokio::test]
+async fn revert_dirty_with_missing_cache_skips_row_whose_path_moved() {
+    let (db, mid, root) = setup().await;
+    let inode = insert_file(
+        &db, mid, root, "doc.txt", "doc.txt",
+        SyncStatus::Dirty, Some("/tmp/cache/doc-renamed.txt"),
+    ).await;
+
+    let reverted = db
+        .revert_dirty_with_missing_cache(inode, Path::new("/tmp/cache/doc.txt"))
+        .await.unwrap();
+    assert!(!reverted, "row now points elsewhere — must not be touched");
+
+    let e = db.get_by_inode(inode).await.unwrap().unwrap();
+    assert_eq!(e.status, SyncStatus::Dirty);
+    assert_eq!(e.cache_path, Some(PathBuf::from("/tmp/cache/doc-renamed.txt")));
+}
+
+/// Only rows with pending upload work are eligible; a row that already
+/// finished (cached) is the eviction path's business, not this one.
+#[tokio::test]
+async fn revert_dirty_with_missing_cache_ignores_non_dirty_rows() {
+    let (db, mid, root) = setup().await;
+    let p = "/tmp/cache/img.png";
+    let inode = insert_file(
+        &db, mid, root, "img.png", "img.png",
+        SyncStatus::Cached, Some(p),
+    ).await;
+
+    let reverted = db.revert_dirty_with_missing_cache(inode, Path::new(p)).await.unwrap();
+    assert!(!reverted);
+    assert_eq!(db.get_by_inode(inode).await.unwrap().unwrap().status, SyncStatus::Cached);
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────────
